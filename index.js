@@ -110,3 +110,75 @@ app.post('/login', async (req, res) => {
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
+// Get all sessions
+app.get('/sessions', async (req, res) => {
+  try {
+    const [sessions] = await pool.query(`
+      SELECT s.id, s.title, s.created_at, u.username AS host
+      FROM sessions s
+      JOIN users u ON s.user_id = u.id
+      ORDER BY s.created_at DESC
+    `);
+    res.json(sessions);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Create new session
+app.post('/sessions', async (req, res) => {
+  const { title, userId } = req.body;
+  if (!title || !userId) return res.status(400).json({ error: 'Missing fields' });
+
+  try {
+    const [result] = await pool.query(
+      'INSERT INTO sessions (user_id, title) VALUES (?, ?)',
+      [userId, title]
+    );
+    res.status(201).json({ sessionId: result.insertId });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get queue of a session
+app.get('/sessions/:id/queue', async (req, res) => {
+  const sessionId = req.params.id;
+  try {
+    const [queue] = await pool.query(
+      'SELECT * FROM queue_items WHERE session_id = ? ORDER BY position ASC',
+      [sessionId]
+    );
+    res.json(queue);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Add video to session queue
+app.post('/sessions/:id/queue', async (req, res) => {
+  const sessionId = req.params.id;
+  const { videoId, title, thumbnail, addedBy } = req.body;
+  if (!videoId || !title || !addedBy) return res.status(400).json({ error: 'Missing fields' });
+
+  try {
+    const [maxPos] = await pool.query(
+      'SELECT MAX(position) AS maxPos FROM queue_items WHERE session_id = ?',
+      [sessionId]
+    );
+    const position = (maxPos[0].maxPos || 0) + 1;
+
+    await pool.query(
+      'INSERT INTO queue_items (session_id, video_id, title, thumbnail, position, added_by) VALUES (?, ?, ?, ?, ?, ?)',
+      [sessionId, videoId, title, thumbnail, position, addedBy]
+    );
+    res.status(201).json({ message: 'Video added to queue' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
