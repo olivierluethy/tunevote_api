@@ -47,8 +47,16 @@ const getUserFromToken = async (token) => {
 
 const getGuestFromToken = async (guestToken) => {
   if (!guestToken) return null;
-  const [rows] = await pool.query('SELECT id, nickname FROM guest_users WHERE guest_token = ?', [guestToken]);
-  return rows[0] || null;
+  try {
+    const [rows] = await pool.query(
+      'SELECT id, nickname FROM guest_users WHERE guest_token = ?',
+      [guestToken]
+    );
+    return rows[0] || null;
+  } catch (err) {
+    console.error('Guest token error:', err);
+    return null;
+  }
 };
 
 const ensureParticipant = async (sessionId, user = null, guest = null) => {
@@ -214,12 +222,15 @@ app.get('/sessions/:id', async (req, res) => {
   const token = req.headers.authorization?.split(' ')[1];
   const guestToken = req.headers['x-guest-token'];
 
-  const user = await getUserFromToken(token);
-  const guest = await getGuestFromToken(guestToken);
-  if (!user && !guest) return res.status(401).json({ error: 'Unauthorized' });
+  const user = token ? await getUserFromToken(token) : null;
+  const guest = guestToken ? await getGuestFromToken(guestToken) : null;
+
+  // Nur einer darf gesetzt sein!
+  if ((user && guest) || (!user && !guest)) {
+    return res.status(401).json({ error: 'Invalid auth: use either JWT or guest token' });
+  }
 
   try {
-    // 1. Session holen
     const [sessRows] = await pool.query(
       'SELECT s.*, u.username AS host FROM sessions s JOIN users u ON s.user_id = u.id WHERE s.id = ? AND s.is_active = 1',
       [id]
@@ -227,14 +238,11 @@ app.get('/sessions/:id', async (req, res) => {
     if (!sessRows[0]) return res.status(404).json({ error: 'Session not found' });
 
     const session = sessRows[0];
+    await ensureParticipant(id, user || null, guest || null);
 
-    // 2. Teilnehmer eintragen (falls noch nicht geschehen)
-    await ensureParticipant(id, user, guest);
-
-    // 3. Antwort: **hostId** (damit Frontend Host‑Check funktioniert)
     res.json({
       ...session,
-      hostId: session.user_id,   // <-- wichtig!
+      hostId: session.user_id,
     });
   } catch (err) {
     console.error('GET /sessions/:id error:', err);
