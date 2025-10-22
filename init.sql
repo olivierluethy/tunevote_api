@@ -119,6 +119,33 @@ CREATE TABLE playback_sync (
     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 );
 
+-- 1) Voting rounds
+CREATE TABLE voting_rounds (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  session_id INT NOT NULL,
+  started_by_user_id INT NULL,
+  started_by_guest_id INT NULL,
+  started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  ends_at TIMESTAMP NULL,
+  max_suggestions INT DEFAULT 10,
+  status ENUM('open','closed','computed') DEFAULT 'open',
+  winner_queue_item_id INT NULL,
+  quorum_percent FLOAT DEFAULT 0.66,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+
+-- 2) Connect proposals to a voting round
+ALTER TABLE queue_items
+  ADD COLUMN voting_round_id INT NULL,
+  ADD COLUMN status ENUM('proposal','queued','played','skipped') DEFAULT 'proposal',
+  ADD FOREIGN KEY (voting_round_id) REFERENCES voting_rounds(id) ON DELETE SET NULL;
+
+-- 3) Optional: cache vote counts for fast reads
+ALTER TABLE queue_items ADD COLUMN vote_count INT DEFAULT 0;
+CREATE INDEX idx_round_votes ON queue_items(voting_round_id, vote_count);
+
+
 -- =============================================
 -- Indizes für Performance
 -- =============================================
