@@ -105,138 +105,137 @@ io.on("connection", (socket) => {
   });
 
   socket.on("song_finished", async ({ sessionId, videoId }) => {
-    console.log(
-      `[Socket] Song finished in session ${sessionId}, videoId: ${videoId}`,
+  console.log(
+    `[Socket] Song finished in session ${sessionId}, videoId: ${videoId}`,
+  );
+
+  try {
+    // 1️⃣ Verify session exists and is live
+    const [session] = await pool.query(
+      "SELECT id, is_live, user_id FROM sessions WHERE id = ?",
+      [sessionId],
+    );
+    if (!session[0]) {
+      console.log(`[Queue] Session ${sessionId} not found`);
+      socket.emit("error", { message: "Session not found" });
+      return;
+    }
+    if (!session[0].is_live) {
+      console.log(`[Queue] Session ${sessionId} is not live`);
+      socket.emit("error", { message: "Session is not live" });
+      return;
+    }
+
+    // 2️⃣ Authenticate: Only host can trigger song_finished
+    const token = socket.handshake.auth.token;
+    const user = await getUserFromToken(token);
+    if (!user || user.id !== session[0].user_id) {
+      console.log(
+        `[Queue] Unauthorized attempt to finish song in session ${sessionId}`,
+      );
+      socket.emit("error", {
+        message: "Only the host can trigger song finished",
+      });
+      return;
+    }
+
+    // 3️⃣ Update the finished song's status and played flag
+    await pool.query(
+      `UPDATE queue_items
+       SET status = 'played', played = 1, playedAt = NOW()
+       WHERE session_id = ? AND video_id = ? AND played = 0`,
+      [sessionId, videoId],
     );
 
-    try {
-      // 1️⃣ Verify session exists and is live
-      const [session] = await pool.query(
-        "SELECT id, is_live, user_id FROM sessions WHERE id = ?",
-        [sessionId],
-      );
-      if (!session[0]) {
-        console.log(`[Queue] Session ${sessionId} not found`);
-        socket.emit("error", { message: "Session not found" });
-        return;
-      }
-      if (!session[0].is_live) {
-        console.log(`[Queue] Session ${sessionId} is not live`);
-        socket.emit("error", { message: "Session is not live" });
-        return;
-      }
+    // 4️⃣ Check if any unplayed songs remain
+    const [remainingSongs] = await pool.query(
+      `SELECT COUNT(*) AS count FROM queue_items
+       WHERE session_id = ? AND played = 0`,
+      [sessionId],
+    );
 
-      // 2️⃣ Authenticate: Only host can trigger song_finished
-      const token = socket.handshake.auth.token;
-      const user = await getUserFromToken(token);
-      if (!user || user.id !== session[0].user_id) {
-        console.log(
-          `[Queue] Unauthorized attempt to finish song in session ${sessionId}`,
-        );
-        socket.emit("error", {
-          message: "Only the host can trigger song finished",
-        });
-        return;
-      }
+    if (remainingSongs[0].count === 0) {
+      console.log(`[Queue] Session ${sessionId}: all songs played, resetting session`);
 
-      // 3️⃣ Update the finished song's status and played flag
+      // 1️⃣ Reset queue_items
       await pool.query(
         `UPDATE queue_items
-         SET status = 'played', played = 1, playedAt = NOW(), playedCount = COALESCE(playedCount, 0) + 1
-         WHERE session_id = ? AND video_id = ? AND played = 0`,
-        [sessionId, videoId],
-      );
-
-      // 4️⃣ Check if any unplayed songs remain
-      const [remainingSongs] = await pool.query(
-        `SELECT COUNT(*) AS count FROM queue_items
-         WHERE session_id = ? AND played = 0`,
+         SET status = 'queued',
+             played = 0,
+             playedAt = NULL
+         WHERE session_id = ?`,
         [sessionId],
       );
 
-      if (remainingSongs[0].count === 0) {
-        console.log(
-          `[Queue] Session ${sessionId}: all songs played, ending session`,
-        );
-        // Update session to not live
-        await pool.query(`UPDATE sessions SET is_live = 0 WHERE id = ?`, [
-          sessionId,
-        ]);
-        // Clear playback sync
-        await pool.query(
-          `UPDATE playback_sync SET is_playing = 0, current_video_id = NULL, video_start_time = NULL WHERE session_id = ?`,
-          [sessionId],
-        );
-        // Notify all clients that the session has ended
-        io.to(sessionId).emit("session_ended", {
-          message: "All songs in the session have been played",
-        });
-        io.to(sessionId).emit("queue_updated", {});
-        return;
-      }
+      // 2️⃣ Set session to not live
+      await pool.query(`UPDATE sessions SET is_live = 0 WHERE id = ?`, [sessionId]);
 
-      // 5️⃣ Fetch the next unplayed song (lowest id, played = 0)
-      const [nextSong] = await pool.query(
-        `SELECT id, video_id FROM queue_items
-         WHERE session_id = ? AND played = 0
-         ORDER BY id ASC
-         LIMIT 1`,
-        [sessionId],
-      );
+      // 3️⃣ Clear playback_sync
+      await pool.query(`DELETE FROM playback_sync WHERE session_id = ?`, [sessionId]);
 
-      if (nextSong.length === 0) {
-        console.log(`[Queue] Session ${sessionId}: queue empty`);
-        await pool.query(
-          "UPDATE playback_sync SET is_playing = 0, current_video_id = NULL, video_start_time = NULL WHERE session_id = ?",
-          [sessionId],
-        );
-        io.to(sessionId).emit("queue_empty");
-        return;
-      }
-
-      const nextId = nextSong[0].id;
-      const nextVideoId = nextSong[0].video_id;
-      const nextStart = Date.now();
-
-      // 6️⃣ Update next song status to playing
-      await pool.query(
-        `UPDATE queue_items SET status = 'playing', playedAt = NOW() WHERE id = ?`,
-        [nextId],
-      );
-
-      // 7️⃣ Update playback sync
-      await pool.query(
-        `INSERT INTO playback_sync (session_id, current_video_id, video_start_time, is_playing)
-         VALUES (?, ?, ?, 1)
-         ON DUPLICATE KEY UPDATE
-           current_video_id = ?,
-           video_start_time = ?,
-           is_playing = 1`,
-        [sessionId, nextVideoId, nextStart, nextVideoId, nextStart],
-      );
-
-      io.to(sessionId).emit("host_song_start", {
-        sessionId,
-        videoId: nextVideoId,
+      // 4️⃣ Notify all clients
+      io.to(sessionId).emit("session_ended", {
+        message: "All songs in the session have been played",
       });
-      io.to(sessionId).emit("playback_sync", {
-        current_video_id: nextVideoId,
-        video_start_time: nextStart,
-        is_playing: true,
-      });
-
       io.to(sessionId).emit("queue_updated", {});
-      console.log(
-        `[Queue] Started next song (id=${nextId}, videoId=${nextVideoId}) in session ${sessionId}`,
-      );
-    } catch (err) {
-      console.error(
-        `[Queue] Error processing song_finished for session ${sessionId}:`,
-        err,
-      );
-      socket.emit("error", { message: "Server error" });
+      return;
     }
-  });
+
+    // 5️⃣ Fetch the next unplayed song
+    const [nextSong] = await pool.query(
+      `SELECT id, video_id FROM queue_items
+       WHERE session_id = ? AND played = 0
+       ORDER BY id ASC
+       LIMIT 1`,
+      [sessionId],
+    );
+
+    if (nextSong.length === 0) {
+      console.log(`[Queue] Session ${sessionId}: queue empty`);
+      await pool.query(
+        `DELETE FROM playback_sync WHERE session_id = ?`,
+        [sessionId],
+      );
+      io.to(sessionId).emit("queue_empty");
+      return;
+    }
+
+    const nextId = nextSong[0].id;
+    const nextVideoId = nextSong[0].video_id;
+    const nextStart = Date.now();
+
+    // 6️⃣ Update next song status to playing
+    await pool.query(
+      `UPDATE queue_items SET status = 'playing', playedAt = NOW() WHERE id = ?`,
+      [nextId],
+    );
+
+    // 7️⃣ Update playback sync
+    await pool.query(
+      `INSERT INTO playback_sync (session_id, current_video_id, video_start_time, is_playing)
+       VALUES (?, ?, ?, 1)`,
+      [sessionId, nextVideoId, nextStart],
+    );
+
+    // 8️⃣ Notify clients
+    io.to(sessionId).emit("playback_sync", {
+      current_video_id: nextVideoId,
+      video_start_time: nextStart,
+      is_playing: true,
+    });
+
+    io.to(sessionId).emit("queue_updated", {});
+    console.log(
+      `[Queue] Started next song (id=${nextId}, videoId=${nextVideoId}) in session ${sessionId}`,
+    );
+  } catch (err) {
+    console.error(
+      `[Queue] Error processing song_finished for session ${sessionId}:`,
+      err,
+    );
+    socket.emit("error", { message: "Server error" });
+  }
+});
 });
 
 // === Playback Sync Endpoint ===
@@ -448,8 +447,8 @@ app.post("/sessions/:id/queue/add", async (req, res) => {
     "SELECT user_id, is_live FROM sessions WHERE id = ?",
     [id],
   );
-  if (!sess[0] || sess[0].user_id !== user.id)
-    return res.status(403).json({ error: "Host only" });
+  //if (!sess[0] || sess[0].user_id !== user.id)
+  //  return res.status(403).json({ error: "Host only" });
   if (sess[0].is_live)
     return res.status(403).json({ error: "Session started" });
 
@@ -473,40 +472,67 @@ app.post("/sessions/:id/start", async (req, res) => {
     "SELECT user_id, is_live FROM sessions WHERE id = ?",
     [id],
   );
-  if (!sess[0] || sess[0].user_id !== user.id)
-    return res.status(403).json({ error: "Host only" });
-  if (sess[0].is_live) return res.status(400).json({ error: "Started" });
 
+  //if (!sess[0] || sess[0].user_id !== user.id)
+  //  return res.status(403).json({ error: "Host only" });
+
+  if (sess[0].is_live)
+    return res.status(400).json({ error: "Session already live" });
+
+  // 1️⃣ playback_sync aufräumen
+  await pool.query(`DELETE FROM playback_sync WHERE session_id = ?`, [id]);
+
+  // 2️⃣ Session auf live setzen
   await pool.query("UPDATE sessions SET is_live = 1 WHERE id = ?", [id]);
-  io.to(id).emit("session_started", {});
 
+  // 3️⃣ Ersten Song finden
   const [first] = await pool.query(
     "SELECT id, video_id FROM queue_items WHERE session_id = ? AND played = 0 ORDER BY id ASC LIMIT 1",
-    [id],
+    [id]
   );
-  if (first[0]) {
-    const startTime = Date.now();
-    await pool.query(
-      `UPDATE queue_items SET status = 'playing', playedAt = NOW() WHERE id = ?`,
-      [first[0].id],
-    );
-    await pool.query(
-      "INSERT INTO playback_sync (session_id, current_video_id, progress_seconds, is_playing, video_start_time) VALUES (?, ?, 0, 1, ?) ON DUPLICATE KEY UPDATE current_video_id = ?, progress_seconds = 0, is_playing = 1, video_start_time = ?",
-      [id, first[0].video_id, startTime, first[0].video_id, startTime],
-    );
-    io.to(id).emit("host_song_start", {
-      sessionId: id,
-      videoId: first[0].video_id,
-    });
-    io.to(id).emit("playback_sync", {
-      current_video_id: first[0].video_id,
-      video_start_time: startTime,
-      is_playing: true,
-    });
+
+  if (!first[0]) {
+    io.to(id).emit("queue_empty");
+    return res.status(400).json({ error: "Queue empty" });
   }
 
+  const startTime = Date.now();
+
+  // 4️⃣ Ersten Song auf 'playing' setzen
+  await pool.query(
+    `UPDATE queue_items SET status = 'playing', playedAt = NOW() WHERE id = ?`,
+    [first[0].id]
+  );
+
+  // 5️⃣ playback_sync setzen
+  await pool.query(
+    `INSERT INTO playback_sync (session_id, current_video_id, progress_seconds, is_playing, video_start_time)
+     VALUES (?, ?, 0, 1, ?)
+     ON DUPLICATE KEY UPDATE
+       current_video_id = VALUES(current_video_id),
+       video_start_time = VALUES(video_start_time),
+       is_playing = 1`,
+    [id, first[0].video_id, startTime]
+  );
+
+  // 6️⃣ Jetzt an alle Clients broadcasten, dass Session live ist
+  io.to(id).emit("session_started", {
+    autoStarted: true,
+    firstVideoId: first[0].video_id,
+    video_start_time: startTime,
+  });
+
+  // 7️⃣ Und direkt den Sync senden (damit auch Joiner starten können)
+  io.to(id).emit("playback_sync", {
+    current_video_id: first[0].video_id,
+    video_start_time: startTime,
+    is_playing: true,
+  });
+
+  console.log(`[Session ${id}] Auto-started first song (${first[0].video_id})`);
   res.json({ success: true });
 });
+
 
 app.post("/sessions/:id/queue/consume", async (req, res) => {
   const { id } = req.params;
@@ -517,8 +543,8 @@ app.post("/sessions/:id/queue/consume", async (req, res) => {
   const [sess] = await pool.query("SELECT user_id FROM sessions WHERE id = ?", [
     id,
   ]);
-  if (!sess[0] || sess[0].user_id !== user.id)
-    return res.status(403).json({ error: "Host only" });
+  //if (!sess[0] || sess[0].user_id !== user.id)
+  //  return res.status(403).json({ error: "Host only" });
 
   // 1️⃣ Fetch first unplayed queue item (lowest id, played = 0)
   const [rows] = await pool.query(
@@ -559,21 +585,40 @@ app.post("/sessions/:id/queue/consume", async (req, res) => {
   );
 
   if (remainingSongs[0].count === 0) {
-    console.log(`[Queue] Session ${id}: all songs played, ending session`);
-    // Update session to not live
-    await pool.query(`UPDATE sessions SET is_live = 0 WHERE id = ?`, [id]);
-    // Clear playback sync
-    await pool.query(
-      `UPDATE playback_sync SET is_playing = 0, current_video_id = NULL, video_start_time = NULL WHERE session_id = ?`,
-      [id],
-    );
-    // Notify all clients that the session has ended
-    io.to(id).emit("session_ended", {
-      message: "All songs in the session have been played",
-    });
-    io.to(id).emit("queue_updated", {});
-    return res.json({ success: true });
-  }
+  console.log(`[Queue] Session ${id}: all songs played, resetting session (consume ending)`);
+
+  // 1️⃣ Reset all queue items so session can be restarted later
+  await pool.query(
+    `UPDATE queue_items
+     SET status = 'queued',
+         played = 0,
+         playedAt = NULL
+     WHERE session_id = ?`,
+    [id]
+  );
+
+  // 2️⃣ Mark session as not live
+  await pool.query(`UPDATE sessions SET is_live = 0 WHERE id = ?`, [id]);
+
+  // 3️⃣ Clear playback_sync completely
+  await pool.query(
+    `UPDATE playback_sync
+     SET is_playing = 0,
+         current_video_id = NULL,
+         video_start_time = NULL
+     WHERE session_id = ?`,
+    [id]
+  );
+
+  // 4️⃣ Notify clients so UI resets and reloads queue
+  io.to(id).emit("session_ended", {
+    message: "All songs in the session have been played",
+  });
+  io.to(id).emit("queue_updated", {});
+
+  return res.json({ success: true });
+}
+
 
   // 4️⃣ Fetch next unplayed song
   const [next] = await pool.query(
