@@ -203,6 +203,12 @@ io.on("connection", (socket) => {
       [sessionId, participantId]
     );
   });
+
+  socket.on("session_deleted", (data) => {
+    alert(data.message); // Zeige eine Nachricht an
+    // Optional: Weiterleitung zur Hauptseite oder Session-Liste
+    window.location.href = "/"; // Beispiel: Zur Hauptseite weiterleiten
+  });
 });
 
 // === Playback Sync Endpoint ===
@@ -484,6 +490,47 @@ app.post("/sessions/:id/queue/add", async (req, res) => {
   } catch (err) {
     console.error("Queue add error:", err);
     res.status(500).json({ error: "Failed to add to queue" });
+  }
+});
+
+// === Session löschen (nur Host) ===
+app.delete("/sessions/:id", async (req, res) => {
+  const { id } = req.params;
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.split(" ")[1];
+  const user = await getUserFromToken(token);
+
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+
+  try {
+    // Prüfen, ob die Session existiert und der Benutzer der Host ist
+    const [session] = await pool.query(
+      "SELECT user_id FROM sessions WHERE id = ?",
+      [id]
+    );
+    if (!session[0]) return res.status(404).json({ error: "Session not found" });
+    if (session[0].user_id !== user.id) {
+      return res.status(403).json({ error: "Only the host can delete the session" });
+    }
+
+    // Session löschen (ON DELETE CASCADE kümmert sich um zugehörige Einträge)
+    await pool.query("DELETE FROM sessions WHERE id = ?", [id]);
+
+    // Timer für die Session stoppen, falls vorhanden
+    if (sessionTimers[id]) {
+      clearTimeout(sessionTimers[id]);
+      delete sessionTimers[id];
+    }
+
+    // Alle Teilnehmer via Socket.IO benachrichtigen
+    io.to(id).emit("session_deleted", {
+      message: "Die Session wurde vom Host gelöscht.",
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Delete session error:", err);
+    res.status(500).json({ error: "Server error" });
   }
 });
 
