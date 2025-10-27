@@ -136,6 +136,10 @@ const advanceToNext = async (sessionId) => {
     );
 
     if (remaining[0].count === 0) {
+      await pool.query(
+        `UPDATE queue_items SET status = 'queued', played = 0, playedAt = NULL WHERE session_id = ?`,
+        [sessionId]
+      );
       await pool.query("UPDATE sessions SET is_live = 0 WHERE id = ?", [sessionId]);
       await pool.query("DELETE FROM playback_sync WHERE session_id = ?", [sessionId]);
       io.to(sessionId).emit("session_ended", { message: "All items played" });
