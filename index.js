@@ -13,14 +13,32 @@ app.use(cors());
 app.use(express.json());
 
 const pool = mysql.createPool({
-  host: process.env.DB_HOST || "localhost",
-  user: process.env.DB_USER || "root",
-  password: process.env.DB_PASSWORD || "",
-  database: process.env.DB_NAME || "tunevote",
+  host: process.env.DB_HOST || 'localhost',
+  user: process.env.DB_USER || 'root',
+  password: process.env.DB_PASSWORD || '',
+  database: process.env.DB_NAME || 'tunevote',
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
 });
+
+// === DB Connection Check ===
+(async () => {
+  try {
+    const connection = await pool.getConnection();
+    const [rows] = await connection.query("SELECT DATABASE() AS db, USER() AS user, NOW() AS time");
+    console.log("✅ MySQL connected successfully!");
+    console.log("   Database:", rows[0].db);
+    console.log("   User:", rows[0].user);
+    console.log("   Server time:", rows[0].time);
+    connection.release();
+  } catch (err) {
+    console.error("❌ MySQL connection failed!");
+    console.error("   Error:", err.message);
+    console.error("   Check your .env settings (DB_HOST, DB_USER, DB_PASSWORD, DB_NAME)");
+    process.exit(1); // stop server if DB not reachable
+  }
+})();
 
 const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret_here";
 const YOUTUBE_KEY = process.env.YOUTUBE_KEY;
@@ -277,10 +295,21 @@ app.get("/sessions", async (req, res) => {
 
   try {
     const [rows] = await pool.query(`
-      SELECT s.id, s.title, s.created_at, u.username AS host, s.user_id AS hostId, s.is_live
+      SELECT 
+        s.id, 
+        s.title, 
+        s.created_at, 
+        u.username AS host, 
+        s.user_id AS hostId, 
+        s.is_live,
+        (
+          SELECT COUNT(*) 
+          FROM session_participants sp 
+          WHERE sp.session_id = s.id
+        ) AS participant_count
       FROM sessions s
       JOIN users u ON s.user_id = u.id
-      ORDER BY s.created_at DESC
+      ORDER BY participant_count DESC, s.created_at DESC
     `);
 
     res.json(rows);
@@ -303,19 +332,27 @@ app.post("/sessions", async (req, res) => {
   try {
     const [result] = await pool.query(
       "INSERT INTO sessions (user_id, title) VALUES (?, ?)",
-      [user.id, title.trim()],
+      [user.id, title.trim()]
     );
+
+    // 🔽 Hier Logging hinzufügen:
+    console.log("🟢 Session insert result:", result);
+
     const sessionId = result.insertId;
+    console.log("✅ New session created with ID:", sessionId, "by user:", user.id);
 
     await ensureParticipant(sessionId, user, null, true);
 
     const [newSession] = await pool.query(
       "SELECT s.id, s.title, s.created_at, u.username AS host FROM sessions s JOIN users u ON s.user_id = u.id WHERE s.id = ?",
-      [sessionId],
+      [sessionId]
     );
+
+    console.log("📦 Retrieved new session:", newSession[0]);
+
     res.status(201).json(newSession[0]);
   } catch (err) {
-    console.error(err);
+    console.error("❌ Error creating session:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
@@ -369,8 +406,6 @@ app.post("/sessions/:id/proposals", async (req, res) => {
     id,
   ]);
   if (!sess[0]) return res.status(404).json({ error: "Session not found" });
-  if (sess[0].is_live)
-    return res.status(403).json({ error: "Session started" });
 
   try {
     if (!YOUTUBE_KEY) throw new Error("YouTube API key missing");
