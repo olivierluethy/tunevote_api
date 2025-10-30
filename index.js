@@ -7,6 +7,12 @@ const mysql = require("mysql2/promise");
 const { Server } = require("socket.io");
 const { v4: uuidv4 } = require("uuid");
 const axios = require("axios");
+const { sendEmail } = require("./email.js");
+const crypto = require("crypto");
+
+const generateResetToken = () => crypto.randomBytes(32).toString("hex");
+
+const hashPassword = (password) => bcrypt.hash(password, 10);
 
 const app = express();
 app.use(cors());
@@ -737,4 +743,64 @@ app.get("/sessions/:id/live/stream", async (req, res) => {
     error:
       "Live streaming not implemented on backend. Integrate WebRTC/mediasoup or an audio streaming server.",
   });
+});
+
+// POST /forgot-password
+app.post('/forgot-password', async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: "Email required" });
+
+  try {
+    const [users] = await pool.query("SELECT id, username FROM users WHERE email = ?", [email]);
+    const user = users[0];
+    if (!user) return res.status(404).json({ error: "Email not found" });
+
+    const resetToken = generateResetToken();
+    const expiry = new Date(Date.now() + 3600000); // 1 Stunde
+
+    await pool.query(
+      "UPDATE users SET reset_token = ?, reset_token_expiry = ? WHERE id = ?",
+      [resetToken, expiry, user.id]
+    );
+
+    const resetLink = `https://api.tunevote.com/reset-password/${resetToken}`;
+    await sendEmail(
+      email,
+      "Passwort zurücksetzen",
+      `Klicke hier, um dein Passwort zurückzusetzen: ${resetLink}\n\nDer Link läuft in 1 Stunde ab.`
+    );
+
+    res.json({ message: "Reset-Link per E-Mail gesendet!" });
+  } catch (err) {
+    console.error("Forgot password error:", err);
+    res.status(500).json({ error: "Serverfehler" });
+  }
+});
+
+// POST /reset-password
+app.post('/reset-password', async (req, res) => {
+  const { token, newPassword } = req.body;
+  if (!token || !newPassword) return res.status(400).json({ error: "Token und Passwort erforderlich" });
+
+  try {
+    const [users] = await pool.query(
+      "SELECT id FROM users WHERE reset_token = ? AND reset_token_expiry > NOW()",
+      [token]
+    );
+
+    if (!users[0]) return res.status(400).json({ error: "Token ungültig oder abgelaufen" });
+
+    const userId = users[0].id;
+    const password_hash = await hashPassword(newPassword);
+
+    await pool.query(
+      "UPDATE users SET password_hash = ?, reset_token = NULL, reset_token_expiry = NULL WHERE id = ?",
+      [password_hash, userId]
+    );
+
+    res.json({ message: "Passwort erfolgreich zurückgesetzt!" });
+  } catch (err) {
+    console.error("Reset password error:", err);
+    res.status(500).json({ error: "Serverfehler" });
+  }
 });
