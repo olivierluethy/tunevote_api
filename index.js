@@ -763,7 +763,7 @@ app.post('/forgot-password', async (req, res) => {
       [resetToken, expiry, user.id]
     );
 
-    const resetLink = `https://api.tunevote.com/reset-password/${resetToken}`;
+    const resetLink = `https://tunevote.com/reset-password/${resetToken}`;
     await sendEmail(
       email,
       "Passwort zurücksetzen",
