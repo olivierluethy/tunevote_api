@@ -340,13 +340,43 @@ app.post("/guest/join", async (req, res) => {
   res.json({ guestToken, nickname: nickname || "Gast" });
 });
 
-// === Sessions (sichtbar für alle angemeldeten Nutzer) ===
+// === Sessions (sichtbar für alle angemeldeten Nutzer + Gäste) ===
 app.get("/sessions", async (req, res) => {
+  let user = null;
+  let isGuest = false;
+
+  // 1. Prüfe eingeloggten Nutzer
   const authHeader = req.headers.authorization;
   const token = authHeader?.split(" ")[1];
-  const user = await getUserFromToken(token);
+  if (token) {
+    try {
+      user = await getUserFromToken(token);
+    } catch (err) {
+      return res.status(401).json({ error: "Invalid token" });
+    }
+  }
 
-  if (!user) return res.status(401).json({ error: "Unauthorized" });
+  // 2. Prüfe Gast
+  const guestToken = req.headers["x-guest-token"];
+  if (!user && guestToken) {
+    try {
+      const [rows] = await pool.query(
+        "SELECT id, nickname FROM guest_users WHERE guest_token = ?",
+        [guestToken]
+      );
+      if (rows.length > 0) {
+        isGuest = true;
+        user = { id: null, isGuest: true, nickname: rows[0].nickname }; // Optional
+      }
+    } catch (err) {
+      console.error("Guest token check failed:", err);
+    }
+  }
+
+  // 3. Kein Zugriff?
+  if (!user && !isGuest) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
 
   try {
     const [rows] = await pool.query(`
@@ -763,7 +793,7 @@ app.post('/forgot-password', async (req, res) => {
       [resetToken, expiry, user.id]
     );
 
-    const resetLink = `https://tunevote.com/reset-password/${resetToken}`;
+    const resetLink = `http://localhsot/reset-password/${resetToken}`;
     await sendEmail(
       email,
       "Passwort zurücksetzen",
