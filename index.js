@@ -442,6 +442,41 @@ app.post("/sessions", async (req, res) => {
   }
 });
 
+// Wenn Benutzer ohne guest user & ohne account -> hier soll nach einer Session gesucht werden die Live ist, und danach sollte diese URL bereitgestellt und über das JSON verschickt werden wodurch man sich in der Live Session befindet.
+// === Auto-Join für nicht eingeloggte Benutzer ===
+app.get("/join", async (req, res) => {
+  try {
+    // Prüfen, ob der Benutzer eingeloggt ist (JWT oder Gast)
+    const token = req.headers.authorization?.split(" ")[1];
+    const guestToken = req.headers["x-guest-token"];
+    const user = await getUserFromToken(token);
+    const guest = await getGuestFromToken(guestToken);
+
+    // Nur fortfahren, wenn KEIN Account & KEIN Gast vorhanden ist
+    if (user || guest) {
+      return res.status(400).json({ error: "Already authenticated" });
+    }
+
+    // Live-Session suchen (erste mit is_live = 1)
+    const [sessions] = await pool.query(
+      "SELECT id FROM sessions WHERE is_live = 1 ORDER BY created_at ASC LIMIT 1"
+    );
+
+    if (sessions.length === 0) {
+      return res.status(404).json({ error: "No live session available" });
+    }
+
+    const sessionId = sessions[0].id;
+    const joinUrl = `http://localhost:5173/session/${sessionId}`;
+
+    // JSON mit Weiterleitungs-URL zurückgeben
+    res.json({ redirect: joinUrl });
+  } catch (err) {
+    console.error("Error in /join:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
 // === Get session (includes is_live) ===
 app.get("/sessions/:id", async (req, res) => {
   const { id } = req.params;
@@ -555,7 +590,6 @@ app.post("/sessions/:id/proposals", async (req, res) => {
     res.status(500).json({ error: "Failed to add proposal" });
   }
 });
-
 
 // === Host: direct queue add (blocked if session is_live) ===
 app.post("/sessions/:id/queue/add", async (req, res) => {
