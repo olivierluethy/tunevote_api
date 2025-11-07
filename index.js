@@ -14,6 +14,45 @@ const generateResetToken = () => crypto.randomBytes(32).toString("hex");
 
 const hashPassword = (password) => bcrypt.hash(password, 10);
 
+// ---------------------------------------------------------------
+// 1. NEW DEPENDENCIES
+// ---------------------------------------------------------------
+const { Configuration, OpenAIApi } = require("openai");
+
+// ---------------------------------------------------------------
+// OPENAI v4+ (openai@6.8.1) – korrekte Initialisierung
+// ---------------------------------------------------------------
+const { OpenAI } = require("openai");
+
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+if (!OPENAI_API_KEY) {
+  console.warn("OPENAI_API_KEY missing – recommendations disabled");
+}
+
+let openai = null;
+if (OPENAI_API_KEY) {
+  openai = new OpenAI({
+    apiKey: OPENAI_API_KEY,
+  });
+}
+
+// ---------------------------------------------------------------
+// 3. HELPER: safe JSON parsing from OpenAI
+// ---------------------------------------------------------------
+const safeParseOpenAI = (text) => {
+  if (!text) return [];
+  try {
+    const cleaned = text
+      .replace(/^```(?:json)?\s*|\s*```$/g, "")
+      .trim();
+    const parsed = JSON.parse(cleaned);
+    return Array.isArray(parsed) ? parsed.filter(s => s.title && s.youtubeId) : [];
+  } catch (e) {
+    console.warn("OpenAI JSON parse failed:", e.message, "\nRaw:", text);
+    return [];
+  }
+};
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -866,5 +905,182 @@ app.post('/reset-password', async (req, res) => {
   } catch (err) {
     console.error("Reset password error:", err);
     res.status(500).json({ error: "Serverfehler" });
+  }
+});
+
+// ---------------------------------------------------------------
+// 4. UPDATED ENDPOINT – GET RECOMMENDATIONS (AI + YouTube Search)
+// ---------------------------------------------------------------
+app.get("/sessions/:id/recommendations", async (req, res) => {
+  const { id } = req.params;
+
+  // ---- Auth ----
+  const token = req.headers.authorization?.split(" ")[1];
+  const guestToken = req.headers["x-guest-token"];
+  const user = token ? await getUserFromToken(token) : null;
+  const guest = guestToken ? await getGuestFromToken(guestToken) : null;
+  if (!user && !guest) return res.status(401).json({ error: "Unauthorized" });
+
+  // ---- Session check ----
+  const [sessionRows] = await pool.query(
+    "SELECT is_live FROM sessions WHERE id = ?",
+    [id]
+  );
+  if (!sessionRows[0]?.is_live)
+    return res.status(400).json({ error: "Session not live" });
+
+  // ---- Queue holen ----
+  const [queueRows] = await pool.query(
+    `SELECT title FROM queue_items 
+     WHERE session_id = ? AND item_type = 'music' AND played = 0
+     ORDER BY id ASC LIMIT 3`,
+    [id]
+  );
+  const titles = queueRows.map((r) => r.title);
+  if (titles.length < 2) return res.status(200).json([]);
+
+  // ---- Cache prüfen ----
+  const [cacheRows] = await pool.query(
+    "SELECT data, expires FROM recommendation_cache WHERE session_id = ?",
+    [id]
+  );
+  const cached = cacheRows?.[0];
+  if (cached && new Date(cached.expires) > new Date()) {
+    let data = typeof cached.data === "string" ? JSON.parse(cached.data) : cached.data;
+    return res.json(data);
+  }
+
+  // ---- Prompt (AI → nur Titel) ----
+  const prompt = `
+You are a music recommendation engine with up-to-date knowledge of popular songs and their official YouTube music videos (as of mid-2025).
+
+I will give you a list of song titles (artist + title).
+Your task: Recommend 2 to 3 additional songs that match in style, mood, energy, or theme — only songs with official, high-quality YouTube music videos (VEVO, official artist channels, or label uploads).
+
+Rules:
+Only suggest songs that are widely known and have stable, official YouTube videos (e.g., from VEVO, Warner, Sony, Universal, or official artist channels).
+Do NOT suggest remixes, fan uploads, lyric videos, or deleted/unavailable content.
+You must know the exact YouTube video ID from your training data — do not guess or fabricate IDs.
+If you're unsure about a video ID, skip that song — never output an invalid or broken link.
+
+Output only a JSON array of objects with:
+"title": Full "Artist - Song Title"
+"youtubeId": The correct, official YouTube video ID (11 characters)
+
+No explanations, no extra text, no markdown.
+
+Example Input:
+["The Weeknd - Blinding Lights", "Dua Lipa - Levitating", "Harry Styles - As It Was"]
+
+Correct Output:
+[
+{"title": "Doja Cat - Say So", "youtubeId": "F3EG4outsD0"},
+{"title": "Lizzo - About Damn Time", "youtubeId": "IzS7BaatisA"},
+{"title": "The Kid LAROI, Justin Bieber - STAY", "youtubeId": "kTJczUoc26U"}
+]
+
+Now recommend for:
+${JSON.stringify(titles)}
+`;
+
+  try {
+    console.log("[OpenAI] Requesting recommendations for session:", id);
+    const completion = await openai.chat.completions.create({
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.7,
+      max_tokens: 400,
+    });
+
+    const raw = completion.choices?.[0]?.message?.content || "";
+    let aiSuggestions = safeParseOpenAI(raw);
+
+    // Fallback-Sicherung
+    if (!Array.isArray(aiSuggestions)) aiSuggestions = [];
+    aiSuggestions = aiSuggestions.filter((s) => s?.title);
+
+    // ---- YouTube Search für jeden vorgeschlagenen Titel ----
+    const results = [];
+    for (const sug of aiSuggestions) {
+      const q = sug.title;
+      try {
+        const ytRes = await axios.get("https://www.googleapis.com/youtube/v3/search", {
+          params: {
+            part: "snippet",
+            q,
+            type: "video",
+            videoCategoryId: "10",
+            maxResults: 1,
+            key: YOUTUBE_KEY,
+          },
+        });
+
+        const video = ytRes.data.items?.[0];
+        if (!video) continue;
+
+        results.push({
+          title: video.snippet.title,
+          youtubeId: video.id.videoId,
+          thumbnail: video.snippet.thumbnails.medium?.url || "",
+        });
+      } catch (ytErr) {
+        console.warn(`[YouTube] Failed for "${q}":`, ytErr.message);
+      }
+    }
+
+    // ---- Cache speichern ----
+    const expires = new Date(Date.now() + 5 * 60 * 1000);
+    await pool.query(
+      `INSERT INTO recommendation_cache (session_id, data, expires)
+       VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE data = ?, expires = ?`,
+      [id, JSON.stringify(results), expires, JSON.stringify(results), expires]
+    );
+
+    console.log(`[Recommend] ${results.length} results cached for session ${id}`);
+    return res.json(results);
+  } catch (err) {
+    console.error("[Recommendation Error]", err);
+    res.status(500).json({ error: "Recommendation failed" });
+  }
+});
+
+// ---------------------------------------------------------------
+// 5. NEW ENDPOINT – ADD RECOMMENDED SONG (click → queue)
+// ---------------------------------------------------------------
+app.post("/sessions/:id/recommendations/add", async (req, res) => {
+  const { id } = req.params;
+  const { youtubeId, title } = req.body;
+
+  const token = req.headers.authorization?.split(" ")[1];
+  const guestToken = req.headers["x-guest-token"];
+  const user = token ? await getUserFromToken(token) : null;
+  const guest = guestToken ? await getGuestFromToken(guestToken) : null;
+  if (!user && !guest) return res.status(401).json({ error: "Unauthorized" });
+
+  // ---- fetch thumbnail + duration (same logic as normal proposal) ----
+  if (!YOUTUBE_KEY) return res.status(500).json({ error: "YouTube key missing" });
+
+  try {
+    const ytRes = await axios.get("https://www.googleapis.com/youtube/v3/videos", {
+      params: { part: "snippet,contentDetails", id: youtubeId, key: YOUTUBE_KEY },
+    });
+    const item = ytRes.data.items[0];
+    if (!item) return res.status(404).json({ error: "Video not found" });
+
+    const thumbnail = item.snippet.thumbnails.medium?.url || "";
+    const duration = parseIsoDuration(item.contentDetails.duration);
+
+    await pool.query(
+      `INSERT INTO queue_items 
+       (session_id, item_type, video_id, title, thumbnail, added_by, guest_id, status, played, duration)
+       VALUES (?, 'music', ?, ?, ?, ?, ?, 'queued', 0, ?)`,
+      [id, youtubeId, title, thumbnail, user?.id || null, guest?.id || null, duration]
+    );
+
+    io.to(id).emit("queue_updated");
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Add recommendation error:", err);
+    res.status(500).json({ error: "Failed to add song" });
   }
 });
