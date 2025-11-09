@@ -14,6 +14,45 @@ const generateResetToken = () => crypto.randomBytes(32).toString("hex");
 
 const hashPassword = (password) => bcrypt.hash(password, 10);
 
+// ---------------------------------------------------------------
+// 1. NEW DEPENDENCIES
+// ---------------------------------------------------------------
+const { Configuration, OpenAIApi } = require("openai");
+
+// ---------------------------------------------------------------
+// OPENAI v4+ (openai@6.8.1) – korrekte Initialisierung
+// ---------------------------------------------------------------
+const { OpenAI } = require("openai");
+
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+if (!OPENAI_API_KEY) {
+  console.warn("OPENAI_API_KEY missing – recommendations disabled");
+}
+
+let openai = null;
+if (OPENAI_API_KEY) {
+  openai = new OpenAI({
+    apiKey: OPENAI_API_KEY,
+  });
+}
+
+// ---------------------------------------------------------------
+// 3. HELPER: safe JSON parsing from OpenAI
+// ---------------------------------------------------------------
+const safeParseOpenAI = (text) => {
+  if (!text) return [];
+  try {
+    const cleaned = text
+      .replace(/^```(?:json)?\s*|\s*```$/g, "")
+      .trim();
+    const parsed = JSON.parse(cleaned);
+    return Array.isArray(parsed) ? parsed.filter(s => s.title && s.youtubeId) : [];
+  } catch (e) {
+    console.warn("OpenAI JSON parse failed:", e.message, "\nRaw:", text);
+    return [];
+  }
+};
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -510,6 +549,263 @@ app.get("/sessions/:id/queue", async (req, res) => {
     [id],
   );
   res.json(queue);
+});
+
+// Levenshtein-Distanz (JS-Version)
+const levenshteinDistance = (s1, s2) => {
+  const track = Array(s2.length + 1).fill(null).map(() =>
+    Array(s1.length + 1).fill(null)
+  );
+  for (let i = 0; i <= s1.length; i += 1) track[0][i] = i;
+  for (let j = 0; j <= s2.length; j += 1) track[j][0] = j;
+
+  for (let j = 1; j <= s2.length; j += 1) {
+    for (let i = 1; i <= s1.length; i += 1) {
+      const indicator = s1[i - 1] === s2[j - 1] ? 0 : 1;
+      track[j][i] = Math.min(
+        track[j][i - 1] + 1,
+        track[j - 1][i] + 1,
+        track[j - 1][i - 1] + indicator
+      );
+    }
+  }
+  return track[s2.length][s1.length];
+};
+
+// Levenshtein-Ratio (0–100)
+const levenshteinRatio = (s1, s2) => {
+  const longer = s1.length > s2.length ? s1 : s2;
+  const shorter = s1.length > s2.length ? s2 : s1;
+  if (longer.length === 0) return 100;
+  return Math.round(((longer.length - levenshteinDistance(longer, shorter)) / longer.length) * 100);
+};
+
+// ---------------------------------------------------------------
+// UPDATED ENDPOINT – GET RECOMMENDATIONS (AI + YouTube Search + Memory + Levenshtein)
+// ---------------------------------------------------------------
+app.get("/sessions/:id/recommendations", async (req, res) => {
+  const { id } = req.params;
+
+  // ---- Auth ----
+  const token = req.headers.authorization?.split(" ")[1];
+  const guestToken = req.headers["x-guest-token"];
+  const user = token ? await getUserFromToken(token) : null;
+  const guest = guestToken ? await getUserFromToken(guestToken) : null;
+  if (!user && !guest) return res.status(401).json({ error: "Unauthorized" });
+
+  // ---- Session check ----
+  const [sessionRows] = await pool.query(
+    "SELECT is_live FROM sessions WHERE id = ? AND is_active = 1",
+    [id]
+  );
+  if (!sessionRows[0]?.is_live) return res.status(400).json({ error: "Session not live" });
+
+  // ---- Aktuelle Queue holen ----
+  const [queueRows] = await pool.query(
+    `
+    SELECT yvc.title
+    FROM queue_items qi
+    JOIN youtube_video_cache yvc ON qi.video_id = yvc.youtube_id
+    WHERE qi.session_id = ?
+      AND qi.item_type = 'music'
+      AND qi.status IN ('queued','playing')
+      AND qi.played = 0
+    ORDER BY qi.id ASC
+    LIMIT 3
+    `,
+    [id]
+  );
+
+  const titles = queueRows.map(r => r.title);
+  if (titles.length < 2) return res.status(200).json([]);
+
+  // ---- Prompt für AI ----
+const prompt = `
+You are a music recommendation engine. Your job is to suggest songs that exist in our database.
+
+RULES (MUST FOLLOW EXACTLY):
+1. Output songs in this format: "Artist - Song Title"
+2. NEVER include "(feat. ...)", "[Official...]", "(Official...)", "Remix", "Live", "Lyric Video"
+3. Use only the MAIN ARTIST and SONG TITLE
+4. The song MUST have an official YouTube music video
+5. You must know the EXACT YouTube video ID
+6. NEVER suggest any song that is already in the Current Queue
+
+Examples of CORRECT format:
+- "Dua Lipa - Levitating"
+- "Beyoncé - Halo"
+- "Khalid - Better"
+
+Examples of WRONG format:
+- "Dua Lipa - Levitating (feat. DaBaby) [Official Music Video]"
+- "Beyoncé - Halo (Official Video)"
+
+Current queue: ${JSON.stringify(titles)}
+
+Instructions:
+- Recommend 3 completely new songs NOT in the Current Queue.
+- Output ONLY songs in the EXACT format above.
+- Output ONLY JSON array:
+[{"title": "Artist - Song Title"}]
+`;
+
+
+  // ---- Helper: normalize ----
+  const normalize = (str) =>
+    str.toLowerCase()
+      .replace(/\(.*\)|\[.*\]/g, "")
+      .replace(/official|video|audio|lyric|visualizer|live|remix|explicit|clean/gi, "")
+      .replace(/ft\.?|feat\.?|featuring/gi, "")
+      .replace(/[^\w\s]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  // ---- Helper: Levenshtein ----
+  const levenshteinDistance = (s1, s2) => {
+    const track = Array(s2.length + 1).fill(null).map(() => Array(s1.length + 1).fill(null));
+    for (let i = 0; i <= s1.length; i++) track[0][i] = i;
+    for (let j = 0; j <= s2.length; j++) track[j][0] = j;
+    for (let j = 1; j <= s2.length; j++) {
+      for (let i = 1; i <= s1.length; i++) {
+        const indicator = s1[i - 1] === s2[j - 1] ? 0 : 1;
+        track[j][i] = Math.min(track[j][i - 1] + 1, track[j - 1][i] + 1, track[j - 1][i - 1] + indicator);
+      }
+    }
+    return track[s2.length][s1.length];
+  };
+  const levenshteinRatio = (s1, s2) => {
+    const longer = s1.length > s2.length ? s1 : s2;
+    const shorter = s1.length > s2.length ? s2 : s1;
+    if (longer.length === 0) return 100;
+    return Math.round(((longer.length - levenshteinDistance(longer, shorter)) / longer.length) * 100);
+  };
+
+  try {
+    console.log("[OpenAI] Requesting recommendations for session:", id);
+    const completion = await openai.chat.completions.create({
+      model: "gpt-3.5-turbo",
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0.7,
+      max_tokens: 400,
+    });
+
+    const raw = completion.choices?.[0]?.message?.content || "";
+
+    // ---- Robust JSON parse ----
+    let aiSuggestions = [];
+    try {
+      const cleaned = raw.replace(/```json|```/g, "").trim();
+      aiSuggestions = JSON.parse(cleaned);
+    } catch (e) {
+      console.warn("[OpenAI] Failed to parse JSON:", raw);
+    }
+    if (!Array.isArray(aiSuggestions)) aiSuggestions = [];
+    aiSuggestions = aiSuggestions.filter(s => s?.title && typeof s.youtubeId === "string" && s.youtubeId.length === 11);
+
+    const results = [];
+
+    for (const s of aiSuggestions) {
+      const normalizedAI = normalize(s.title);
+
+      // --- DB Lookup: alle Songs aus Cache holen ---
+      const [rows] = await pool.query(`SELECT * FROM youtube_video_cache`);
+      let bestMatch = null;
+      let bestScore = 0;
+
+      for (const row of rows) {
+        const score = levenshteinRatio(normalizedAI, row.title_norm);
+        if (score > bestScore) {
+          bestScore = score;
+          bestMatch = row;
+        }
+      }
+
+      if (bestMatch && bestScore > 90) { // >90% match
+        results.push({
+          title: bestMatch.title,
+          youtubeId: bestMatch.youtube_id,
+          thumbnail: bestMatch.thumbnail || "",
+        });
+        continue;
+      }
+
+      // --- Fallback: YouTube API ---
+      try {
+        const searchQuery = s.title.replace(/\(feat.*\)/gi, "").replace(/\[feat.*\]/gi, "").trim();
+        const ytRes = await axios.get("https://www.googleapis.com/youtube/v3/search", {
+          params: { part: "snippet", q: searchQuery, type: "video", videoCategoryId: "10", maxResults: 1, key: YOUTUBE_KEY }
+        });
+
+        const item = ytRes.data.items?.[0];
+        if (!item) continue;
+
+        const videoId = item.id.videoId;
+        const title = item.snippet.title;
+        const thumbnail = item.snippet.thumbnails.medium?.url || "";
+        const titleNorm = normalize(title);
+
+        await pool.query(
+          `INSERT INTO youtube_video_cache (youtube_id, title, title_norm, thumbnail)
+           VALUES (?, ?, ?, ?)
+           ON DUPLICATE KEY UPDATE title=VALUES(title), title_norm=VALUES(title_norm), thumbnail=VALUES(thumbnail)`,
+          [videoId, title, titleNorm, thumbnail]
+        );
+
+        results.push({ title, youtubeId: videoId, thumbnail });
+      } catch (err) {
+        console.warn(`[YouTube] Search failed for "${s.title}":`, err.message);
+      }
+    }
+
+    console.log(`[Recommend] ${results.length} results generated for session ${id}`);
+    return res.json(results);
+
+  } catch (err) {
+    console.error("[Recommendation Error]", err);
+    res.status(500).json({ error: "Recommendation failed" });
+  }
+});
+
+
+// ---------------------------------------------------------------
+// 5. NEW ENDPOINT – ADD RECOMMENDED SONG (click → queue)
+// ---------------------------------------------------------------
+app.post("/sessions/:id/recommendations/add", async (req, res) => {
+  const { id } = req.params;
+  const { youtubeId } = req.body; // nur youtubeId vom Client nötig
+
+  const token = req.headers.authorization?.split(" ")[1];
+  const guestToken = req.headers["x-guest-token"];
+  const user = token ? await getUserFromToken(token) : null;
+  const guest = guestToken ? await getGuestFromToken(guestToken) : null;
+  if (!user && !guest) return res.status(401).json({ error: "Unauthorized" });
+
+  try {
+    // --- Hole Video-Infos aus youtube_video_cache ---
+    const [rows] = await pool.query(
+      `SELECT title, thumbnail, duration FROM youtube_video_cache WHERE youtube_id = ? LIMIT 1`,
+      [youtubeId]
+    );
+
+    if (!rows[0]) {
+      return res.status(404).json({ error: "Video nicht gefunden im Cache" });
+    }
+
+    const { title, thumbnail, duration } = rows[0];
+
+    await pool.query(
+      `INSERT INTO queue_items 
+       (session_id, item_type, video_id, title, thumbnail, added_by, guest_id, status, played, duration)
+       VALUES (?, 'music', ?, ?, ?, ?, ?, 'queued', 0, ?)`,
+      [id, youtubeId, title, thumbnail, user?.id || null, guest?.id || null, duration || 0]
+    );
+
+    io.to(id).emit("queue_updated");
+    res.json({ success: true, youtubeId, title, thumbnail, duration });
+  } catch (err) {
+    console.error("Add recommendation error:", err);
+    res.status(500).json({ error: "Failed to add song" });
+  }
 });
 
 // === Proposals endpoint (POST) ===
