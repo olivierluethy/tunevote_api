@@ -62,7 +62,7 @@ CREATE TABLE session_participants (
 CREATE TABLE queue_items (
   id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
   session_id INT NOT NULL,
-  fk_video_id INT NOT NULL,
+  fk_video_id INT,
   added_by INT DEFAULT NULL,
   guest_id INT DEFAULT NULL,
   status ENUM('queued','playing','played','skipped') DEFAULT 'queued',

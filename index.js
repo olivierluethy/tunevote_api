@@ -123,6 +123,40 @@ const getGuestFromToken = async (guestToken) => {
   }
 };
 
+// Hilfsfunktion: Queue holen
+async function getQueue(sessionId) {
+  const [rows] = await pool.query(
+    `SELECT 
+       qi.id,
+       qi.session_id,
+       qi.fk_video_id,
+       qi.added_by,
+       qi.guest_id,
+       qi.status,
+       qi.played,
+       qi.duration,
+       qi.item_type,
+       qi.description,
+       yvc.youtube_id,
+       yvc.title,
+       yvc.thumbnail,
+       u.username AS addedByUser,
+       g.nickname AS addedByGuest
+     FROM queue_items qi
+     LEFT JOIN youtube_video_cache yvc ON qi.fk_video_id = yvc.id
+     LEFT JOIN users u ON qi.added_by = u.id
+     LEFT JOIN guest_users g ON qi.guest_id = g.id
+     WHERE qi.session_id = ?
+     ORDER BY qi.id ASC`,
+    [sessionId]
+  );
+
+  return rows.map((item) => ({
+    ...item,
+    addedBy: item.addedByUser || item.addedByGuest || "Gast",
+  }));
+}
+
 const ensureParticipant = async (
   sessionId,
   user = null,
@@ -482,6 +516,7 @@ app.get("/sessions/:id", async (req, res) => {
 // GET /sessions/:id/queue
 app.get("/sessions/:id/queue", async (req, res) => {
   const { id } = req.params;
+
   const [rows] = await pool.query(
     `SELECT 
        qi.id,
@@ -497,17 +532,26 @@ app.get("/sessions/:id/queue", async (req, res) => {
        yvc.youtube_id,
        yvc.title,
        yvc.thumbnail,
-       u.username AS addedBy
+       u.username AS addedByUser,
+       g.nickname AS addedByGuest
      FROM queue_items qi
      LEFT JOIN youtube_video_cache yvc ON qi.fk_video_id = yvc.id
      LEFT JOIN users u ON qi.added_by = u.id
+     LEFT JOIN guest_users g ON qi.guest_id = g.id
      WHERE qi.session_id = ?
      ORDER BY qi.id ASC`,
     [id]
   );
 
-  res.json(rows);
+  // Einheitliches Feld `addedBy` vorbereiten
+  const formatted = rows.map((item) => ({
+    ...item,
+    addedBy: item.addedByUser || item.addedByGuest || "Gast",
+  }));
+
+  res.json(formatted);
 });
+
 
 // === Proposals endpoint (POST) ===
 app.post("/sessions/:id/proposals", async (req, res) => {
@@ -532,18 +576,20 @@ app.post("/sessions/:id/proposals", async (req, res) => {
     // === 1. FALL: PAUSE ===
     if (item_type === "pause") {
       await pool.query(
-        `INSERT INTO queue_items 
-         (session_id, item_type, description, duration, added_by, guest_id, status, played)
-         VALUES (?, 'pause', ?, ?, ?, ?, 'queued', 0)`,
-        [
-          id,
-          description || "Pause",
-          duration || 30,
-          user?.id || null,
-          guest?.id || null
-        ]
-      );
+  `INSERT INTO queue_items 
+   (session_id, item_type, description, duration, added_by, guest_id, status, played)
+   VALUES (?, 'pause', ?, ?, ?, ?, 'queued', 0)`,
+  [
+    id,
+    description || "Pause",
+    duration || 30,
+    user?.id || null,
+    guest?.id || null
+  ]
+);
 
+
+      const queue = await getQueue(id);
       io.to(id).emit("queue_updated", {});
       return res.status(201).json({ success: true, type: "pause" });
     }
@@ -621,6 +667,7 @@ app.post("/sessions/:id/proposals", async (req, res) => {
         throw dbErr;
       }
 
+      const queue = await getQueue(id);
       io.to(id).emit("queue_updated", {});
       return res.status(201).json({ success: true, type: "music" });
 
@@ -675,6 +722,7 @@ app.post("/sessions/:id/queue/add", async (req, res) => {
       [id, videoId, title, thumbnail, user.id, "queued", duration],
     );
 
+    const queue = await getQueue(id);
     io.to(id).emit("queue_updated", {});
     res.json({ success: true });
   } catch (err) {
