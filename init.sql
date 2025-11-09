@@ -25,6 +25,7 @@ CREATE TABLE youtube_video_cache (
   youtube_id VARCHAR(255) NOT NULL UNIQUE,
   title VARCHAR(255) NOT NULL,
   title_norm VARCHAR(255) NOT NULL UNIQUE,
+  duration INT DEFAULT NULL,
   thumbnail TEXT,
   cached_at DATETIME DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
@@ -59,28 +60,29 @@ CREATE TABLE session_participants (
   CONSTRAINT session_participants_ibfk_3 FOREIGN KEY (guest_id) REFERENCES guest_users (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
-CREATE TABLE queue_items (
-  id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-  session_id INT NOT NULL,
-  fk_video_id INT,
-  added_by INT DEFAULT NULL,
-  guest_id INT DEFAULT NULL,
-  status ENUM('queued','playing','played','skipped') DEFAULT 'queued',
-  created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-  played TINYINT(1) DEFAULT '0',
-  playedAt DATETIME DEFAULT NULL,
-  startedAt DATETIME DEFAULT NULL,
-  duration INT DEFAULT NULL,
-  item_type enum('music','pause') NOT NULL DEFAULT 'music',
+CREATE TABLE `queue_items` (
+  `id` int NOT NULL AUTO_INCREMENT,
+  `session_id` int NOT NULL,
+  `video_id` varchar(20),
+  `title` varchar(150) NOT NULL,
+  `thumbnail` varchar(255) DEFAULT NULL,
+  `added_by` int DEFAULT NULL,
+  `guest_id` int DEFAULT NULL,
+  `status` enum('queued','playing','played','skipped') DEFAULT 'queued',
+  `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
+  `played` tinyint(1) DEFAULT '0',
+  `playedAt` datetime DEFAULT NULL,
+  `startedAt` datetime DEFAULT NULL,
+  `duration` int DEFAULT NULL,
   description varchar(255) DEFAULT NULL,
-  UNIQUE KEY unique_session_video (session_id,fk_video_id),
-  KEY added_by (added_by),
-  KEY guest_id (guest_id),
-  KEY fk_video_id (fk_video_id),
-  CONSTRAINT queue_items_ibfk_1 FOREIGN KEY (session_id) REFERENCES sessions (id) ON DELETE CASCADE,
-  CONSTRAINT queue_items_ibfk_2 FOREIGN KEY (added_by) REFERENCES users (id) ON DELETE SET NULL,
-  CONSTRAINT queue_items_ibfk_3 FOREIGN KEY (guest_id) REFERENCES guest_users (id) ON DELETE SET NULL,
-  CONSTRAINT fk_queue_video FOREIGN KEY (fk_video_id) REFERENCES youtube_video_cache (id) ON DELETE RESTRICT
+  item_type enum('music','pause') NOT NULL DEFAULT 'music',
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `unique_session_video` (`session_id`,`video_id`),
+  KEY `added_by` (`added_by`),
+  KEY `guest_id` (`guest_id`),
+  CONSTRAINT `queue_items_ibfk_1` FOREIGN KEY (`session_id`) REFERENCES `sessions` (`id`) ON DELETE CASCADE,
+  CONSTRAINT `queue_items_ibfk_2` FOREIGN KEY (`added_by`) REFERENCES `users` (`id`) ON DELETE SET NULL,
+  CONSTRAINT `queue_items_ibfk_3` FOREIGN KEY (`guest_id`) REFERENCES `guest_users` (`id`) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE playback_sync (
