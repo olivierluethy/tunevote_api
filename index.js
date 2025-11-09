@@ -1001,6 +1001,35 @@ app.post('/reset-password', async (req, res) => {
   }
 });
 
+// Levenshtein-Distanz (JS-Version)
+const levenshteinDistance = (s1, s2) => {
+  const track = Array(s2.length + 1).fill(null).map(() =>
+    Array(s1.length + 1).fill(null)
+  );
+  for (let i = 0; i <= s1.length; i += 1) track[0][i] = i;
+  for (let j = 0; j <= s2.length; j += 1) track[j][0] = j;
+
+  for (let j = 1; j <= s2.length; j += 1) {
+    for (let i = 1; i <= s1.length; i += 1) {
+      const indicator = s1[i - 1] === s2[j - 1] ? 0 : 1;
+      track[j][i] = Math.min(
+        track[j][i - 1] + 1,
+        track[j - 1][i] + 1,
+        track[j - 1][i - 1] + indicator
+      );
+    }
+  }
+  return track[s2.length][s1.length];
+};
+
+// Levenshtein-Ratio (0–100)
+const levenshteinRatio = (s1, s2) => {
+  const longer = s1.length > s2.length ? s1 : s2;
+  const shorter = s1.length > s2.length ? s2 : s1;
+  if (longer.length === 0) return 100;
+  return Math.round(((longer.length - levenshteinDistance(longer, shorter)) / longer.length) * 100);
+};
+
 // ---------------------------------------------------------------
 // 4. UPDATED ENDPOINT – GET RECOMMENDATIONS (AI + YouTube Search + Memory)
 // ---------------------------------------------------------------
@@ -1011,12 +1040,12 @@ app.get("/sessions/:id/recommendations", async (req, res) => {
   const token = req.headers.authorization?.split(" ")[1];
   const guestToken = req.headers["x-guest-token"];
   const user = token ? await getUserFromToken(token) : null;
-  const guest = guestToken ? await getGuestFromToken(guestToken) : null;
+  const guest = guestToken ? await getUserFromToken(guestToken) : null;
   if (!user && !guest) return res.status(401).json({ error: "Unauthorized" });
 
   // ---- Session check ----
   const [sessionRows] = await pool.query(
-    "SELECT is_live FROM sessions WHERE id = ?",
+    "SELECT is_live FROM sessions WHERE id = ? AND is_active = 1",
     [id]
   );
   if (!sessionRows[0]?.is_live)
@@ -1024,155 +1053,153 @@ app.get("/sessions/:id/recommendations", async (req, res) => {
 
   // ---- Aktuelle Queue holen ----
   const [queueRows] = await pool.query(
-    `SELECT title FROM queue_items 
-     WHERE session_id = ? AND item_type = 'music' AND played = 0
-     ORDER BY id ASC LIMIT 3`,
+    `
+    SELECT yvc.title
+    FROM queue_items qi
+    JOIN youtube_video_cache yvc ON qi.fk_video_id = yvc.id
+    WHERE qi.session_id = ?
+      AND qi.item_type = 'music'
+      AND qi.status IN ('queued','playing')
+      AND qi.played = 0
+    ORDER BY qi.id ASC
+    LIMIT 3
+    `,
     [id]
   );
+
   const titles = queueRows.map((r) => r.title);
   if (titles.length < 2) return res.status(200).json([]);
 
-  // ---- Cache prüfen ----
-  const [cacheRows] = await pool.query(
-    "SELECT data, expires FROM recommendation_cache WHERE session_id = ?",
-    [id]
-  );
-  const cached = cacheRows?.[0];
-  const cacheStillValid =
-    cached && new Date(cached.expires) > new Date() && cached.data;
-
-  // ---- Wenn Cache noch gültig, verwende ihn ----
-  if (cacheStillValid) {
-    const data =
-      typeof cached.data === "string" ? JSON.parse(cached.data) : cached.data;
-    return res.json(data);
-  }
-
-  // ---- Falls Cache existiert, extrahiere alte Titel (um Dopplungen zu vermeiden) ----
-  let previousTitles = [];
-  if (cached?.data) {
-    try {
-      const prev = typeof cached.data === "string" ? JSON.parse(cached.data) : cached.data;
-      previousTitles = Array.isArray(prev)
-        ? prev.map((r) => r.title).filter(Boolean)
-        : [];
-    } catch (e) {
-      console.warn("[Cache] Failed to parse old recommendations");
-    }
-  }
-
-  // ---- Kombinierte Prompt mit Vermeidung von Duplikaten ----
+  // ---- Prompt für AI ----
   const prompt = `
-You are a music recommendation engine with up-to-date knowledge of popular songs and their official YouTube music videos (as of mid-2025).
+You are a music recommendation engine. Your job is to suggest songs that exist in our database.
 
-I will give you a list of current songs (artist + title).
-Your task: Recommend 2 to 3 **new** additional songs that match in style, mood, energy, or theme — only songs with official, high-quality YouTube music videos (VEVO, official artist channels, or label uploads).
+RULES (MUST FOLLOW EXACTLY):
+1. Output songs in this format: "Artist - Song Title"
+2. NEVER include "(feat. ...)", "[Official...]", "(Official...)", "Remix", "Live", "Lyric Video"
+3. Use only the MAIN ARTIST and SONG TITLE
+4. The song MUST have an official YouTube music video
+5. You must know the EXACT YouTube video ID
 
-Avoid recommending any songs that have already been suggested before in this session:
-${previousTitles.length > 0 ? JSON.stringify(previousTitles, null, 2) : "[]"}
+Examples of CORRECT format:
+- "Dua Lipa - Levitating"
+- "Beyoncé - Halo"
+- "Khalid - Better"
 
-Rules:
-Only suggest songs that are widely known and have stable, official YouTube videos (e.g., from VEVO, Warner, Sony, Universal, or official artist channels).
-Do NOT suggest remixes, fan uploads, lyric videos, or deleted/unavailable content.
-You must know the exact YouTube video ID from your training data — do not guess or fabricate IDs.
-If you're unsure about a video ID, skip that song — never output an invalid or broken link.
+Examples of WRONG format:
+- "Dua Lipa - Levitating (feat. DaBaby) [Official Music Video]"
+- "Beyoncé - Halo (Official Video)"
 
-Output only a JSON array of objects with:
-"title": Full "Artist - Song Title"
-"youtubeId": The correct, official YouTube video ID (11 characters)
+Current queue: ${JSON.stringify(titles)}
 
-No explanations, no extra text, no markdown.
-
-Now recommend new songs for:
-${JSON.stringify(titles)}
+Recommend 2-3 new songs in EXACT format above.
+Output ONLY JSON array:
+[{"title": "Artist - Song Title", "youtubeId": "11-char-id"}]
 `;
+
+  // ---- Normalisierungsfunktion (einmal, außerhalb!) ----
+  const normalize = (str) =>
+    str
+      .toLowerCase()
+      .replace(/\(.*\)/g, "")
+      .replace(/\[.*\]/g, "")
+      .replace(/official|video|audio|lyric|visualizer|live|remix|explicit|clean/gi, "")
+      .replace(/ft\.?|feat\.?|featuring/gi, "")
+      .replace(/[^\w\s]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
 
   try {
     console.log("[OpenAI] Requesting recommendations for session:", id);
     const completion = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
+      model: "gpt-3.5-turbo",
       messages: [{ role: "user", content: prompt }],
       temperature: 0.7,
       max_tokens: 400,
     });
 
     const raw = completion.choices?.[0]?.message?.content || "";
-    let aiSuggestions = safeParseOpenAI(raw);
-
-    if (!Array.isArray(aiSuggestions)) aiSuggestions = [];
-    aiSuggestions = aiSuggestions.filter((s) => s?.title);
-
-    // ---- YouTube Search ----
-    // ---- Optimierte YouTube Batch Search ----
-const results = [];
-
-if (aiSuggestions.length > 0) {
-  // Kombinierte Query mit Pipe-Operator (OR-Suche)
-  const query = aiSuggestions.map((s) => `"${s.title}"`).join("|");
-
-  let ytRes;
-  try {
-    ytRes = await axios.get("https://www.googleapis.com/youtube/v3/search", {
-      params: {
-        part: "snippet",
-        q: query,
-        type: "video",
-        videoCategoryId: "10",
-        maxResults: 15, // genug für mehrere Treffer
-        key: YOUTUBE_KEY,
-      },
-    });
-  } catch (err) {
-    console.error("[YouTube] Batch search failed:", err.message);
-    ytRes = { data: { items: [] } };
-  }
-
-  // Hilfsfunktion zum Normalisieren
-  const normalize = (str) =>
-    str.toLowerCase().replace(/[^\w\s]/g, "").trim();
-
-  // Titel-Matching
-  for (const s of aiSuggestions) {
-    const match = ytRes.data.items.find((item) => {
-      const t = normalize(item.snippet.title);
-      const q = normalize(s.title);
-      return t.includes(q) || q.includes(t.split(" ")[0]);
-    });
-
-    if (match) {
-      results.push({
-        title: match.snippet.title,
-        youtubeId: match.id.videoId,
-        thumbnail: match.snippet.thumbnails.medium?.url || "",
-      });
-    } else {
-      console.warn(`[YouTube] No match for "${s.title}"`);
+    
+    // ---- Robuste JSON-Parsing-Funktion (sicher!) ----
+    let aiSuggestions = [];
+    try {
+      const cleaned = raw.trim().replace(/```json|```/g, "").trim();
+      aiSuggestions = JSON.parse(cleaned);
+    } catch (e) {
+      console.warn("[OpenAI] Failed to parse JSON:", raw);
     }
-  }
-}
+    if (!Array.isArray(aiSuggestions)) aiSuggestions = [];
+    aiSuggestions = aiSuggestions.filter((s) => s?.title && typeof s.youtubeId === "string" && s.youtubeId.length === 11);
 
+    // ---- YouTube Lookup + Cache ----
+    const results = [];
 
-    // ---- Neue Ergebnisse mit bisherigen zusammenführen (ohne Duplikate) ----
-    const merged = [
-      ...(previousTitles.length
-        ? previousTitles.map((title) => ({ title })) // alte Titel rekonstruieren
-        : []),
-      ...results,
-    ].reduce((acc, curr) => {
-      if (!acc.some((s) => s.title === curr.title)) acc.push(curr);
-      return acc;
-    }, []);
+    for (const s of aiSuggestions) {
+      // 1. Normalisiere AI-Vorschlag → exakt wie title_norm
+      const normalized = normalize(s.title);
 
-    // ---- Cache aktualisieren ----
-    const expires = new Date(Date.now() + 5 * 60 * 1000);
-    await pool.query(
-      `INSERT INTO recommendation_cache (session_id, data, expires)
-       VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE data = ?, expires = ?`,
-      [id, JSON.stringify(merged), expires, JSON.stringify(merged), expires]
-    );
+      // 2. Exakter Match in DB über title_norm
+      const [rows] = await pool.query(
+        `SELECT * FROM youtube_video_cache 
+         WHERE title_norm = ? 
+         LIMIT 1`,
+        [normalized]
+      );
 
-    console.log(`[Recommend] ${results.length} new results cached for session ${id}`);
-    return res.json(merged);
+      if (rows[0]) {
+        results.push({
+          title: rows[0].title,
+          youtubeId: rows[0].youtube_id,
+          thumbnail: rows[0].thumbnail || "",
+        });
+        continue;
+      }
+
+      // 3. Nur bei echtem Miss → YouTube API
+      try {
+        const searchQuery = s.title
+          .replace(/\(feat\.?.*?\)/gi, "")
+          .replace(/\[feat\.?.*?\]/gi, "")
+          .replace(/official music video/gi, "")
+          .trim();
+
+        const ytRes = await axios.get("https://www.googleapis.com/youtube/v3/search", {
+          params: {
+            part: "snippet",
+            q: searchQuery,
+            type: "video",
+            videoCategoryId: "10",
+            maxResults: 1,
+            key: YOUTUBE_KEY,
+          },
+        });
+
+        const item = ytRes.data.items?.[0];
+        if (!item) continue;
+
+        const videoId = item.id.videoId;
+        const title = item.snippet.title;
+        const thumbnail = item.snippet.thumbnails.medium?.url || "";
+        const titleNorm = normalize(title);
+
+        await pool.query(
+          `INSERT INTO youtube_video_cache (youtube_id, title, title_norm, thumbnail)
+           VALUES (?, ?, ?, ?)
+           ON DUPLICATE KEY UPDATE 
+             title = VALUES(title), 
+             title_norm = VALUES(title_norm), 
+             thumbnail = VALUES(thumbnail)`,
+          [videoId, title, titleNorm, thumbnail]
+        );
+
+        results.push({ title, youtubeId: videoId, thumbnail });
+      } catch (err) {
+        console.warn(`[YouTube] Search failed for "${s.title}":`, err.message);
+      }
+    }
+
+    console.log(`[Recommend] ${results.length} results generated for session ${id}`);
+    return res.json(results);
   } catch (err) {
     console.error("[Recommendation Error]", err);
     res.status(500).json({ error: "Recommendation failed" });
