@@ -551,35 +551,6 @@ app.get("/sessions/:id/queue", async (req, res) => {
   res.json(queue);
 });
 
-// Levenshtein-Distanz (JS-Version)
-const levenshteinDistance = (s1, s2) => {
-  const track = Array(s2.length + 1).fill(null).map(() =>
-    Array(s1.length + 1).fill(null)
-  );
-  for (let i = 0; i <= s1.length; i += 1) track[0][i] = i;
-  for (let j = 0; j <= s2.length; j += 1) track[j][0] = j;
-
-  for (let j = 1; j <= s2.length; j += 1) {
-    for (let i = 1; i <= s1.length; i += 1) {
-      const indicator = s1[i - 1] === s2[j - 1] ? 0 : 1;
-      track[j][i] = Math.min(
-        track[j][i - 1] + 1,
-        track[j - 1][i] + 1,
-        track[j - 1][i - 1] + indicator
-      );
-    }
-  }
-  return track[s2.length][s1.length];
-};
-
-// Levenshtein-Ratio (0–100)
-const levenshteinRatio = (s1, s2) => {
-  const longer = s1.length > s2.length ? s1 : s2;
-  const shorter = s1.length > s2.length ? s2 : s1;
-  if (longer.length === 0) return 100;
-  return Math.round(((longer.length - levenshteinDistance(longer, shorter)) / longer.length) * 100);
-};
-
 // ---------------------------------------------------------------
 // UPDATED ENDPOINT – GET RECOMMENDATIONS (AI + YouTube Search + Memory + Levenshtein)
 // ---------------------------------------------------------------
@@ -610,8 +581,7 @@ app.get("/sessions/:id/recommendations", async (req, res) => {
       AND qi.item_type = 'music'
       AND qi.status IN ('queued','playing')
       AND qi.played = 0
-    ORDER BY qi.id ASC
-    LIMIT 3
+    ORDER BY qi.id DESC
     `,
     [id]
   );
@@ -621,15 +591,15 @@ app.get("/sessions/:id/recommendations", async (req, res) => {
 
   // ---- Prompt für AI ----
 const prompt = `
-You are a music recommendation engine. Your job is to suggest songs that exist in our database.
+You are a music recommendation engine. Your job is to suggest popular songs that likely exist on YouTube.
+
 
 RULES (MUST FOLLOW EXACTLY):
 1. Output songs in this format: "Artist - Song Title"
 2. NEVER include "(feat. ...)", "[Official...]", "(Official...)", "Remix", "Live", "Lyric Video"
 3. Use only the MAIN ARTIST and SONG TITLE
 4. The song MUST have an official YouTube music video
-5. You must know the EXACT YouTube video ID
-6. NEVER suggest any song that is already in the Current Queue
+5. NEVER suggest any song that is already in the Current Queue
 
 Examples of CORRECT format:
 - "Dua Lipa - Levitating"
@@ -649,16 +619,15 @@ Instructions:
 [{"title": "Artist - Song Title"}]
 `;
 
-
   // ---- Helper: normalize ----
   const normalize = (str) =>
-    str.toLowerCase()
-      .replace(/\(.*\)|\[.*\]/g, "")
-      .replace(/official|video|audio|lyric|visualizer|live|remix|explicit|clean/gi, "")
-      .replace(/ft\.?|feat\.?|featuring/gi, "")
-      .replace(/[^\w\s]/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
+  str.toLowerCase()
+    .replace(/\(.*\)|\[.*\]/g, "")
+    .replace(/\b(ft\.?|feat\.?|featuring)\b.*$/gi, "") // <--- NEU: entfernt alles nach "ft"/"feat"/"featuring"
+    .replace(/official|video|audio|lyric|visualizer|live|remix|explicit|clean/gi, "")
+    .replace(/[^\w\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 
   // ---- Helper: Levenshtein ----
   const levenshteinDistance = (s1, s2) => {
@@ -700,7 +669,19 @@ Instructions:
       console.warn("[OpenAI] Failed to parse JSON:", raw);
     }
     if (!Array.isArray(aiSuggestions)) aiSuggestions = [];
-    aiSuggestions = aiSuggestions.filter(s => s?.title && typeof s.youtubeId === "string" && s.youtubeId.length === 11);
+    aiSuggestions = aiSuggestions.filter(s => s?.title && typeof s.title === "string");
+
+    // ---- Filter out songs already in the queue ----
+const normalizedQueue = titles.map(t => normalize(t));
+
+aiSuggestions = aiSuggestions.filter(s => {
+  const norm = normalize(s.title);
+  const isDuplicate = normalizedQueue.some(q => levenshteinRatio(q, norm) > 90);
+  if (isDuplicate) console.log(`[Duplicate skipped] "${s.title}" already in queue`);
+  return !isDuplicate;
+});
+
+
 
     const results = [];
 
