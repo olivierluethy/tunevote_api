@@ -590,9 +590,8 @@ app.get("/sessions/:id/recommendations", async (req, res) => {
   if (titles.length < 2) return res.status(200).json([]);
 
   // ---- Prompt für AI ----
-const prompt = `
+  const prompt = `
 You are a music recommendation engine. Your job is to suggest popular songs that likely exist on YouTube.
-
 
 RULES (MUST FOLLOW EXACTLY):
 1. Output songs in this format: "Artist - Song Title"
@@ -619,15 +618,16 @@ Instructions:
 [{"title": "Artist - Song Title"}]
 `;
 
-  // ---- Helper: normalize ----
+  // ---- Helper: normalize (erweitert) ----
+  // ANPASSUNG: Erweitere entfernte Keywords um "mv", "official music video", "music video" usw., für bessere Matches
   const normalize = (str) =>
-  str.toLowerCase()
-    .replace(/\(.*\)|\[.*\]/g, "")
-    .replace(/\b(ft\.?|feat\.?|featuring)\b.*$/gi, "") // <--- NEU: entfernt alles nach "ft"/"feat"/"featuring"
-    .replace(/official|video|audio|lyric|visualizer|live|remix|explicit|clean/gi, "")
-    .replace(/[^\w\s]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+    str.toLowerCase()
+      .replace(/\(.*\)|\[.*\]/g, "")
+      .replace(/\b(ft\.?|feat\.?|featuring)\b.*$/gi, "")
+      .replace(/official|video|audio|lyric|visualizer|live|remix|explicit|clean|mv|music video/gi, "")
+      .replace(/[^\w\s]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
 
   // ---- Helper: Levenshtein ----
   const levenshteinDistance = (s1, s2) => {
@@ -672,16 +672,14 @@ Instructions:
     aiSuggestions = aiSuggestions.filter(s => s?.title && typeof s.title === "string");
 
     // ---- Filter out songs already in the queue ----
-const normalizedQueue = titles.map(t => normalize(t));
+    const normalizedQueue = titles.map(t => normalize(t));
 
-aiSuggestions = aiSuggestions.filter(s => {
-  const norm = normalize(s.title);
-  const isDuplicate = normalizedQueue.some(q => levenshteinRatio(q, norm) > 90);
-  if (isDuplicate) console.log(`[Duplicate skipped] "${s.title}" already in queue`);
-  return !isDuplicate;
-});
-
-
+    aiSuggestions = aiSuggestions.filter(s => {
+      const norm = normalize(s.title);
+      const isDuplicate = normalizedQueue.some(q => levenshteinRatio(q, norm) > 90);
+      if (isDuplicate) console.log(`[Duplicate skipped] "${s.title}" already in queue`);
+      return !isDuplicate;
+    });
 
     const results = [];
 
@@ -701,7 +699,8 @@ aiSuggestions = aiSuggestions.filter(s => {
         }
       }
 
-      if (bestMatch && bestScore > 90) { // >90% match
+      // ANPASSUNG: Senke Threshold auf 80% für mehr DB-Matches (vermeidet YouTube-Fallback)
+      if (bestMatch && bestScore > 80) {
         results.push({
           title: bestMatch.title,
           youtubeId: bestMatch.youtube_id,
@@ -712,17 +711,39 @@ aiSuggestions = aiSuggestions.filter(s => {
 
       // --- Fallback: YouTube API ---
       try {
-        const searchQuery = s.title.replace(/\(feat.*\)/gi, "").replace(/\[feat.*\]/gi, "").trim();
+        // ANPASSUNG: Füge "official music video" zur Query für bessere Treffer; entferne videoCategoryId für breitere Suche
+        // Erhöhe maxResults auf 5 und wähle bestes Match
+        const searchQuery = `${s.title.replace(/\(feat.*\)/gi, "").replace(/\[feat.*\]/gi, "").trim()} official music video`;
         const ytRes = await axios.get("https://www.googleapis.com/youtube/v3/search", {
-          params: { part: "snippet", q: searchQuery, type: "video", videoCategoryId: "10", maxResults: 1, key: YOUTUBE_KEY }
+          params: { 
+            part: "snippet", 
+            q: searchQuery, 
+            type: "video", 
+            maxResults: 5,  // ANPASSUNG: Mehr Results für Auswahl
+            key: YOUTUBE_KEY 
+          }
         });
 
-        const item = ytRes.data.items?.[0];
-        if (!item) continue;
+        const items = ytRes.data.items || [];
+        if (items.length === 0) continue;
 
-        const videoId = item.id.videoId;
-        const title = item.snippet.title;
-        const thumbnail = item.snippet.thumbnails.medium?.url || "";
+        // ANPASSUNG: Wähle das beste Match aus den Results via Levenshtein
+        let bestYtMatch = null;
+        let bestYtScore = 0;
+        for (const item of items) {
+          const titleNorm = normalize(item.snippet.title);
+          const score = levenshteinRatio(normalizedAI, titleNorm);
+          if (score > bestYtScore) {
+            bestYtScore = score;
+            bestYtMatch = item;
+          }
+        }
+
+        if (!bestYtMatch || bestYtScore < 80) continue;  // ANPASSUNG: Ignoriere schlechte Matches
+
+        const videoId = bestYtMatch.id.videoId;
+        const title = bestYtMatch.snippet.title;
+        const thumbnail = bestYtMatch.snippet.thumbnails.medium?.url || "";
         const titleNorm = normalize(title);
 
         await pool.query(
@@ -734,7 +755,11 @@ aiSuggestions = aiSuggestions.filter(s => {
 
         results.push({ title, youtubeId: videoId, thumbnail });
       } catch (err) {
-        console.warn(`[YouTube] Search failed for "${s.title}":`, err.message);
+        // ANPASSUNG: Besserer Error-Handling für 403 – logge Details
+        console.warn(`[YouTube] Search failed for "${s.title}":`, err.message, err.response?.data);
+        if (err.response?.status === 403) {
+          console.error("[YouTube 403] Überprüfe API-Key Restrictions (z.B. HTTP Referrer) oder Quota!");
+        }
       }
     }
 
@@ -746,7 +771,6 @@ aiSuggestions = aiSuggestions.filter(s => {
     res.status(500).json({ error: "Recommendation failed" });
   }
 });
-
 
 // ---------------------------------------------------------------
 // 5. NEW ENDPOINT – ADD RECOMMENDED SONG (click → queue)
