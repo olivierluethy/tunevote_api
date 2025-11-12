@@ -42,11 +42,11 @@ if (OPENAI_API_KEY) {
 const safeParseOpenAI = (text) => {
   if (!text) return [];
   try {
-    const cleaned = text
-      .replace(/^```(?:json)?\s*|\s*```$/g, "")
-      .trim();
+    const cleaned = text.replace(/^```(?:json)?\s*|\s*```$/g, "").trim();
     const parsed = JSON.parse(cleaned);
-    return Array.isArray(parsed) ? parsed.filter(s => s.title && s.youtubeId) : [];
+    return Array.isArray(parsed)
+      ? parsed.filter((s) => s.title && s.youtubeId)
+      : [];
   } catch (e) {
     console.warn("OpenAI JSON parse failed:", e.message, "\nRaw:", text);
     return [];
@@ -58,10 +58,10 @@ app.use(cors());
 app.use(express.json());
 
 const pool = mysql.createPool({
-  host: process.env.DB_HOST || 'localhost',
-  user: process.env.DB_USER || 'root',
-  password: process.env.DB_PASSWORD || '',
-  database: process.env.DB_NAME || 'tunevote',
+  host: process.env.DB_HOST || "localhost",
+  user: process.env.DB_USER || "root",
+  password: process.env.DB_PASSWORD || "",
+  database: process.env.DB_NAME || "tunevote",
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
@@ -71,7 +71,9 @@ const pool = mysql.createPool({
 (async () => {
   try {
     const connection = await pool.getConnection();
-    const [rows] = await connection.query("SELECT DATABASE() AS db, USER() AS user, NOW() AS time");
+    const [rows] = await connection.query(
+      "SELECT DATABASE() AS db, USER() AS user, NOW() AS time",
+    );
     console.log("✅ MySQL connected successfully!");
     console.log("   Database:", rows[0].db);
     console.log("   User:", rows[0].user);
@@ -80,7 +82,9 @@ const pool = mysql.createPool({
   } catch (err) {
     console.error("❌ MySQL connection failed!");
     console.error("   Error:", err.message);
-    console.error("   Check your .env settings (DB_HOST, DB_USER, DB_PASSWORD, DB_NAME)");
+    console.error(
+      "   Check your .env settings (DB_HOST, DB_USER, DB_PASSWORD, DB_NAME)",
+    );
     process.exit(1); // stop server if DB not reachable
   }
 })();
@@ -108,6 +112,28 @@ const getUserFromToken = async (token) => {
   } catch {
     return null;
   }
+};
+
+const ensureGuestToken = async () => {
+  let guestToken = localStorage.getItem("guestToken");
+  const nickname = localStorage.getItem("guestName") || "Gast";
+
+  // Wenn noch kein Token vorhanden, neuen Gast anlegen
+  if (!guestToken) {
+    try {
+      const { data } = await axios.post("http://localhost:4000/guest/join", {
+        nickname,
+      });
+      guestToken = data.guestToken;
+      localStorage.setItem("guestToken", guestToken);
+      localStorage.setItem("guestName", data.nickname);
+      console.log("New guest created:", data);
+    } catch (err) {
+      console.error("Guest creation failed:", err);
+    }
+  }
+
+  return guestToken;
 };
 
 const getGuestFromToken = async (guestToken) => {
@@ -160,7 +186,7 @@ const advanceToNext = async (sessionId) => {
   try {
     const [sync] = await pool.query(
       "SELECT current_video_id FROM playback_sync WHERE session_id = ?",
-      [sessionId]
+      [sessionId],
     );
     if (!sync[0]) return;
 
@@ -171,22 +197,26 @@ const advanceToNext = async (sessionId) => {
       `UPDATE queue_items 
        SET status = 'played', played = 1, playedAt = NOW() 
        WHERE session_id = ? AND (video_id = ? OR (video_id IS NULL AND ? IS NULL)) AND played = 0`,
-      [sessionId, currentVideoId, currentVideoId]
+      [sessionId, currentVideoId, currentVideoId],
     );
 
     // Check remaining
     const [remaining] = await pool.query(
       "SELECT COUNT(*) as count FROM queue_items WHERE session_id = ? AND played = 0",
-      [sessionId]
+      [sessionId],
     );
 
     if (remaining[0].count === 0) {
       await pool.query(
         `UPDATE queue_items SET status = 'queued', played = 0, playedAt = NULL WHERE session_id = ?`,
-        [sessionId]
+        [sessionId],
       );
-      await pool.query("UPDATE sessions SET is_live = 0 WHERE id = ?", [sessionId]);
-      await pool.query("DELETE FROM playback_sync WHERE session_id = ?", [sessionId]);
+      await pool.query("UPDATE sessions SET is_live = 0 WHERE id = ?", [
+        sessionId,
+      ]);
+      await pool.query("DELETE FROM playback_sync WHERE session_id = ?", [
+        sessionId,
+      ]);
       io.to(sessionId).emit("session_ended", { message: "All items played" });
       io.to(sessionId).emit("queue_updated");
       if (sessionTimers[sessionId]) clearTimeout(sessionTimers[sessionId]);
@@ -201,24 +231,32 @@ const advanceToNext = async (sessionId) => {
        WHERE session_id = ? AND played = 0 
        ORDER BY id ASC 
        LIMIT 1`,
-      [sessionId]
+      [sessionId],
     );
 
     const next = nextItems[0];
     if (!next) return;
 
-    const { id: nextId, video_id: nextVideoId, item_type, duration, title } = next;
+    const {
+      id: nextId,
+      video_id: nextVideoId,
+      item_type,
+      duration,
+      title,
+    } = next;
     const startTime = Date.now();
 
     // Mark as playing
     await pool.query(
       `UPDATE queue_items SET status = 'playing', playedAt = NOW() WHERE id = ?`,
-      [nextId]
+      [nextId],
     );
 
     // PAUSE HANDLING 🟨
     if (item_type === "pause") {
-      console.log(`[Session ${sessionId}] Starting pause: ${title} (${duration}s)`);
+      console.log(
+        `[Session ${sessionId}] Starting pause: ${title} (${duration}s)`,
+      );
 
       io.to(sessionId).emit("pause_started", {
         title,
@@ -231,7 +269,7 @@ const advanceToNext = async (sessionId) => {
         `UPDATE playback_sync 
          SET current_video_id = NULL, is_playing = 0, video_start_time = ? 
          WHERE session_id = ?`,
-        [startTime, sessionId]
+        [startTime, sessionId],
       );
 
       // Timer für das Ende der Pause
@@ -249,7 +287,7 @@ const advanceToNext = async (sessionId) => {
       `UPDATE playback_sync 
        SET current_video_id = ?, video_start_time = ?, is_playing = 1 
        WHERE session_id = ?`,
-      [nextVideoId, startTime, sessionId]
+      [nextVideoId, startTime, sessionId],
     );
 
     io.to(sessionId).emit("playback_sync", {
@@ -260,15 +298,18 @@ const advanceToNext = async (sessionId) => {
     io.to(sessionId).emit("queue_updated");
 
     if (sessionTimers[sessionId]) clearTimeout(sessionTimers[sessionId]);
-    sessionTimers[sessionId] = setTimeout(() => advanceToNext(sessionId), duration * 1000);
+    sessionTimers[sessionId] = setTimeout(
+      () => advanceToNext(sessionId),
+      duration * 1000,
+    );
 
-    console.log(`[Session ${sessionId}] Playing music: ${nextVideoId} (${duration}s)`);
-
+    console.log(
+      `[Session ${sessionId}] Playing music: ${nextVideoId} (${duration}s)`,
+    );
   } catch (err) {
     console.error(`Error advancing queue for session ${sessionId}:`, err);
   }
 };
-
 
 // === Socket.IO ===
 io.on("connection", (socket) => {
@@ -288,7 +329,7 @@ io.on("connection", (socket) => {
 
     await pool.query(
       `DELETE FROM session_participants WHERE session_id = ? AND ${column} = ?`,
-      [sessionId, participantId]
+      [sessionId, participantId],
     );
   });
 
@@ -306,7 +347,7 @@ app.get("/sessions/:id/playback-sync", async (req, res) => {
   try {
     const [rows] = await pool.query(
       "SELECT current_video_id, video_start_time, is_playing FROM playback_sync WHERE session_id = ?",
-      [id]
+      [id],
     );
     res.json(rows[0] || {});
   } catch (err) {
@@ -401,7 +442,7 @@ app.get("/sessions", async (req, res) => {
     try {
       const [rows] = await pool.query(
         "SELECT id, nickname FROM guest_users WHERE guest_token = ?",
-        [guestToken]
+        [guestToken],
       );
       if (rows.length > 0) {
         isGuest = true;
@@ -456,20 +497,25 @@ app.post("/sessions", async (req, res) => {
   try {
     const [result] = await pool.query(
       "INSERT INTO sessions (user_id, title) VALUES (?, ?)",
-      [user.id, title.trim()]
+      [user.id, title.trim()],
     );
 
     // 🔽 Hier Logging hinzufügen:
     console.log("🟢 Session insert result:", result);
 
     const sessionId = result.insertId;
-    console.log("✅ New session created with ID:", sessionId, "by user:", user.id);
+    console.log(
+      "✅ New session created with ID:",
+      sessionId,
+      "by user:",
+      user.id,
+    );
 
     await ensureParticipant(sessionId, user, null, true);
 
     const [newSession] = await pool.query(
       "SELECT s.id, s.title, s.created_at, u.username AS host FROM sessions s JOIN users u ON s.user_id = u.id WHERE s.id = ?",
-      [sessionId]
+      [sessionId],
     );
 
     console.log("📦 Retrieved new session:", newSession[0]);
@@ -498,7 +544,7 @@ app.get("/join", async (req, res) => {
 
     // Live-Session suchen (erste mit is_live = 1)
     const [sessions] = await pool.query(
-      "SELECT id FROM sessions WHERE is_live = 1 ORDER BY created_at ASC LIMIT 1"
+      "SELECT id FROM sessions WHERE is_live = 1 ORDER BY created_at ASC LIMIT 1",
     );
 
     if (sessions.length === 0) {
@@ -544,6 +590,7 @@ app.get("/sessions/:id/queue", async (req, res) => {
     LEFT JOIN users u ON qi.added_by = u.id
     LEFT JOIN guest_users g ON qi.guest_id = g.id
     WHERE qi.session_id = ?
+      AND (qi.status IS NULL OR qi.status NOT IN ('suggested', 'archived'))
     ORDER BY qi.id ASC
   `,
     [id],
@@ -567,9 +614,10 @@ app.get("/sessions/:id/recommendations", async (req, res) => {
   // ---- Session check ----
   const [sessionRows] = await pool.query(
     "SELECT is_live FROM sessions WHERE id = ? AND is_active = 1",
-    [id]
+    [id],
   );
-  if (!sessionRows[0]?.is_live) return res.status(400).json({ error: "Session not live" });
+  if (!sessionRows[0]?.is_live)
+    return res.status(400).json({ error: "Session not live" });
 
   // ---- Aktuelle Queue holen ----
   const [queueRows] = await pool.query(
@@ -583,10 +631,10 @@ app.get("/sessions/:id/recommendations", async (req, res) => {
       AND qi.played = 0
     ORDER BY qi.id DESC
     `,
-    [id]
+    [id],
   );
 
-  const titles = queueRows.map(r => r.title);
+  const titles = queueRows.map((r) => r.title);
   if (titles.length < 2) return res.status(200).json([]);
 
   // ---- Prompt für AI ----
@@ -621,23 +669,33 @@ Instructions:
   // ---- Helper: normalize (erweitert) ----
   // ANPASSUNG: Erweitere entfernte Keywords um "mv", "official music video", "music video" usw., für bessere Matches
   const normalize = (str) =>
-    str.toLowerCase()
+    str
+      .toLowerCase()
       .replace(/\(.*\)|\[.*\]/g, "")
       .replace(/\b(ft\.?|feat\.?|featuring)\b.*$/gi, "")
-      .replace(/official|video|audio|lyric|visualizer|live|remix|explicit|clean|mv|music video/gi, "")
+      .replace(
+        /official|video|audio|lyric|visualizer|live|remix|explicit|clean|mv|music video/gi,
+        "",
+      )
       .replace(/[^\w\s]/g, " ")
       .replace(/\s+/g, " ")
       .trim();
 
   // ---- Helper: Levenshtein ----
   const levenshteinDistance = (s1, s2) => {
-    const track = Array(s2.length + 1).fill(null).map(() => Array(s1.length + 1).fill(null));
+    const track = Array(s2.length + 1)
+      .fill(null)
+      .map(() => Array(s1.length + 1).fill(null));
     for (let i = 0; i <= s1.length; i++) track[0][i] = i;
     for (let j = 0; j <= s2.length; j++) track[j][0] = j;
     for (let j = 1; j <= s2.length; j++) {
       for (let i = 1; i <= s1.length; i++) {
         const indicator = s1[i - 1] === s2[j - 1] ? 0 : 1;
-        track[j][i] = Math.min(track[j][i - 1] + 1, track[j - 1][i] + 1, track[j - 1][i - 1] + indicator);
+        track[j][i] = Math.min(
+          track[j][i - 1] + 1,
+          track[j - 1][i] + 1,
+          track[j - 1][i - 1] + indicator,
+        );
       }
     }
     return track[s2.length][s1.length];
@@ -646,7 +704,10 @@ Instructions:
     const longer = s1.length > s2.length ? s1 : s2;
     const shorter = s1.length > s2.length ? s2 : s1;
     if (longer.length === 0) return 100;
-    return Math.round(((longer.length - levenshteinDistance(longer, shorter)) / longer.length) * 100);
+    return Math.round(
+      ((longer.length - levenshteinDistance(longer, shorter)) / longer.length) *
+        100,
+    );
   };
 
   try {
@@ -669,15 +730,20 @@ Instructions:
       console.warn("[OpenAI] Failed to parse JSON:", raw);
     }
     if (!Array.isArray(aiSuggestions)) aiSuggestions = [];
-    aiSuggestions = aiSuggestions.filter(s => s?.title && typeof s.title === "string");
+    aiSuggestions = aiSuggestions.filter(
+      (s) => s?.title && typeof s.title === "string",
+    );
 
     // ---- Filter out songs already in the queue ----
-    const normalizedQueue = titles.map(t => normalize(t));
+    const normalizedQueue = titles.map((t) => normalize(t));
 
-    aiSuggestions = aiSuggestions.filter(s => {
+    aiSuggestions = aiSuggestions.filter((s) => {
       const norm = normalize(s.title);
-      const isDuplicate = normalizedQueue.some(q => levenshteinRatio(q, norm) > 90);
-      if (isDuplicate) console.log(`[Duplicate skipped] "${s.title}" already in queue`);
+      const isDuplicate = normalizedQueue.some(
+        (q) => levenshteinRatio(q, norm) > 90,
+      );
+      if (isDuplicate)
+        console.log(`[Duplicate skipped] "${s.title}" already in queue`);
       return !isDuplicate;
     });
 
@@ -713,16 +779,22 @@ Instructions:
       try {
         // ANPASSUNG: Füge "official music video" zur Query für bessere Treffer; entferne videoCategoryId für breitere Suche
         // Erhöhe maxResults auf 5 und wähle bestes Match
-        const searchQuery = `${s.title.replace(/\(feat.*\)/gi, "").replace(/\[feat.*\]/gi, "").trim()} official music video`;
-        const ytRes = await axios.get("https://www.googleapis.com/youtube/v3/search", {
-          params: { 
-            part: "snippet", 
-            q: searchQuery, 
-            type: "video", 
-            maxResults: 5,  // ANPASSUNG: Mehr Results für Auswahl
-            key: YOUTUBE_KEY 
-          }
-        });
+        const searchQuery = `${s.title
+          .replace(/\(feat.*\)/gi, "")
+          .replace(/\[feat.*\]/gi, "")
+          .trim()} official music video`;
+        const ytRes = await axios.get(
+          "https://www.googleapis.com/youtube/v3/search",
+          {
+            params: {
+              part: "snippet",
+              q: searchQuery,
+              type: "video",
+              maxResults: 5, // ANPASSUNG: Mehr Results für Auswahl
+              key: YOUTUBE_KEY,
+            },
+          },
+        );
 
         const items = ytRes.data.items || [];
         if (items.length === 0) continue;
@@ -739,7 +811,7 @@ Instructions:
           }
         }
 
-        if (!bestYtMatch || bestYtScore < 80) continue;  // ANPASSUNG: Ignoriere schlechte Matches
+        if (!bestYtMatch || bestYtScore < 80) continue; // ANPASSUNG: Ignoriere schlechte Matches
 
         const videoId = bestYtMatch.id.videoId;
         const title = bestYtMatch.snippet.title;
@@ -750,22 +822,29 @@ Instructions:
           `INSERT INTO youtube_video_cache (youtube_id, title, title_norm, thumbnail)
            VALUES (?, ?, ?, ?)
            ON DUPLICATE KEY UPDATE title=VALUES(title), title_norm=VALUES(title_norm), thumbnail=VALUES(thumbnail)`,
-          [videoId, title, titleNorm, thumbnail]
+          [videoId, title, titleNorm, thumbnail],
         );
 
         results.push({ title, youtubeId: videoId, thumbnail });
       } catch (err) {
         // ANPASSUNG: Besserer Error-Handling für 403 – logge Details
-        console.warn(`[YouTube] Search failed for "${s.title}":`, err.message, err.response?.data);
+        console.warn(
+          `[YouTube] Search failed for "${s.title}":`,
+          err.message,
+          err.response?.data,
+        );
         if (err.response?.status === 403) {
-          console.error("[YouTube 403] Überprüfe API-Key Restrictions (z.B. HTTP Referrer) oder Quota!");
+          console.error(
+            "[YouTube 403] Überprüfe API-Key Restrictions (z.B. HTTP Referrer) oder Quota!",
+          );
         }
       }
     }
 
-    console.log(`[Recommend] ${results.length} results generated for session ${id}`);
+    console.log(
+      `[Recommend] ${results.length} results generated for session ${id}`,
+    );
     return res.json(results);
-
   } catch (err) {
     console.error("[Recommendation Error]", err);
     res.status(500).json({ error: "Recommendation failed" });
@@ -789,7 +868,7 @@ app.post("/sessions/:id/recommendations/add", async (req, res) => {
     // --- Hole Video-Infos aus youtube_video_cache ---
     const [rows] = await pool.query(
       `SELECT title, thumbnail, duration FROM youtube_video_cache WHERE youtube_id = ? LIMIT 1`,
-      [youtubeId]
+      [youtubeId],
     );
 
     if (!rows[0]) {
@@ -802,7 +881,15 @@ app.post("/sessions/:id/recommendations/add", async (req, res) => {
       `INSERT INTO queue_items 
        (session_id, item_type, video_id, title, thumbnail, added_by, guest_id, status, played, duration)
        VALUES (?, 'music', ?, ?, ?, ?, ?, 'queued', 0, ?)`,
-      [id, youtubeId, title, thumbnail, user?.id || null, guest?.id || null, duration || 0]
+      [
+        id,
+        youtubeId,
+        title,
+        thumbnail,
+        user?.id || null,
+        guest?.id || null,
+        duration || 0,
+      ],
     );
 
     io.to(id).emit("queue_updated");
@@ -815,7 +902,7 @@ app.post("/sessions/:id/recommendations/add", async (req, res) => {
 
 // === Proposals endpoint (POST) ===
 app.post("/sessions/:id/proposals", async (req, res) => {
-  const { id } = req.params;
+  const { id: sessionId } = req.params;
   const { videoId, item_type, description } = req.body;
 
   const token = req.headers.authorization?.split(" ")[1];
@@ -824,39 +911,35 @@ app.post("/sessions/:id/proposals", async (req, res) => {
   const guest = await getGuestFromToken(guestToken);
   if (!user && !guest) return res.status(401).json({ error: "Unauthorized" });
 
-  const [sess] = await pool.query("SELECT is_live FROM sessions WHERE id = ?", [id]);
-  if (!sess[0]) return res.status(404).json({ error: "Session not found" });
-
   try {
-    // 🟨 1️⃣ FALL: PAUSE
+    // 🟨 FALL: PAUSE
     if (item_type === "pause") {
       await pool.query(
         `INSERT INTO queue_items 
-         (session_id, item_type, title, description, duration, added_by, guest_id, status, played)
-         VALUES (?, 'pause', ?, ?, ?, ?, ?, 'queued', 0)`,
+         (session_id, item_type, title, description, duration, added_by, guest_id, status, played, item_source)
+         VALUES (?, 'pause', ?, ?, ?, ?, ?, 'queued', 0, ?)`,
         [
-          id,
+          sessionId,
           description || "Pause",
           description || "Pause",
           30,
           user?.id || null,
-          guest?.id || null
-        ]
+          guest?.id || null,
+          user ? "user" : "guest",
+        ],
       );
 
-      io.to(id).emit("queue_updated", {});
+      io.to(sessionId).emit("queue_updated", {});
       return res.status(201).json({ success: true, type: "pause" });
     }
 
-    // 🟦 2️⃣ FALL: MUSIK (aus Cache)
-    if (!videoId) {
-      return res.status(400).json({ error: "Missing videoId" });
-    }
+    // 🟦 FALL: MUSIK
+    if (!videoId) return res.status(400).json({ error: "Missing videoId" });
 
-    // 🎬 Hole Daten aus Cache
+    // 🎬 Hole aus Cache oder YouTube API (nur Cache hier)
     const [rows] = await pool.query(
       "SELECT title, thumbnail, duration FROM youtube_video_cache WHERE youtube_id = ?",
-      [videoId]
+      [videoId],
     );
 
     if (rows.length === 0) {
@@ -865,30 +948,364 @@ app.post("/sessions/:id/proposals", async (req, res) => {
 
     const { title, thumbnail, duration } = rows[0];
 
+    // 🔍 Prüfe, ob eine aktive Votingrunde läuft
+    let [openRounds] = await pool.query(
+      "SELECT id FROM voting_rounds WHERE session_id = ? AND status = 'open' LIMIT 1",
+      [sessionId],
+    );
+
+    let votingRoundId = null;
+    let status = "queued";
+
+    if (openRounds.length === 0) {
+      // ⚡️ Keine offene Runde → Neue Votingrunde starten
+      const [result] = await pool.query(
+        "INSERT INTO voting_rounds (session_id, status, created_at) VALUES (?, 'open', NOW())",
+        [sessionId],
+      );
+      votingRoundId = result.insertId;
+      status = "suggested";
+    } else {
+      // ✅ Es gibt eine laufende Runde → Song dieser zuordnen
+      votingRoundId = openRounds[0].id;
+      status = "suggested";
+    }
+
+    // Prüfe, wie viele Songs in der aktuellen Voting-Runde schon vorgeschlagen sind
+    const [proposalCount] = await pool.query(
+      `SELECT COUNT(*) AS count 
+   FROM queue_items 
+   WHERE session_id = ? 
+     AND status = 'suggested'
+     AND voting_round_id = ?`,
+      [sessionId, votingRoundId],
+    );
+
+    if (proposalCount[0].count >= 5) {
+      return res
+        .status(400)
+        .json({ message: "Maximal 5 Songs pro Voting-Runde erlaubt." });
+    }
+
+    // 💾 Vorschlag speichern
     await pool.query(
       `INSERT INTO queue_items 
-       (session_id, item_type, video_id, title, thumbnail, added_by, guest_id, status, played, duration)
-       VALUES (?, 'music', ?, ?, ?, ?, ?, 'queued', 0, ?)`,
+       (session_id, item_type, video_id, title, thumbnail, added_by, guest_id, status, played, duration, voting_round_id, item_source)
+       VALUES (?, 'music', ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
       [
-        id,
+        sessionId,
         videoId,
         title,
         thumbnail,
         user?.id || null,
         guest?.id || null,
-        duration
-      ]
+        status,
+        duration,
+        votingRoundId,
+        user ? "user" : "guest",
+      ],
     );
 
-    io.to(id).emit("queue_updated", {});
-    res.status(201).json({ success: true, type: "music" });
+    // 🔔 Socket-Update
+    if (status === "suggested") {
+      io.to(sessionId).emit("proposal_added", {
+        title,
+        videoId,
+        votingRoundId,
+      });
+    } else {
+      io.to(sessionId).emit("queue_updated", {});
+    }
 
+    res.status(201).json({
+      success: true,
+      type: "music",
+      status,
+      votingRoundId,
+    });
   } catch (err) {
     console.error("Proposal error:", err);
     res.status(500).json({ error: "Failed to add proposal" });
   }
 });
 
+// === GET: Alle vorgeschlagenen Songs (für Voting) ===
+app.get("/sessions/:id/proposals", async (req, res) => {
+  const { id: sessionId } = req.params;
+
+  try {
+    const [proposals] = await pool.query(
+      `
+      SELECT 
+        q.id,
+        q.title,
+        q.thumbnail,
+        q.status,
+        q.video_id,
+        q.voting_round_id,
+        COALESCE(v.vote_count, 0) AS votes,
+        u.username AS addedByUser,
+        g.nickname AS addedByGuest
+      FROM queue_items q
+      LEFT JOIN users u ON q.added_by = u.id
+      LEFT JOIN guest_users g ON q.guest_id = g.id
+      LEFT JOIN (
+        SELECT queue_item_id, COUNT(*) AS vote_count
+        FROM votes
+        GROUP BY queue_item_id
+      ) v ON v.queue_item_id = q.id
+      WHERE q.session_id = ? AND q.status IN ('suggested', 'proposal')
+      ORDER BY q.created_at ASC
+    `,
+      [sessionId],
+    );
+
+    const result = proposals.map((p) => ({
+      id: p.id,
+      title: p.title,
+      thumbnail: p.thumbnail,
+      status: p.status,
+      videoId: p.video_id,
+      votingRoundId: p.voting_round_id,
+      votes: p.votes,
+      addedBy: p.addedByUser || p.addedByGuest || "Unbekannt",
+    }));
+
+    res.json(result);
+  } catch (err) {
+    console.error("Failed to load proposals:", err);
+    res.status(500).json({ error: "Failed to load proposals" });
+  }
+});
+
+// Beispiel-Endpoint zum Abschließen einer Votingrunde
+app.post("/voting-rounds/:id/close", async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    // 1️⃣ Sieger bestimmen
+    const [winnerRows] = await pool.query(
+      `
+      SELECT q.id, COUNT(v.id) AS votes
+      FROM queue_items q
+      LEFT JOIN votes v ON q.id = v.queue_item_id
+      WHERE q.voting_round_id = ?
+      GROUP BY q.id
+      ORDER BY votes DESC
+      LIMIT 1
+    `,
+      [id],
+    );
+
+    if (winnerRows.length === 0) {
+      await pool.query("UPDATE voting_rounds SET status='closed' WHERE id=?", [
+        id,
+      ]);
+      return res.json({ success: true, message: "Keine Vorschläge vorhanden" });
+    }
+
+    const winnerId = winnerRows[0].id;
+
+    // 2️⃣ Votingrunde updaten
+    await pool.query(
+      "UPDATE voting_rounds SET status='computed', winner_queue_item_id=? WHERE id=?",
+      [winnerId, id],
+    );
+
+    // 3️⃣ Gewinner in Queue verschieben
+    await pool.query("UPDATE queue_items SET status='queued' WHERE id=?", [
+      winnerId,
+    ]);
+
+    // 4️⃣ Alle anderen Vorschläge ablehnen
+    await pool.query(
+      "UPDATE queue_items SET status='rejected' WHERE voting_round_id=? AND id<>?",
+      [id, winnerId],
+    );
+
+    io.emit("queue_updated", {});
+    res.json({ success: true, winnerId });
+  } catch (err) {
+    console.error("Voting close error:", err);
+    res.status(500).json({ error: "Failed to close voting round" });
+  }
+});
+
+async function checkQuorum(votingRoundId, sessionId) {
+  // Hole Voting Round Daten
+  const [roundRows] = await pool.query(
+    "SELECT max_suggestions, quorum_percent FROM voting_rounds WHERE id = ?",
+    [votingRoundId],
+  );
+  if (!roundRows[0]) return;
+
+  const { max_suggestions, quorum_percent } = roundRows[0];
+
+  // Anzahl der Votes pro Vorschlag zählen
+  const [votesRows] = await pool.query(
+    `SELECT queue_item_id, COUNT(*) AS votes 
+     FROM votes v
+     JOIN queue_items q ON v.queue_item_id = q.id
+     WHERE q.voting_round_id = ?
+     GROUP BY queue_item_id`,
+    [votingRoundId],
+  );
+
+  // Prüfen ob Quorum erreicht
+  const votesNeeded = Math.ceil(max_suggestions * quorum_percent);
+  for (const v of votesRows) {
+    if (v.votes >= votesNeeded) {
+      // Voting Round schließen und Gewinner setzen
+      await pool.query(
+        'UPDATE voting_rounds SET status = "computed", winner_queue_item_id = ? WHERE id = ?',
+        [v.queue_item_id, votingRoundId],
+      );
+      io.to(sessionId).emit("voting_round_completed", {
+        winner: v.queue_item_id,
+      });
+      break;
+    }
+  }
+}
+
+// === Voting ===
+app.post("/sessions/:id/proposals/:propId/vote", async (req, res) => {
+  const { id, propId } = req.params;
+  const token = req.headers.authorization?.split(" ")[1];
+  const guestToken = req.headers["x-guest-token"];
+  const user = await getUserFromToken(token);
+  const guest = await getGuestFromToken(guestToken);
+  if (!user && !guest) return res.status(401).json({ error: "Unauthorized" });
+
+  // Prüfen, ob Proposal existiert
+  const [prop] = await pool.query(
+    "SELECT voting_round_id FROM queue_items WHERE id = ? AND session_id = ?",
+    [propId, id],
+  );
+  if (!prop[0]) return res.status(404).json({ error: "Not found" });
+
+  const voterColumn = user ? "user_id" : "guest_id";
+  const voterId = user?.id || guest?.id;
+
+  // Prüfen, ob User/Guest schon gelikt hat
+  const [existingVote] = await pool.query(
+    `SELECT id FROM votes WHERE queue_item_id = ? AND ${voterColumn} = ?`,
+    [propId, voterId],
+  );
+
+  if (existingVote.length > 0) {
+    // Wenn bereits gelikt → Widerruf
+    await pool.query(
+      `DELETE FROM votes WHERE queue_item_id = ? AND ${voterColumn} = ?`,
+      [propId, voterId],
+    );
+  } else {
+    // Neu liken
+    await pool.query(
+      `INSERT INTO votes (queue_item_id, user_id, guest_id, vote) VALUES (?, ?, ?, 1)`,
+      [propId, user?.id || null, guest?.id || null],
+    );
+  }
+
+  // Event für alle Clients
+  io.to(id).emit("proposals_updated");
+
+  // === Prüfen, ob ALLE Teilnehmer abgestimmt haben ===
+  const [voteCheck] = await pool.query(
+    `
+  SELECT 
+    p.cnt AS total_participants,
+    COALESCE(v.voted_count, 0) AS voted_participants
+  FROM (
+    SELECT COUNT(*) AS cnt 
+    FROM session_participants sp
+    WHERE sp.session_id = ?
+  ) p
+  LEFT JOIN (
+    SELECT COUNT(DISTINCT voter_key) AS voted_count
+    FROM (
+      SELECT CONCAT('U', v.user_id) AS voter_key
+      FROM votes v
+      JOIN queue_items qi ON v.queue_item_id = qi.id
+      WHERE qi.session_id = ? 
+        AND qi.status = 'suggested' 
+        AND v.user_id IS NOT NULL
+
+      UNION ALL
+
+      SELECT CONCAT('G', v.guest_id) AS voter_key
+      FROM votes v
+      JOIN queue_items qi ON v.queue_item_id = qi.id
+      WHERE qi.session_id = ? 
+        AND qi.status = 'suggested' 
+        AND v.guest_id IS NOT NULL
+    ) AS voters
+  ) v ON 1=1
+  `,
+    [id, id, id],
+  );
+
+  const totalParticipants = voteCheck[0].total_participants;
+  const votedParticipants = voteCheck[0].voted_participants;
+
+  console.log(
+    `Abstimmung: ${votedParticipants}/${totalParticipants} haben abgestimmt`,
+  );
+
+  // Nur wenn ALLE abgestimmt haben
+  if (totalParticipants > 0 && votedParticipants >= totalParticipants) {
+    // === Gewinner ermitteln ===
+    const [winnerResult] = await pool.query(
+      `
+    SELECT 
+      qi.id,
+      COUNT(v.id) AS vote_count
+    FROM queue_items qi
+    LEFT JOIN votes v ON qi.id = v.queue_item_id
+    WHERE qi.session_id = ? 
+      AND qi.status = 'suggested'
+    GROUP BY qi.id
+    HAVING COUNT(v.id) > 0
+    ORDER BY vote_count DESC, qi.created_at ASC
+    LIMIT 1
+    `,
+      [id],
+    );
+
+    if (winnerResult.length > 0) {
+      const winningId = winnerResult[0].id;
+
+      // Gewinner in Queue verschieben
+      await pool.query(
+        `UPDATE queue_items SET status = 'queued' WHERE id = ?`,
+        [winningId],
+      );
+
+      // Alle anderen suggested → archived
+      await pool.query(
+        `UPDATE queue_items 
+       SET status = 'archived' 
+       WHERE session_id = ? AND status = 'suggested' AND id != ?`,
+        [id, winningId],
+      );
+
+      // Optional: Voting-Runde schließen (falls verwendet)
+      // await pool.query(`UPDATE voting_rounds SET status = 'computed', winner_queue_item_id = ? WHERE session_id = ? AND status = 'open'`, [winningId, id]);
+
+      // Informiere alle Clients
+      io.to(id).emit("proposals_updated");
+      io.to(id).emit("queue_updated");
+
+      console.log(
+        `Voting abgeschlossen: Song #${winningId} gewinnt in Session ${id}`,
+      );
+    } else {
+      console.log(`Kein Gewinner – kein Song hat Stimmen in Session ${id}`);
+    }
+  }
+
+  res.json({ success: true });
+});
 
 // === Host: direct queue add (blocked if session is_live) ===
 app.post("/sessions/:id/queue/add", async (req, res) => {
@@ -915,7 +1332,7 @@ app.post("/sessions/:id/queue/add", async (req, res) => {
           id: videoId,
           key: YOUTUBE_KEY,
         },
-      }
+      },
     );
     const durationIso = ytRes.data.items[0]?.contentDetails.duration;
     const duration = parseIsoDuration(durationIso);
@@ -946,11 +1363,14 @@ app.delete("/sessions/:id", async (req, res) => {
     // Prüfen, ob die Session existiert und der Benutzer der Host ist
     const [session] = await pool.query(
       "SELECT user_id FROM sessions WHERE id = ?",
-      [id]
+      [id],
     );
-    if (!session[0]) return res.status(404).json({ error: "Session not found" });
+    if (!session[0])
+      return res.status(404).json({ error: "Session not found" });
     if (session[0].user_id !== user.id) {
-      return res.status(403).json({ error: "Only the host can delete the session" });
+      return res
+        .status(403)
+        .json({ error: "Only the host can delete the session" });
     }
 
     // Session löschen (ON DELETE CASCADE kümmert sich um zugehörige Einträge)
@@ -981,7 +1401,9 @@ app.post("/sessions/:id/start", async (req, res) => {
   const user = await getUserFromToken(token);
   if (!user) return res.status(401).json({ error: "Unauthorized" });
 
-  const [sess] = await pool.query("SELECT is_live FROM sessions WHERE id = ?", [id]);
+  const [sess] = await pool.query("SELECT is_live FROM sessions WHERE id = ?", [
+    id,
+  ]);
   if (sess[0]?.is_live) {
     return res.status(400).json({ error: "Session already live" });
   }
@@ -995,7 +1417,7 @@ app.post("/sessions/:id/start", async (req, res) => {
   // 🎵 Fetch first unplayed song
   const [first] = await pool.query(
     "SELECT id, video_id, duration FROM queue_items WHERE session_id = ? AND played = 0 ORDER BY id ASC LIMIT 1",
-    [id]
+    [id],
   );
 
   if (!first[0]) {
@@ -1011,7 +1433,7 @@ app.post("/sessions/:id/start", async (req, res) => {
   // 🕒 Mark first song as playing
   await pool.query(
     `UPDATE queue_items SET status = 'playing', playedAt = NOW() WHERE id = ?`,
-    [firstId]
+    [firstId],
   );
 
   // 🧩 Set playback sync
@@ -1022,9 +1444,11 @@ app.post("/sessions/:id/start", async (req, res) => {
        current_video_id = VALUES(current_video_id),
        video_start_time = VALUES(video_start_time),
        is_playing = 1`,
-    [id, firstVideoId, startTime]
+    [id, firstVideoId, startTime],
   );
-  console.log(`[Playback] Session ${id} STARTED with first song: videoId=${firstVideoId}`);
+  console.log(
+    `[Playback] Session ${id} STARTED with first song: videoId=${firstVideoId}`,
+  );
 
   // 📡 Broadcast: the radio goes live
   io.to(id).emit("session_started", {
@@ -1044,7 +1468,9 @@ app.post("/sessions/:id/start", async (req, res) => {
   if (sessionTimers[id]) clearTimeout(sessionTimers[id]);
   sessionTimers[id] = setTimeout(() => advanceToNext(id), duration * 1000);
 
-  console.log(`[Session ${id}] Radio started with first song (${firstVideoId})`);
+  console.log(
+    `[Session ${id}] Radio started with first song (${firstVideoId})`,
+  );
   res.json({ success: true });
 });
 
@@ -1057,21 +1483,26 @@ app.post("/sessions/:id/join-live", async (req, res) => {
   const guest = await getGuestFromToken(guestToken);
   if (!user && !guest) return res.status(401).json({ error: "Unauthorized" });
 
-  const [sess] = await pool.query("SELECT user_id FROM sessions WHERE id = ?", [id]);
+  const [sess] = await pool.query("SELECT user_id FROM sessions WHERE id = ?", [
+    id,
+  ]);
   if (!sess[0]) return res.status(404).json({ error: "Session not found" });
 
   const column = user ? "user_id" : "guest_id";
   const participantId = user ? user.id : guest.id;
-  const role = user && sess[0].user_id === user.id ? "host" : "guest";
+  let role = "guest"; // default
+  if (user) {
+    role = sess[0].user_id === user.id ? "host" : "user";
+  }
 
   const [exists] = await pool.query(
     `SELECT id FROM session_participants WHERE session_id = ? AND ${column} = ?`,
-    [id, participantId]
+    [id, participantId],
   );
   if (exists.length === 0) {
     await pool.query(
       `INSERT INTO session_participants (session_id, ${column}, role) VALUES (?, ?, ?)`,
-      [id, participantId, role]
+      [id, participantId, role],
     );
   }
 
@@ -1092,7 +1523,7 @@ app.post("/sessions/:id/leave-live", async (req, res) => {
 
   await pool.query(
     `DELETE FROM session_participants WHERE session_id = ? AND ${column} = ?`,
-    [id, participantId]
+    [id, participantId],
   );
 
   io.to(id).emit("participant_left", { participantId, isGuest: !!guest });
@@ -1109,12 +1540,15 @@ app.get("/sessions/:id/live/stream", async (req, res) => {
 });
 
 // POST /forgot-password
-app.post('/forgot-password', async (req, res) => {
+app.post("/forgot-password", async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ error: "Email required" });
 
   try {
-    const [users] = await pool.query("SELECT id, username FROM users WHERE email = ?", [email]);
+    const [users] = await pool.query(
+      "SELECT id, username FROM users WHERE email = ?",
+      [email],
+    );
     const user = users[0];
     if (!user) return res.status(404).json({ error: "Email not found" });
 
@@ -1123,14 +1557,14 @@ app.post('/forgot-password', async (req, res) => {
 
     await pool.query(
       "UPDATE users SET reset_token = ?, reset_token_expiry = ? WHERE id = ?",
-      [resetToken, expiry, user.id]
+      [resetToken, expiry, user.id],
     );
 
     const resetLink = `http://localhsot/reset-password/${resetToken}`;
     await sendEmail(
       email,
       "Passwort zurücksetzen",
-      `Klicke hier, um dein Passwort zurückzusetzen: ${resetLink}\n\nDer Link läuft in 1 Stunde ab.`
+      `Klicke hier, um dein Passwort zurückzusetzen: ${resetLink}\n\nDer Link läuft in 1 Stunde ab.`,
     );
 
     res.json({ message: "Reset-Link per E-Mail gesendet!" });
@@ -1141,24 +1575,26 @@ app.post('/forgot-password', async (req, res) => {
 });
 
 // POST /reset-password
-app.post('/reset-password', async (req, res) => {
+app.post("/reset-password", async (req, res) => {
   const { token, newPassword } = req.body;
-  if (!token || !newPassword) return res.status(400).json({ error: "Token und Passwort erforderlich" });
+  if (!token || !newPassword)
+    return res.status(400).json({ error: "Token und Passwort erforderlich" });
 
   try {
     const [users] = await pool.query(
       "SELECT id FROM users WHERE reset_token = ? AND reset_token_expiry > NOW()",
-      [token]
+      [token],
     );
 
-    if (!users[0]) return res.status(400).json({ error: "Token ungültig oder abgelaufen" });
+    if (!users[0])
+      return res.status(400).json({ error: "Token ungültig oder abgelaufen" });
 
     const userId = users[0].id;
     const password_hash = await hashPassword(newPassword);
 
     await pool.query(
       "UPDATE users SET password_hash = ?, reset_token = NULL, reset_token_expiry = NULL WHERE id = ?",
-      [password_hash, userId]
+      [password_hash, userId],
     );
 
     res.json({ message: "Passwort erfolgreich zurückgesetzt!" });
@@ -1171,7 +1607,7 @@ app.post('/reset-password', async (req, res) => {
 app.get("/youtube-cache", async (req, res) => {
   try {
     const [rows] = await pool.query(
-      "SELECT title_norm, title, youtube_id AS youtubeId, thumbnail FROM youtube_video_cache"
+      "SELECT title_norm, title, youtube_id AS youtubeId, thumbnail FROM youtube_video_cache",
     );
     res.json(rows);
   } catch (err) {
@@ -1182,13 +1618,16 @@ app.get("/youtube-cache", async (req, res) => {
 app.post("/youtube-cache", async (req, res) => {
   const { title_norm, title, youtube_id, thumbnail } = req.body;
   try {
-    await pool.query(`
+    await pool.query(
+      `
       INSERT INTO youtube_video_cache (title_norm, title, youtube_id, thumbnail)
       VALUES (?, ?, ?, ?)
       ON DUPLICATE KEY UPDATE
         title = VALUES(title),
         thumbnail = VALUES(thumbnail)
-    `, [title_norm, title, youtube_id, thumbnail]);
+    `,
+      [title_norm, title, youtube_id, thumbnail],
+    );
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: "Cache save failed" });

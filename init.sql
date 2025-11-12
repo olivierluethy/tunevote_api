@@ -47,7 +47,7 @@ CREATE TABLE session_participants (
   session_id INT NOT NULL,
   user_id INT DEFAULT NULL,
   guest_id INT DEFAULT NULL,
-  role ENUM('host','guest') NOT NULL,
+  role ENUM('host', 'user','guest') NOT NULL,
   joined_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
   is_live TINYINT(1) DEFAULT '0',
   PRIMARY KEY (id),
@@ -68,18 +68,22 @@ CREATE TABLE `queue_items` (
   `thumbnail` varchar(255) DEFAULT NULL,
   `added_by` int DEFAULT NULL,
   `guest_id` int DEFAULT NULL,
-  `status` enum('queued','playing','played','skipped') DEFAULT 'queued',
+  `status` enum('queued','playing','played','skipped', 'archived', 'suggested') DEFAULT 'queued',
   `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
   `played` tinyint(1) DEFAULT '0',
   `playedAt` datetime DEFAULT NULL,
   `startedAt` datetime DEFAULT NULL,
   `duration` int DEFAULT NULL,
   description varchar(255) DEFAULT NULL,
+  ADD COLUMN item_source ENUM('user','guest','ai') DEFAULT 'user' AFTER item_type;
   item_type enum('music','pause') NOT NULL DEFAULT 'music',
   PRIMARY KEY (`id`),
   UNIQUE KEY `unique_session_video` (`session_id`,`video_id`),
   KEY `added_by` (`added_by`),
   KEY `guest_id` (`guest_id`),
+  ALTER TABLE queue_items ADD COLUMN voting_round_id INT NULL;
+  UPDATE queue_items SET voting_round_id = ? WHERE id = LAST_INSERT_ID();
+
   CONSTRAINT `queue_items_ibfk_1` FOREIGN KEY (`session_id`) REFERENCES `sessions` (`id`) ON DELETE CASCADE,
   CONSTRAINT `queue_items_ibfk_2` FOREIGN KEY (`added_by`) REFERENCES `users` (`id`) ON DELETE SET NULL,
   CONSTRAINT `queue_items_ibfk_3` FOREIGN KEY (`guest_id`) REFERENCES `guest_users` (`id`) ON DELETE SET NULL
@@ -96,3 +100,37 @@ CREATE TABLE playback_sync (
   CONSTRAINT playback_sync_ibfk_1 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
   CONSTRAINT playback_sync_ibfk_2 FOREIGN KEY (current_video_id) REFERENCES youtube_video_cache(youtube_id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-- =============================================
+-- 6. Votes (Upvotes für Vorschläge)
+-- =============================================
+CREATE TABLE votes (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    queue_item_id INT NOT NULL,
+    user_id INT NULL,
+    guest_id INT NULL,
+    vote TINYINT(1) DEFAULT 1, -- nur Upvote (1), Downvote später möglich
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    
+    FOREIGN KEY (queue_item_id) REFERENCES queue_items(id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (guest_id) REFERENCES guest_users(id) ON DELETE CASCADE,
+    
+    UNIQUE KEY unique_vote_user (queue_item_id, user_id),
+    UNIQUE KEY unique_vote_guest (queue_item_id, guest_id)
+);
+
+CREATE TABLE voting_rounds (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  session_id INT NOT NULL,
+  started_by_user_id INT NULL,
+  started_by_guest_id INT NULL,
+  started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  ends_at TIMESTAMP NULL,
+  max_suggestions INT DEFAULT 10,
+  status ENUM('open','closed','computed') DEFAULT 'open',
+  winner_queue_item_id INT NULL,
+  quorum_percent FLOAT DEFAULT 0.66,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
