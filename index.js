@@ -320,23 +320,33 @@ io.on("connection", (socket) => {
   socket.on("disconnect", async () => {
     const token = socket.handshake.auth.token;
     const guestToken = socket.handshake.auth.guestToken;
+
     const user = token ? await getUserFromToken(token) : null;
     const guest = guestToken ? await getGuestFromToken(guestToken) : null;
+
     if (!user && !guest) return;
 
     const column = user ? "user_id" : "guest_id";
     const participantId = user ? user.id : guest.id;
 
+    // --- Nur is_live auf 0 setzen statt löschen ---
     await pool.query(
-      `DELETE FROM session_participants WHERE session_id = ? AND ${column} = ?`,
-      [sessionId, participantId],
+      `UPDATE session_participants 
+       SET is_live = 0 
+       WHERE session_id = ? AND ${column} = ?`,
+      [sessionId, participantId]
     );
+
+    // --- Optional: Event senden ---
+    io.to(sessionId).emit("participant_left", {
+      participantId,
+      isGuest: !!guest,
+    });
   });
 
   socket.on("session_deleted", (data) => {
-    alert(data.message); // Zeige eine Nachricht an
-    // Optional: Weiterleitung zur Hauptseite oder Session-Liste
-    window.location.href = "/"; // Beispiel: Zur Hauptseite weiterleiten
+    alert(data.message);
+    window.location.href = "/";
   });
 });
 
@@ -470,7 +480,7 @@ app.get("/sessions", async (req, res) => {
         (
           SELECT COUNT(*) 
           FROM session_participants sp 
-          WHERE sp.session_id = s.id
+          WHERE sp.session_id = s.id AND sp.is_live = 1
         ) AS participant_count
       FROM sessions s
       JOIN users u ON s.user_id = u.id
@@ -1475,60 +1485,137 @@ app.post("/sessions/:id/start", async (req, res) => {
 });
 
 // === Join Live ===
+// === Join Live ===
 app.post("/sessions/:id/join-live", async (req, res) => {
-  const { id } = req.params;
-  const token = req.headers.authorization?.split(" ")[1];
-  const guestToken = req.headers["x-guest-token"];
-  const user = await getUserFromToken(token);
-  const guest = await getGuestFromToken(guestToken);
-  if (!user && !guest) return res.status(401).json({ error: "Unauthorized" });
+  try {
+    const { id } = req.params;
 
-  const [sess] = await pool.query("SELECT user_id FROM sessions WHERE id = ?", [
-    id,
-  ]);
-  if (!sess[0]) return res.status(404).json({ error: "Session not found" });
+    console.log("📥 [JOIN-LIVE] Incoming request:", {
+      sessionId: id,
+      headersAuth: req.headers.authorization,
+      headersGuest: req.headers["x-guest-token"],
+      ip: req.ip,
+      cookies: req.headers.cookie
+    });
 
-  const column = user ? "user_id" : "guest_id";
-  const participantId = user ? user.id : guest.id;
-  let role = "guest"; // default
-  if (user) {
-    role = sess[0].user_id === user.id ? "host" : "user";
-  }
+    const token = req.headers.authorization?.split(" ")[1];
+    const guestToken = req.headers["x-guest-token"];
 
-  const [exists] = await pool.query(
-    `SELECT id FROM session_participants WHERE session_id = ? AND ${column} = ?`,
-    [id, participantId],
-  );
-  if (exists.length === 0) {
-    await pool.query(
-      `INSERT INTO session_participants (session_id, ${column}, role) VALUES (?, ?, ?)`,
-      [id, participantId, role],
+    const user = await getUserFromToken(token);
+    const guest = await getGuestFromToken(guestToken);
+
+    console.log("🔍 [JOIN-LIVE] Token decoded:", {
+      user: user ? { id: user.id, name: user.name } : null,
+      guest: guest ? { id: guest.id, tempName: guest.tempName } : null
+    });
+
+    if (!user && !guest) {
+      console.warn("❌ [JOIN-LIVE] Unauthorized — no valid token");
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const [sess] = await pool.query("SELECT user_id FROM sessions WHERE id = ?", [id]);
+    if (!sess[0]) {
+      console.warn("⚠️ [JOIN-LIVE] Session not found:", id);
+      return res.status(404).json({ error: "Session not found" });
+    }
+
+    const column = user ? "user_id" : "guest_id";
+    const participantId = user ? user.id : guest.id;
+
+    console.log("👤 [JOIN-LIVE] Participant attempting to join:", {
+      sessionId: id,
+      participantId,
+      type: user ? "user" : "guest",
+      role: user ? (sess[0].user_id === user.id ? "host" : "user") : "guest"
+    });
+
+    const sessionIdInt = parseInt(id, 10);
+    const participantIdInt = parseInt(participantId, 10);
+    const role = user ? (sess[0].user_id === user.id ? "host" : "user") : "guest";
+
+    // === 1) Prüfen ob Eintrag existiert ===
+    const [existing] = await pool.query(
+      `SELECT * FROM session_participants 
+       WHERE session_id = ? AND ${column} = ?`,
+      [sessionIdInt, participantIdInt]
     );
-  }
 
-  res.json({ success: true });
+    if (existing.length > 0) {
+      // === 2) Existiert bereits → nur reaktivieren ===
+      console.log("♻️ [JOIN-LIVE] Participant exists — updating is_live=1", existing[0]);
+
+      await pool.query(
+        `UPDATE session_participants 
+         SET is_live = 1, role = ?
+         WHERE session_id = ? AND ${column} = ?`,
+        [role, sessionIdInt, participantIdInt]
+      );
+
+    } else {
+      // === 3) Existiert NICHT → Insert ===
+      console.log("🆕 [JOIN-LIVE] Inserting new participant");
+
+      await pool.query(
+        `INSERT INTO session_participants (session_id, ${column}, role, is_live)
+         VALUES (?, ?, ?, 1)`,
+        [sessionIdInt, participantIdInt, role]
+      );
+    }
+
+    // === Final check ===
+    const [check] = await pool.query(
+      `SELECT * FROM session_participants WHERE session_id = ? AND ${column} = ?`,
+      [sessionIdInt, participantIdInt]
+    );
+
+    console.log("📝 [JOIN-LIVE] DB state after join:", check);
+
+    console.log("✅ [JOIN-LIVE] Join successful:", {
+      sessionId: sessionIdInt,
+      participantId: participantIdInt,
+      role
+    });
+
+    res.json({ success: true });
+
+  } catch (err) {
+    console.error("❌ [JOIN-LIVE] Error:", err);
+    res.status(500).json({ error: "Internal server error" });
+  }
 });
+
 
 // === Leave Live ===
 app.post("/sessions/:id/leave-live", async (req, res) => {
-  const { id } = req.params;
-  const token = req.headers.authorization?.split(" ")[1];
-  const guestToken = req.headers["x-guest-token"];
-  const user = await getUserFromToken(token);
-  const guest = await getGuestFromToken(guestToken);
-  if (!user && !guest) return res.status(401).json({ error: "Unauthorized" });
+  try {
+    const sessionIdInt = parseInt(req.params.id, 10);
 
-  const column = user ? "user_id" : "guest_id";
-  const participantId = user ? user.id : guest.id;
+    const token = req.headers.authorization?.split(" ")[1];
+    const guestToken = req.headers["x-guest-token"];
+    const user = await getUserFromToken(token);
+    const guest = await getGuestFromToken(guestToken);
 
-  await pool.query(
-    `DELETE FROM session_participants WHERE session_id = ? AND ${column} = ?`,
-    [id, participantId],
-  );
+    if (!user && !guest) return res.status(401).json({ error: "Unauthorized" });
 
-  io.to(id).emit("participant_left", { participantId, isGuest: !!guest });
+    const column = user ? "user_id" : "guest_id";
+    const participantIdInt = parseInt(user ? user.id : guest.id, 10);
 
-  res.json({ success: true });
+    await pool.query(
+      `UPDATE session_participants SET is_live = 0 WHERE session_id = ? AND ${column} = ?`,
+      [sessionIdInt, participantIdInt]
+    );
+
+    io.to(sessionIdInt).emit("participant_left", {
+      participantId: participantIdInt,
+      isGuest: !!guest,
+    });
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
 });
 
 // === Live stream endpoint (HOOK) ===
