@@ -596,20 +596,26 @@ app.get("/sessions/:id", async (req, res) => {
 // === Queue endpoints ===
 app.get("/sessions/:id/queue", async (req, res) => {
   const { id } = req.params;
+
   const [queue] = await pool.query(
     `
-    SELECT qi.*, COALESCE(u.username, g.nickname, 'Gast') AS addedBy
+    SELECT 
+      qi.*, 
+      qi.item_type AS itemType,           -- <-- NEU: camelCase für Frontend
+      COALESCE(u.username, g.nickname, 'Gast') AS addedBy
     FROM queue_items qi
     LEFT JOIN users u ON qi.added_by = u.id
     LEFT JOIN guest_users g ON qi.guest_id = g.id
     WHERE qi.session_id = ?
       AND (qi.status IS NULL OR qi.status NOT IN ('suggested', 'archived'))
     ORDER BY qi.id ASC
-  `,
-    [id],
+    `,
+    [id]
   );
+
   res.json(queue);
 });
+
 
 // ---------------------------------------------------------------
 // UPDATED ENDPOINT – GET RECOMMENDATIONS (AI + YouTube Search + Memory + Levenshtein)
@@ -893,7 +899,7 @@ app.post("/sessions/:id/recommendations/add", async (req, res) => {
     await pool.query(
       `INSERT INTO queue_items 
        (session_id, item_type, video_id, title, thumbnail, added_by, guest_id, status, played, duration)
-       VALUES (?, 'music', ?, ?, ?, ?, ?, 'queued', 0, ?)`,
+       VALUES (?, 'music', ?, ?, ?, ?, ?, 'suggested', 0, ?)`,
       [
         id,
         youtubeId,
@@ -936,7 +942,7 @@ app.post("/sessions/:id/proposals", async (req, res) => {
       await pool.query(
         `INSERT INTO queue_items 
          (session_id, item_type, title, description, duration, added_by, guest_id, status, played, item_source)
-         VALUES (?, 'pause', ?, ?, ?, ?, ?, 'queued', 0, ?)`,
+         VALUES (?, 'pause', ?, ?, ?, ?, ?, 'suggested', 0, ?)`,
         [
           sessionId,
           desc,
@@ -1110,23 +1116,32 @@ app.get("/sessions/:id/proposals", async (req, res) => {
         q.status,
         q.video_id,
         q.voting_round_id,
+        q.item_type,        -- NEU
+        q.item_source,      -- NEU
+        q.description,      -- für Pausen
+        q.duration,
         COALESCE(v.vote_count, 0) AS votes,
         u.username AS addedByUser,
         g.nickname AS addedByGuest
       FROM queue_items q
       LEFT JOIN users u ON q.added_by = u.id
       LEFT JOIN guest_users g ON q.guest_id = g.id
+
       LEFT JOIN (
         SELECT queue_item_id, COUNT(*) AS vote_count
         FROM votes
         GROUP BY queue_item_id
       ) v ON v.queue_item_id = q.id
-      WHERE q.session_id = ? AND q.status IN ('suggested', 'proposal')
+
+      WHERE q.session_id = ? 
+        AND q.status IN ('suggested', 'proposal')
+
       ORDER BY q.created_at ASC
-    `,
-      [sessionId],
+      `,
+      [sessionId]
     );
 
+    // → Einheitliches API-Format erzeugen
     const result = proposals.map((p) => ({
       id: p.id,
       title: p.title,
@@ -1134,11 +1149,16 @@ app.get("/sessions/:id/proposals", async (req, res) => {
       status: p.status,
       videoId: p.video_id,
       votingRoundId: p.voting_round_id,
+      itemType: p.item_type,     // music | pause
+      itemSource: p.item_source, // user | guest | ai
+      description: p.description,
+      duration: p.duration,
       votes: p.votes,
       addedBy: p.addedByUser || p.addedByGuest || "Unbekannt",
     }));
 
     res.json(result);
+
   } catch (err) {
     console.error("Failed to load proposals:", err);
     res.status(500).json({ error: "Failed to load proposals" });
