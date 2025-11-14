@@ -9,6 +9,7 @@ const { v4: uuidv4 } = require("uuid");
 const axios = require("axios");
 const { sendEmail } = require("./email.js");
 const crypto = require("crypto");
+const ytdl = require("ytdl-core");
 
 const generateResetToken = () => crypto.randomBytes(32).toString("hex");
 
@@ -226,13 +227,15 @@ const advanceToNext = async (sessionId) => {
 
     // Get next item
     const [nextItems] = await pool.query(
-      `SELECT id, video_id, item_type, duration, title 
-       FROM queue_items 
-       WHERE session_id = ? AND played = 0 
-       ORDER BY id ASC 
-       LIMIT 1`,
-      [sessionId],
-    );
+  `SELECT id, video_id, item_type, duration, title 
+   FROM queue_items 
+   WHERE session_id = ? 
+     AND played = 0 
+     AND status = 'queued'
+   ORDER BY id ASC 
+   LIMIT 1`,
+  [sessionId]
+);
 
     const next = nextItems[0];
     if (!next) return;
@@ -913,91 +916,131 @@ app.post("/sessions/:id/recommendations/add", async (req, res) => {
 // === Proposals endpoint (POST) ===
 app.post("/sessions/:id/proposals", async (req, res) => {
   const { id: sessionId } = req.params;
-  const { videoId, item_type, description } = req.body;
+  const { videoId, title: clientTitle, thumbnail: clientThumbnail, item_type, description, duration: pauseDuration } = req.body;
 
   const token = req.headers.authorization?.split(" ")[1];
   const guestToken = req.headers["x-guest-token"];
   const user = await getUserFromToken(token);
   const guest = await getGuestFromToken(guestToken);
-  if (!user && !guest) return res.status(401).json({ error: "Unauthorized" });
+
+  if (!user && !guest) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
 
   try {
-    // 🟨 FALL: PAUSE
+    // === FALL: PAUSE ===
     if (item_type === "pause") {
+      const duration = pauseDuration || 30;
+      const desc = description || "Kurze Pause";
+
       await pool.query(
         `INSERT INTO queue_items 
          (session_id, item_type, title, description, duration, added_by, guest_id, status, played, item_source)
          VALUES (?, 'pause', ?, ?, ?, ?, ?, 'queued', 0, ?)`,
         [
           sessionId,
-          description || "Pause",
-          description || "Pause",
-          30,
+          desc,
+          desc,
+          duration,
           user?.id || null,
           guest?.id || null,
           user ? "user" : "guest",
-        ],
+        ]
       );
 
       io.to(sessionId).emit("queue_updated", {});
       return res.status(201).json({ success: true, type: "pause" });
     }
 
-    // 🟦 FALL: MUSIK
-    if (!videoId) return res.status(400).json({ error: "Missing videoId" });
-
-    // 🎬 Hole aus Cache oder YouTube API (nur Cache hier)
-    const [rows] = await pool.query(
-      "SELECT title, thumbnail, duration FROM youtube_video_cache WHERE youtube_id = ?",
-      [videoId],
-    );
-
-    if (rows.length === 0) {
-      return res.status(404).json({ error: "Video not found in cache" });
+    // === FALL: MUSIK ===
+    if (!videoId) {
+      return res.status(400).json({ error: "Missing videoId" });
     }
 
-    const { title, thumbnail, duration } = rows[0];
+    let title, thumbnail, duration;
 
-    // 🔍 Prüfe, ob eine aktive Votingrunde läuft
+    // 1. Versuche aus Cache zu holen
+    const [cachedRows] = await pool.query(
+      "SELECT title, thumbnail, duration FROM youtube_video_cache WHERE youtube_id = ?",
+      [videoId]
+    );
+
+    if (cachedRows.length > 0) {
+      // Cache-Treffer
+      ({ title, thumbnail, duration } = cachedRows[0]);
+    } else {
+      // 2. Nicht im Cache → ytdl holen und cachen
+      try {
+        const info = await ytdl.getBasicInfo(`https://www.youtube.com/watch?v=${videoId}`);
+        const videoDetails = info.videoDetails;
+
+        title = videoDetails.title || clientTitle || "Unbekannter Titel";
+        thumbnail = 
+          videoDetails.thumbnails?.[0]?.url || 
+          clientThumbnail || 
+          `https://i.ytimg.com/vi/${videoId}/default.jpg`;
+        duration = parseInt(videoDetails.lengthSeconds) || 0;
+
+        // In Cache speichern
+        await pool.query(
+          `INSERT INTO youtube_video_cache 
+           (youtube_id, title, title_norm, thumbnail, duration)
+           VALUES (?, ?, ?, ?, ?)`,
+          [
+            videoId,
+            title,
+            normalize(title),
+            thumbnail,
+            duration
+          ]
+        );
+      } catch (ytdlErr) {
+        console.error("ytdl fallback failed for videoId:", videoId, ytdlErr);
+        return res.status(400).json({
+          error: "Video nicht verfügbar oder konnte nicht geladen werden",
+          details: "YouTube-Link ungültig oder Video nicht abrufbar"
+        });
+      }
+    }
+
+    // === Voting-Runde Logik ===
     let [openRounds] = await pool.query(
       "SELECT id FROM voting_rounds WHERE session_id = ? AND status = 'open' LIMIT 1",
-      [sessionId],
+      [sessionId]
     );
 
     let votingRoundId = null;
     let status = "queued";
 
     if (openRounds.length === 0) {
-      // ⚡️ Keine offene Runde → Neue Votingrunde starten
       const [result] = await pool.query(
         "INSERT INTO voting_rounds (session_id, status, created_at) VALUES (?, 'open', NOW())",
-        [sessionId],
+        [sessionId]
       );
       votingRoundId = result.insertId;
       status = "suggested";
     } else {
-      // ✅ Es gibt eine laufende Runde → Song dieser zuordnen
       votingRoundId = openRounds[0].id;
       status = "suggested";
     }
 
-    // Prüfe, wie viele Songs in der aktuellen Voting-Runde schon vorgeschlagen sind
+    // === Max. 5 Vorschläge pro Runde ===
     const [proposalCount] = await pool.query(
       `SELECT COUNT(*) AS count 
-   FROM queue_items 
-   WHERE session_id = ? 
-     AND status = 'suggested'
-     AND voting_round_id = ?`,
-      [sessionId, votingRoundId],
+       FROM queue_items 
+       WHERE session_id = ? 
+         AND status = 'suggested'
+         AND voting_round_id = ?`,
+      [sessionId, votingRoundId]
     );
 
     if (proposalCount[0].count >= 5) {
-      return res
-        .status(400)
-        .json({ message: "Maximal 5 Songs pro Voting-Runde erlaubt." });
+      return res.status(400).json({
+        message: "Maximal 5 Songs pro Voting-Runde erlaubt."
+      });
     }
 
-    // 💾 Vorschlag speichern
+    // === Vorschlag in DB speichern ===
     await pool.query(
       `INSERT INTO queue_items 
        (session_id, item_type, video_id, title, thumbnail, added_by, guest_id, status, played, duration, voting_round_id, item_source)
@@ -1012,32 +1055,46 @@ app.post("/sessions/:id/proposals", async (req, res) => {
         status,
         duration,
         votingRoundId,
-        user ? "user" : "guest",
-      ],
+        user ? "user" : "guest"
+      ]
     );
 
-    // 🔔 Socket-Update
+    // === Socket Updates ===
     if (status === "suggested") {
       io.to(sessionId).emit("proposal_added", {
         title,
         videoId,
-        votingRoundId,
+        votingRoundId
       });
+      io.to(sessionId).emit("proposals_updated", {});
     } else {
       io.to(sessionId).emit("queue_updated", {});
     }
 
+    // === Erfolg ===
     res.status(201).json({
       success: true,
       type: "music",
       status,
-      votingRoundId,
+      votingRoundId
     });
+
   } catch (err) {
     console.error("Proposal error:", err);
-    res.status(500).json({ error: "Failed to add proposal" });
+    res.status(500).json({
+      error: "Interner Serverfehler beim Hinzufügen des Vorschlags",
+      details: err.message
+    });
   }
 });
+
+function normalize(str) {
+  return str
+    .toLowerCase()
+    .replace(/[^\w\s-]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
 // === GET: Alle vorgeschlagenen Songs (für Voting) ===
 app.get("/sessions/:id/proposals", async (req, res) => {
@@ -1718,5 +1775,79 @@ app.post("/youtube-cache", async (req, res) => {
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: "Cache save failed" });
+  }
+});
+
+app.get("/youtube-info/:id", async (req, res) => {
+  const id = req.params.id;
+
+  try {
+    // 1. Erst prüfen, ob es bereits im Cache ist
+    const [cached] = await pool.query(
+      "SELECT * FROM youtube_video_cache WHERE youtube_id = ?",
+      [id]
+    );
+
+    if (cached.length) {
+      // Cache-Treffer → exakt dasselbe Format wie YouTube-API zurückgeben
+      const row = cached[0];
+      return res.json({
+        id: { videoId: id },
+        snippet: {
+          title: row.title,
+          description: "",                 // optional
+          channelTitle: "",                // optional
+          thumbnails: {
+            default: { url: row.thumbnail },
+            medium:  { url: row.thumbnail },
+            high:    { url: row.thumbnail },
+          },
+        },
+      });
+    }
+
+    // 2. Nicht im Cache → mit ytdl holen
+    const info = await ytdl.getBasicInfo(`https://www.youtube.com/watch?v=${id}`);
+
+    const thumbs = info.videoDetails.thumbnails || [];
+    const getThumb = (size) => {
+      const map = { default: 0, medium: 1, high: thumbs.length - 1 };
+      return thumbs[map[size]]?.url || `https://i.ytimg.com/vi/${id}/${size}.jpg`;
+    };
+
+    const title     = info.videoDetails.title || "Unbekannter Titel";
+    const thumbnail = getThumb("default");   // wir nutzen nur default im Cache
+
+    // 3. **In Cache schreiben**
+    await pool.query(
+      `INSERT INTO youtube_video_cache 
+       (youtube_id, title, thumbnail, title_norm, duration) 
+       VALUES (?, ?, ?, ?, ?)`,
+      [
+        id,
+        title,
+        thumbnail,
+        normalize(title),                 // deine normalize-Funktion
+        info.videoDetails.lengthSeconds || 0,
+      ]
+    );
+
+    // 4. Antwort im YouTube-API-Format
+    res.json({
+      id: { videoId: id },
+      snippet: {
+        title,
+        description: info.videoDetails.description || "",
+        channelTitle: info.videoDetails.author?.name || "",
+        thumbnails: {
+          default: { url: thumbnail },
+          medium:  { url: getThumb("medium") },
+          high:    { url: getThumb("high") },
+        },
+      },
+    });
+  } catch (err) {
+    console.error("YTDL error:", err);
+    res.status(500).json({ error: "Failed to fetch video info" });
   }
 });
