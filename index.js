@@ -182,63 +182,90 @@ const parseIsoDuration = (iso) => {
   return seconds;
 };
 
-// Advance to next song
+// Advance to next queue item — Identifikation ausschließlich über queue_items.id / status
 const advanceToNext = async (sessionId) => {
   try {
-    const [sync] = await pool.query(
-      "SELECT current_video_id FROM playback_sync WHERE session_id = ?",
-      [sessionId],
-    );
-    if (!sync[0]) return;
-
-    const currentVideoId = sync[0].current_video_id;
-
-    // Mark current as played (Pause hat evtl. NULL video_id → extra Bedingung)
-    await pool.query(
-      `UPDATE queue_items 
-       SET status = 'played', played = 1, playedAt = NOW() 
-       WHERE session_id = ? AND (video_id = ? OR (video_id IS NULL AND ? IS NULL)) AND played = 0`,
-      [sessionId, currentVideoId, currentVideoId],
+    // 1) Aktuelles playing-Item eindeutig ermitteln (wenn vorhanden)
+    //    Wir wählen das zuletzt gestartete "playing"-Item (falls mehrere vorhanden sind).
+    const [playingRows] = await pool.query(
+      `SELECT id, video_id, item_type, duration, title
+       FROM queue_items
+       WHERE session_id = ? AND status = 'playing'
+       ORDER BY COALESCE(startedAt, created_at) DESC
+       LIMIT 1`,
+      [sessionId]
     );
 
-    // Check remaining
+    const currentPlaying = playingRows[0] || null;
+    const currentPlayingId = currentPlaying?.id || null;
+
+    // 2) Falls ein aktuelles playing-Item existiert -> als played markieren
+    if (currentPlayingId) {
+      await pool.query(
+        `UPDATE queue_items
+         SET status = 'played', played = 1, playedAt = NOW()
+         WHERE id = ?`,
+        [currentPlayingId]
+      );
+
+      console.log(
+        `[Session ${sessionId}] Marked played: queue_item_id=${currentPlayingId}`
+      );
+    } else {
+      console.log(
+        `[Session ${sessionId}] No item with status='playing' found to mark as played`
+      );
+    }
+
+    // 3) Prüfen ob noch ungespielte Items existieren
     const [remaining] = await pool.query(
-      "SELECT COUNT(*) as count FROM queue_items WHERE session_id = ? AND played = 0",
-      [sessionId],
+      `SELECT COUNT(*) as count
+       FROM queue_items
+       WHERE session_id = ? AND played = 0`,
+      [sessionId]
     );
 
     if (remaining[0].count === 0) {
+      // Alles gespielt — Session zurücksetzen / beenden
       await pool.query(
-        `UPDATE queue_items SET status = 'queued', played = 0, playedAt = NULL WHERE session_id = ?`,
-        [sessionId],
+        `UPDATE queue_items
+         SET status = 'queued', played = 0, playedAt = NULL
+         WHERE session_id = ?`,
+        [sessionId]
       );
+
       await pool.query("UPDATE sessions SET is_live = 0 WHERE id = ?", [
         sessionId,
       ]);
       await pool.query("DELETE FROM playback_sync WHERE session_id = ?", [
         sessionId,
       ]);
-      io.to(sessionId).emit("session_ended", { message: "All items played" });
+
+      io.to(sessionId).emit("session_ended");
       io.to(sessionId).emit("queue_updated");
+
       if (sessionTimers[sessionId]) clearTimeout(sessionTimers[sessionId]);
       delete sessionTimers[sessionId];
+
+      console.log(`[Session ${sessionId}] No remaining items → Session ended`);
       return;
     }
 
-    // Get next item
+    // 4) Nächstes ungespieltes & queued Item holen (eindeutig über id-Order)
     const [nextItems] = await pool.query(
-  `SELECT id, video_id, item_type, duration, title 
-   FROM queue_items 
-   WHERE session_id = ? 
-     AND played = 0 
-     AND status = 'queued'
-   ORDER BY id ASC 
-   LIMIT 1`,
-  [sessionId]
-);
+      `SELECT id, video_id, item_type, duration, title
+       FROM queue_items
+       WHERE session_id = ? AND played = 0 AND status = 'queued'
+       ORDER BY id ASC
+       LIMIT 1`,
+      [sessionId]
+    );
 
     const next = nextItems[0];
-    if (!next) return;
+    if (!next) {
+      console.warn(`[Session ${sessionId}] No next item found despite remaining > 0`);
+      return;
+    }
 
     const {
       id: nextId,
@@ -247,68 +274,84 @@ const advanceToNext = async (sessionId) => {
       duration,
       title,
     } = next;
+
     const startTime = Date.now();
 
-    // Mark as playing
+    // 5) Markiere das nächste Item als 'playing' (startedAt setzen)
     await pool.query(
-      `UPDATE queue_items SET status = 'playing', playedAt = NOW() WHERE id = ?`,
-      [nextId],
+      `UPDATE queue_items
+       SET status = 'playing', startedAt = NOW()
+       WHERE id = ?`,
+      [nextId]
     );
 
-    // PAUSE HANDLING 🟨
+    // 6) PAUSE-Fall: setze playback_sync entsprechend und sende pause events
     if (item_type === "pause") {
-      console.log(
-        `[Session ${sessionId}] Starting pause: ${title} (${duration}s)`,
-      );
+      console.log(`[Session ${sessionId}] Starting pause: ${title} (QueueItem=${nextId}, ${duration}s)`);
 
       io.to(sessionId).emit("pause_started", {
+        queue_item_id: nextId,
         title,
         duration,
         startTime,
       });
 
-      // Stelle sicher, dass wir Playback-Sync zurücksetzen
+      // playback_sync bleibt ohne current_video_id (NULL), aber wir lassen den client wissen welches queue_item läuft
       await pool.query(
-        `UPDATE playback_sync 
-         SET current_video_id = NULL, is_playing = 0, video_start_time = ? 
+        `UPDATE playback_sync
+         SET current_video_id = NULL,
+             is_playing = 0,
+             video_start_time = ?
          WHERE session_id = ?`,
-        [startTime, sessionId],
+        [startTime, sessionId]
       );
 
-      // Timer für das Ende der Pause
+      // Timer für Ende der Pause
       if (sessionTimers[sessionId]) clearTimeout(sessionTimers[sessionId]);
       sessionTimers[sessionId] = setTimeout(async () => {
-        io.to(sessionId).emit("pause_ended", { title });
+        io.to(sessionId).emit("pause_ended", { queue_item_id: nextId });
         await advanceToNext(sessionId);
-      }, duration * 1000);
+      }, (duration || 0) * 1000);
 
-      return; // ⛔ Nicht weiter abspielen, Pause beendet hier den aktuellen Durchgang
+      // Event: Wir senden zusätzlich die queue item id damit Clients es als "LIVE" erkennen können
+      io.to(sessionId).emit("playback_sync", {
+        current_queue_item_id: nextId,
+        current_video_id: null,
+        video_start_time: startTime,
+        is_playing: false,
+      });
+
+      io.to(sessionId).emit("queue_updated");
+      return;
     }
 
-    // MUSIC HANDLING 🎵
+    // 7) MUSIC-Fall: Aktualisiere playback_sync und sende Events.
     await pool.query(
-      `UPDATE playback_sync 
-       SET current_video_id = ?, video_start_time = ?, is_playing = 1 
+      `UPDATE playback_sync
+       SET current_video_id = ?, video_start_time = ?, is_playing = 1
        WHERE session_id = ?`,
-      [nextVideoId, startTime, sessionId],
+      [nextVideoId, startTime, sessionId]
     );
 
     io.to(sessionId).emit("playback_sync", {
+      current_queue_item_id: nextId, // für Frontend-LIVE-Markierung (ungültige Spalte in DB nicht nötig)
       current_video_id: nextVideoId,
       video_start_time: startTime,
       is_playing: true,
     });
+
     io.to(sessionId).emit("queue_updated");
 
+    // 8) Timer für automatisches Weiterspringen nach Duration
     if (sessionTimers[sessionId]) clearTimeout(sessionTimers[sessionId]);
+    const safeDurationMs = Math.max(0, (duration || 0) * 1000);
     sessionTimers[sessionId] = setTimeout(
       () => advanceToNext(sessionId),
-      duration * 1000,
+      safeDurationMs
     );
 
-    console.log(
-      `[Session ${sessionId}] Playing music: ${nextVideoId} (${duration}s)`,
-    );
+    console.log(`[Session ${sessionId}] Playing music: ${title} (QueueItem=${nextId}, duration=${duration}s)`);
+
   } catch (err) {
     console.error(`Error advancing queue for session ${sessionId}:`, err);
   }

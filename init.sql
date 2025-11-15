@@ -61,33 +61,40 @@ CREATE TABLE session_participants (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE `queue_items` (
-  `id` int NOT NULL AUTO_INCREMENT,
-  `session_id` int NOT NULL,
-  `video_id` varchar(20),
-  `title` varchar(150) NOT NULL,
-  `thumbnail` varchar(255) DEFAULT NULL,
-  `added_by` int DEFAULT NULL,
-  `guest_id` int DEFAULT NULL,
-  `status` enum('queued','playing','played','skipped', 'archived', 'suggested') DEFAULT 'queued',
-  `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
-  `played` tinyint(1) DEFAULT '0',
-  `playedAt` datetime DEFAULT NULL,
-  `startedAt` datetime DEFAULT NULL,
-  `duration` int DEFAULT NULL,
-  description varchar(255) DEFAULT NULL,
-  ADD COLUMN item_source ENUM('user','guest','ai') DEFAULT 'user' AFTER item_type;
-  item_type enum('music','pause') NOT NULL DEFAULT 'music',
+  `id` INT NOT NULL AUTO_INCREMENT,
+  `session_id` INT NOT NULL,
+  `video_id` VARCHAR(20),
+  `title` VARCHAR(150) NOT NULL,
+  `thumbnail` VARCHAR(255) DEFAULT NULL,
+  `added_by` INT DEFAULT NULL,
+  `guest_id` INT DEFAULT NULL,
+  `status` ENUM('queued','playing','played','skipped','archived','suggested') DEFAULT 'queued',
+  `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  `played` TINYINT(1) DEFAULT '0',
+  `playedAt` DATETIME DEFAULT NULL,
+  `startedAt` DATETIME DEFAULT NULL,
+  `duration` INT DEFAULT NULL,
+  `description` VARCHAR(255) DEFAULT NULL,
+  `item_type` ENUM('music','pause') NOT NULL DEFAULT 'music',
+  `item_source` ENUM('user','guest','ai') DEFAULT 'user',
+  `voting_round_id` INT DEFAULT NULL,
+
   PRIMARY KEY (`id`),
-  UNIQUE KEY `unique_session_video` (`session_id`,`video_id`),
+
+  KEY `session_video` (`session_id`,`video_id`),
   KEY `added_by` (`added_by`),
   KEY `guest_id` (`guest_id`),
-  ALTER TABLE queue_items ADD COLUMN voting_round_id INT NULL;
-  UPDATE queue_items SET voting_round_id = ? WHERE id = LAST_INSERT_ID();
 
-  CONSTRAINT `queue_items_ibfk_1` FOREIGN KEY (`session_id`) REFERENCES `sessions` (`id`) ON DELETE CASCADE,
-  CONSTRAINT `queue_items_ibfk_2` FOREIGN KEY (`added_by`) REFERENCES `users` (`id`) ON DELETE SET NULL,
-  CONSTRAINT `queue_items_ibfk_3` FOREIGN KEY (`guest_id`) REFERENCES `guest_users` (`id`) ON DELETE SET NULL
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+  CONSTRAINT `queue_items_ibfk_1` 
+    FOREIGN KEY (`session_id`) REFERENCES `sessions` (`id`) ON DELETE CASCADE,
+
+  CONSTRAINT `queue_items_ibfk_2` 
+    FOREIGN KEY (`added_by`) REFERENCES `users` (`id`) ON DELETE SET NULL,
+
+  CONSTRAINT `queue_items_ibfk_3` 
+    FOREIGN KEY (`guest_id`) REFERENCES `guest_users` (`id`) ON DELETE SET NULL
+)
+
 
 CREATE TABLE playback_sync (
   session_id INT NOT NULL,
