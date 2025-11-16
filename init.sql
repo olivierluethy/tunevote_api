@@ -93,7 +93,7 @@ CREATE TABLE `queue_items` (
 
   CONSTRAINT `queue_items_ibfk_3` 
     FOREIGN KEY (`guest_id`) REFERENCES `guest_users` (`id`) ON DELETE SET NULL
-)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 
 CREATE TABLE playback_sync (
@@ -125,7 +125,7 @@ CREATE TABLE votes (
     
     UNIQUE KEY unique_vote_user (queue_item_id, user_id),
     UNIQUE KEY unique_vote_guest (queue_item_id, guest_id)
-);
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE voting_rounds (
   id INT AUTO_INCREMENT PRIMARY KEY,
@@ -140,4 +140,4 @@ CREATE TABLE voting_rounds (
   quorum_percent FLOAT DEFAULT 0.66,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
-);
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
