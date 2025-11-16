@@ -193,7 +193,7 @@ const advanceToNext = async (sessionId) => {
        WHERE session_id = ? AND status = 'playing'
        ORDER BY COALESCE(startedAt, created_at) DESC
        LIMIT 1`,
-      [sessionId]
+      [sessionId],
     );
 
     const currentPlaying = playingRows[0] || null;
@@ -205,15 +205,15 @@ const advanceToNext = async (sessionId) => {
         `UPDATE queue_items
          SET status = 'played', played = 1, playedAt = NOW()
          WHERE id = ?`,
-        [currentPlayingId]
+        [currentPlayingId],
       );
 
       console.log(
-        `[Session ${sessionId}] Marked played: queue_item_id=${currentPlayingId}`
+        `[Session ${sessionId}] Marked played: queue_item_id=${currentPlayingId}`,
       );
     } else {
       console.log(
-        `[Session ${sessionId}] No item with status='playing' found to mark as played`
+        `[Session ${sessionId}] No item with status='playing' found to mark as played`,
       );
     }
 
@@ -221,8 +221,8 @@ const advanceToNext = async (sessionId) => {
     const [remaining] = await pool.query(
       `SELECT COUNT(*) as count
        FROM queue_items
-       WHERE session_id = ? AND played = 0`,
-      [sessionId]
+       WHERE session_id = ? AND played = 0 AND status IN ('queued', 'playing')`,
+      [sessionId],
     );
 
     if (remaining[0].count === 0) {
@@ -230,8 +230,8 @@ const advanceToNext = async (sessionId) => {
       await pool.query(
         `UPDATE queue_items
          SET status = 'queued', played = 0, playedAt = NULL
-         WHERE session_id = ?`,
-        [sessionId]
+         WHERE session_id = ? AND status IN ('played', 'skipped', 'playing')`,
+        [sessionId],
       );
 
       await pool.query("UPDATE sessions SET is_live = 0 WHERE id = ?", [
@@ -258,12 +258,14 @@ const advanceToNext = async (sessionId) => {
        WHERE session_id = ? AND played = 0 AND status = 'queued'
        ORDER BY id ASC
        LIMIT 1`,
-      [sessionId]
+      [sessionId],
     );
 
     const next = nextItems[0];
     if (!next) {
-      console.warn(`[Session ${sessionId}] No next item found despite remaining > 0`);
+      console.warn(
+        `[Session ${sessionId}] No next item found despite remaining > 0`,
+      );
       return;
     }
 
@@ -282,12 +284,14 @@ const advanceToNext = async (sessionId) => {
       `UPDATE queue_items
        SET status = 'playing', startedAt = NOW()
        WHERE id = ?`,
-      [nextId]
+      [nextId],
     );
 
     // 6) PAUSE-Fall: setze playback_sync entsprechend und sende pause events
     if (item_type === "pause") {
-      console.log(`[Session ${sessionId}] Starting pause: ${title} (QueueItem=${nextId}, ${duration}s)`);
+      console.log(
+        `[Session ${sessionId}] Starting pause: ${title} (QueueItem=${nextId}, ${duration}s)`,
+      );
 
       io.to(sessionId).emit("pause_started", {
         queue_item_id: nextId,
@@ -303,15 +307,18 @@ const advanceToNext = async (sessionId) => {
              is_playing = 0,
              video_start_time = ?
          WHERE session_id = ?`,
-        [startTime, sessionId]
+        [startTime, sessionId],
       );
 
       // Timer für Ende der Pause
       if (sessionTimers[sessionId]) clearTimeout(sessionTimers[sessionId]);
-      sessionTimers[sessionId] = setTimeout(async () => {
-        io.to(sessionId).emit("pause_ended", { queue_item_id: nextId });
-        await advanceToNext(sessionId);
-      }, (duration || 0) * 1000);
+      sessionTimers[sessionId] = setTimeout(
+        async () => {
+          io.to(sessionId).emit("pause_ended", { queue_item_id: nextId });
+          await advanceToNext(sessionId);
+        },
+        (duration || 0) * 1000,
+      );
 
       // Event: Wir senden zusätzlich die queue item id damit Clients es als "LIVE" erkennen können
       io.to(sessionId).emit("playback_sync", {
@@ -330,7 +337,7 @@ const advanceToNext = async (sessionId) => {
       `UPDATE playback_sync
        SET current_video_id = ?, video_start_time = ?, is_playing = 1
        WHERE session_id = ?`,
-      [nextVideoId, startTime, sessionId]
+      [nextVideoId, startTime, sessionId],
     );
 
     io.to(sessionId).emit("playback_sync", {
@@ -347,11 +354,12 @@ const advanceToNext = async (sessionId) => {
     const safeDurationMs = Math.max(0, (duration || 0) * 1000);
     sessionTimers[sessionId] = setTimeout(
       () => advanceToNext(sessionId),
-      safeDurationMs
+      safeDurationMs,
     );
 
-    console.log(`[Session ${sessionId}] Playing music: ${title} (QueueItem=${nextId}, duration=${duration}s)`);
-
+    console.log(
+      `[Session ${sessionId}] Playing music: ${title} (QueueItem=${nextId}, duration=${duration}s)`,
+    );
   } catch (err) {
     console.error(`Error advancing queue for session ${sessionId}:`, err);
   }
@@ -380,7 +388,7 @@ io.on("connection", (socket) => {
       `UPDATE session_participants 
        SET is_live = 0 
        WHERE session_id = ? AND ${column} = ?`,
-      [sessionId, participantId]
+      [sessionId, participantId],
     );
 
     // --- Optional: Event senden ---
@@ -653,12 +661,11 @@ app.get("/sessions/:id/queue", async (req, res) => {
       AND (qi.status IS NULL OR qi.status NOT IN ('suggested', 'archived'))
     ORDER BY qi.id ASC
     `,
-    [id]
+    [id],
   );
 
   res.json(queue);
 });
-
 
 // ---------------------------------------------------------------
 // UPDATED ENDPOINT – GET RECOMMENDATIONS (AI + YouTube Search + Memory + Levenshtein)
@@ -699,6 +706,68 @@ app.get("/sessions/:id/recommendations", async (req, res) => {
   const titles = queueRows.map((r) => r.title);
   if (titles.length < 2) return res.status(200).json([]);
 
+  // ---- NEW: Voting-Round & AI Suggestion Check ----
+  const [votingRoundRows] = await pool.query(
+    `SELECT id FROM voting_rounds 
+     WHERE session_id = ? AND status = 'open'
+     ORDER BY id DESC LIMIT 1`,
+    [id]
+  );
+
+  const currentRoundId = votingRoundRows[0]?.id;
+  if (!currentRoundId) {
+    console.log("[AI] No active voting round for session", id);
+    return res.status(400).json({ error: "No active voting round" });
+  }
+
+  const [suggestedRows] = await pool.query(
+    `SELECT COUNT(*) as count 
+     FROM queue_items 
+     WHERE voting_round_id = ? AND status = 'suggested'`,
+    [currentRoundId]
+  );
+  const numItems = suggestedRows[0].count;
+
+  const needed = 3 - numItems;
+  if (needed <= 0) {
+    console.log("[AI] Already 3 or more items in voting round. Returning existing AI suggestions.");
+    const [existingAi] = await pool.query(
+      `SELECT id, title, video_id AS youtubeId, thumbnail
+       FROM queue_items
+       WHERE session_id = ?
+         AND voting_round_id = ?
+         AND item_source = 'ai'
+         AND status = 'suggested'`,
+      [id, currentRoundId]
+    );
+    return res.json(existingAi);
+  }
+
+  const [existingAi] = await pool.query(
+    `SELECT id, title, video_id AS youtubeId, thumbnail
+     FROM queue_items
+     WHERE session_id = ?
+       AND voting_round_id = ?
+       AND item_source = 'ai'
+       AND status = 'suggested'`,
+    [id, currentRoundId]
+  );
+
+  console.log(`[AI] ${numItems} items in voting round. Generating ${needed} AI suggestion(s)...`);
+
+  // ---- Get suggested titles to avoid duplicates ----
+  const [suggestedTitleRows] = await pool.query(
+    `
+    SELECT yvc.title
+    FROM queue_items qi
+    JOIN youtube_video_cache yvc ON qi.video_id = yvc.youtube_id
+    WHERE qi.voting_round_id = ? AND qi.status = 'suggested'
+    `,
+    [currentRoundId]
+  );
+
+  const allTitles = [...titles, ...suggestedTitleRows.map((r) => r.title)];
+
   // ---- Prompt für AI ----
   const prompt = `
 You are a music recommendation engine. Your job is to suggest popular songs that likely exist on YouTube.
@@ -719,17 +788,16 @@ Examples of WRONG format:
 - "Dua Lipa - Levitating (feat. DaBaby) [Official Music Video]"
 - "Beyoncé - Halo (Official Video)"
 
-Current queue: ${JSON.stringify(titles)}
+Current queue: ${JSON.stringify(allTitles)}
 
 Instructions:
-- Recommend 3 completely new songs NOT in the Current Queue.
+- Recommend ${needed} completely new songs NOT in the Current Queue.
 - Output ONLY songs in the EXACT format above.
 - Output ONLY JSON array:
 [{"title": "Artist - Song Title"}]
 `;
 
-  // ---- Helper: normalize (erweitert) ----
-  // ANPASSUNG: Erweitere entfernte Keywords um "mv", "official music video", "music video" usw., für bessere Matches
+  // ---- Helper: normalize ----
   const normalize = (str) =>
     str
       .toLowerCase()
@@ -762,13 +830,13 @@ Instructions:
     }
     return track[s2.length][s1.length];
   };
+
   const levenshteinRatio = (s1, s2) => {
     const longer = s1.length > s2.length ? s1 : s2;
     const shorter = s1.length > s2.length ? s2 : s1;
     if (longer.length === 0) return 100;
     return Math.round(
-      ((longer.length - levenshteinDistance(longer, shorter)) / longer.length) *
-        100,
+      ((longer.length - levenshteinDistance(longer, shorter)) / longer.length) * 100,
     );
   };
 
@@ -783,7 +851,6 @@ Instructions:
 
     const raw = completion.choices?.[0]?.message?.content || "";
 
-    // ---- Robust JSON parse ----
     let aiSuggestions = [];
     try {
       const cleaned = raw.replace(/```json|```/g, "").trim();
@@ -796,8 +863,7 @@ Instructions:
       (s) => s?.title && typeof s.title === "string",
     );
 
-    // ---- Filter out songs already in the queue ----
-    const normalizedQueue = titles.map((t) => normalize(t));
+    const normalizedQueue = allTitles.map((t) => normalize(t));
 
     aiSuggestions = aiSuggestions.filter((s) => {
       const norm = normalize(s.title);
@@ -814,7 +880,6 @@ Instructions:
     for (const s of aiSuggestions) {
       const normalizedAI = normalize(s.title);
 
-      // --- DB Lookup: alle Songs aus Cache holen ---
       const [rows] = await pool.query(`SELECT * FROM youtube_video_cache`);
       let bestMatch = null;
       let bestScore = 0;
@@ -827,20 +892,47 @@ Instructions:
         }
       }
 
-      // ANPASSUNG: Senke Threshold auf 80% für mehr DB-Matches (vermeidet YouTube-Fallback)
       if (bestMatch && bestScore > 80) {
+        let durationSeconds = bestMatch.duration;
+        if (durationSeconds === null) {
+          try {
+            const ytDetails = await axios.get(
+              "https://www.googleapis.com/youtube/v3/videos",
+              {
+                params: {
+                  part: "contentDetails",
+                  id: bestMatch.youtube_id,
+                  key: YOUTUBE_KEY,
+                },
+              }
+            );
+
+            const durIso = ytDetails.data.items?.[0]?.contentDetails?.duration;
+            if (durIso) {
+              const match = durIso.match(/PT(?:(\d+)M)?(?:(\d+)S)?/);
+              const mins = parseInt(match?.[1] ?? 0, 10);
+              const secs = parseInt(match?.[2] ?? 0, 10);
+              durationSeconds = mins * 60 + secs;
+              await pool.query(
+                `UPDATE youtube_video_cache SET duration = ? WHERE youtube_id = ?`,
+                [durationSeconds, bestMatch.youtube_id]
+              );
+            }
+          } catch (err) {
+            console.warn("[YouTube] Failed to fetch duration from cache match:", err.message);
+          }
+        }
         results.push({
           title: bestMatch.title,
           youtubeId: bestMatch.youtube_id,
           thumbnail: bestMatch.thumbnail || "",
+          duration: durationSeconds
         });
+        if (results.length >= needed) break;
         continue;
       }
 
-      // --- Fallback: YouTube API ---
       try {
-        // ANPASSUNG: Füge "official music video" zur Query für bessere Treffer; entferne videoCategoryId für breitere Suche
-        // Erhöhe maxResults auf 5 und wähle bestes Match
         const searchQuery = `${s.title
           .replace(/\(feat.*\)/gi, "")
           .replace(/\[feat.*\]/gi, "")
@@ -852,7 +944,7 @@ Instructions:
               part: "snippet",
               q: searchQuery,
               type: "video",
-              maxResults: 5, // ANPASSUNG: Mehr Results für Auswahl
+              maxResults: 5,
               key: YOUTUBE_KEY,
             },
           },
@@ -861,7 +953,6 @@ Instructions:
         const items = ytRes.data.items || [];
         if (items.length === 0) continue;
 
-        // ANPASSUNG: Wähle das beste Match aus den Results via Levenshtein
         let bestYtMatch = null;
         let bestYtScore = 0;
         for (const item of items) {
@@ -873,45 +964,100 @@ Instructions:
           }
         }
 
-        if (!bestYtMatch || bestYtScore < 80) continue; // ANPASSUNG: Ignoriere schlechte Matches
+        if (!bestYtMatch || bestYtScore < 80) continue;
 
         const videoId = bestYtMatch.id.videoId;
         const title = bestYtMatch.snippet.title;
         const thumbnail = bestYtMatch.snippet.thumbnails.medium?.url || "";
         const titleNorm = normalize(title);
 
+        // ---- NEW: Fetch video duration ----
+        let durationSeconds = null;
+        try {
+          const ytDetails = await axios.get(
+            "https://www.googleapis.com/youtube/v3/videos",
+            {
+              params: {
+                part: "contentDetails",
+                id: videoId,
+                key: YOUTUBE_KEY,
+              },
+            }
+          );
+
+          const durIso = ytDetails.data.items?.[0]?.contentDetails?.duration;
+          if (durIso) {
+            const match = durIso.match(/PT(?:(\d+)M)?(?:(\d+)S)?/);
+            const mins = parseInt(match?.[1] ?? 0, 10);
+            const secs = parseInt(match?.[2] ?? 0, 10);
+            durationSeconds = mins * 60 + secs;
+          }
+        } catch (err) {
+          console.warn("[YouTube] Failed to fetch duration:", err.message);
+        }
+
+        // ---- UPDATED: Cache includes duration ----
         await pool.query(
-          `INSERT INTO youtube_video_cache (youtube_id, title, title_norm, thumbnail)
-           VALUES (?, ?, ?, ?)
-           ON DUPLICATE KEY UPDATE title=VALUES(title), title_norm=VALUES(title_norm), thumbnail=VALUES(thumbnail)`,
-          [videoId, title, titleNorm, thumbnail],
+          `INSERT INTO youtube_video_cache (youtube_id, title, title_norm, thumbnail, duration)
+           VALUES (?, ?, ?, ?, ?)
+           ON DUPLICATE KEY UPDATE 
+             title = VALUES(title),
+             title_norm = VALUES(title_norm),
+             thumbnail = VALUES(thumbnail),
+             duration = VALUES(duration)`,
+          [videoId, title, titleNorm, thumbnail, durationSeconds],
         );
 
-        results.push({ title, youtubeId: videoId, thumbnail });
+        // ---- UPDATED: push duration into results ----
+        results.push({ 
+          title, 
+          youtubeId: videoId, 
+          thumbnail,
+          duration: durationSeconds 
+        });
+
+        if (results.length >= needed) break;
+
       } catch (err) {
-        // ANPASSUNG: Besserer Error-Handling für 403 – logge Details
         console.warn(
           `[YouTube] Search failed for "${s.title}":`,
           err.message,
           err.response?.data,
         );
         if (err.response?.status === 403) {
-          console.error(
-            "[YouTube 403] Überprüfe API-Key Restrictions (z.B. HTTP Referrer) oder Quota!",
-          );
+          console.error("[YouTube 403] Check API-Key Restrictions/Quota!");
         }
       }
     }
 
-    console.log(
-      `[Recommend] ${results.length} results generated for session ${id}`,
-    );
-    return res.json(results);
+    const created = [];
+
+    for (const item of results) {
+      const [insert] = await pool.query(
+        `INSERT INTO queue_items 
+          (session_id, video_id, title, thumbnail, duration, status, item_source, item_type, voting_round_id)
+         VALUES (?, ?, ?, ?, ?, 'suggested', 'ai', 'music', ?)`,
+        [id, item.youtubeId, item.title, item.thumbnail, item.duration, currentRoundId],
+      );
+
+      created.push({
+        id: insert.insertId,
+        title: item.title,
+        youtubeId: item.youtubeId,
+        thumbnail: item.thumbnail,
+        status: "suggested",
+        item_source: "ai",
+      });
+    }
+
+    const allAi = [...existingAi, ...created];
+    return res.json(allAi);
   } catch (err) {
     console.error("[Recommendation Error]", err);
     res.status(500).json({ error: "Recommendation failed" });
   }
 });
+
 
 // ---------------------------------------------------------------
 // 5. NEW ENDPOINT – ADD RECOMMENDED SONG (click → queue)
@@ -965,7 +1111,14 @@ app.post("/sessions/:id/recommendations/add", async (req, res) => {
 // === Proposals endpoint (POST) ===
 app.post("/sessions/:id/proposals", async (req, res) => {
   const { id: sessionId } = req.params;
-  const { videoId, title: clientTitle, thumbnail: clientThumbnail, item_type, description, duration: pauseDuration } = req.body;
+  const {
+    videoId,
+    title: clientTitle,
+    thumbnail: clientThumbnail,
+    item_type,
+    description,
+    duration: pauseDuration,
+  } = req.body;
 
   const token = req.headers.authorization?.split(" ")[1];
   const guestToken = req.headers["x-guest-token"];
@@ -994,7 +1147,7 @@ app.post("/sessions/:id/proposals", async (req, res) => {
           user?.id || null,
           guest?.id || null,
           user ? "user" : "guest",
-        ]
+        ],
       );
 
       io.to(sessionId).emit("queue_updated", {});
@@ -1011,7 +1164,7 @@ app.post("/sessions/:id/proposals", async (req, res) => {
     // 1. Versuche aus Cache zu holen
     const [cachedRows] = await pool.query(
       "SELECT title, thumbnail, duration FROM youtube_video_cache WHERE youtube_id = ?",
-      [videoId]
+      [videoId],
     );
 
     if (cachedRows.length > 0) {
@@ -1020,13 +1173,15 @@ app.post("/sessions/:id/proposals", async (req, res) => {
     } else {
       // 2. Nicht im Cache → ytdl holen und cachen
       try {
-        const info = await ytdl.getBasicInfo(`https://www.youtube.com/watch?v=${videoId}`);
+        const info = await ytdl.getBasicInfo(
+          `https://www.youtube.com/watch?v=${videoId}`,
+        );
         const videoDetails = info.videoDetails;
 
         title = videoDetails.title || clientTitle || "Unbekannter Titel";
-        thumbnail = 
-          videoDetails.thumbnails?.[0]?.url || 
-          clientThumbnail || 
+        thumbnail =
+          videoDetails.thumbnails?.[0]?.url ||
+          clientThumbnail ||
           `https://i.ytimg.com/vi/${videoId}/default.jpg`;
         duration = parseInt(videoDetails.lengthSeconds) || 0;
 
@@ -1035,19 +1190,13 @@ app.post("/sessions/:id/proposals", async (req, res) => {
           `INSERT INTO youtube_video_cache 
            (youtube_id, title, title_norm, thumbnail, duration)
            VALUES (?, ?, ?, ?, ?)`,
-          [
-            videoId,
-            title,
-            normalize(title),
-            thumbnail,
-            duration
-          ]
+          [videoId, title, normalize(title), thumbnail, duration],
         );
       } catch (ytdlErr) {
         console.error("ytdl fallback failed for videoId:", videoId, ytdlErr);
         return res.status(400).json({
           error: "Video nicht verfügbar oder konnte nicht geladen werden",
-          details: "YouTube-Link ungültig oder Video nicht abrufbar"
+          details: "YouTube-Link ungültig oder Video nicht abrufbar",
         });
       }
     }
@@ -1055,7 +1204,7 @@ app.post("/sessions/:id/proposals", async (req, res) => {
     // === Voting-Runde Logik ===
     let [openRounds] = await pool.query(
       "SELECT id FROM voting_rounds WHERE session_id = ? AND status = 'open' LIMIT 1",
-      [sessionId]
+      [sessionId],
     );
 
     let votingRoundId = null;
@@ -1064,7 +1213,7 @@ app.post("/sessions/:id/proposals", async (req, res) => {
     if (openRounds.length === 0) {
       const [result] = await pool.query(
         "INSERT INTO voting_rounds (session_id, status, created_at) VALUES (?, 'open', NOW())",
-        [sessionId]
+        [sessionId],
       );
       votingRoundId = result.insertId;
       status = "suggested";
@@ -1080,12 +1229,12 @@ app.post("/sessions/:id/proposals", async (req, res) => {
        WHERE session_id = ? 
          AND status = 'suggested'
          AND voting_round_id = ?`,
-      [sessionId, votingRoundId]
+      [sessionId, votingRoundId],
     );
 
     if (proposalCount[0].count >= 5) {
       return res.status(400).json({
-        message: "Maximal 5 Songs pro Voting-Runde erlaubt."
+        message: "Maximal 5 Songs pro Voting-Runde erlaubt.",
       });
     }
 
@@ -1104,8 +1253,8 @@ app.post("/sessions/:id/proposals", async (req, res) => {
         status,
         duration,
         votingRoundId,
-        user ? "user" : "guest"
-      ]
+        user ? "user" : "guest",
+      ],
     );
 
     // === Socket Updates ===
@@ -1113,7 +1262,7 @@ app.post("/sessions/:id/proposals", async (req, res) => {
       io.to(sessionId).emit("proposal_added", {
         title,
         videoId,
-        votingRoundId
+        votingRoundId,
       });
       io.to(sessionId).emit("proposals_updated", {});
     } else {
@@ -1125,14 +1274,13 @@ app.post("/sessions/:id/proposals", async (req, res) => {
       success: true,
       type: "music",
       status,
-      votingRoundId
+      votingRoundId,
     });
-
   } catch (err) {
     console.error("Proposal error:", err);
     res.status(500).json({
       error: "Interner Serverfehler beim Hinzufügen des Vorschlags",
-      details: err.message
+      details: err.message,
     });
   }
 });
@@ -1181,7 +1329,7 @@ app.get("/sessions/:id/proposals", async (req, res) => {
 
       ORDER BY q.created_at ASC
       `,
-      [sessionId]
+      [sessionId],
     );
 
     // → Einheitliches API-Format erzeugen
@@ -1192,7 +1340,7 @@ app.get("/sessions/:id/proposals", async (req, res) => {
       status: p.status,
       videoId: p.video_id,
       votingRoundId: p.voting_round_id,
-      itemType: p.item_type,     // music | pause
+      itemType: p.item_type, // music | pause
       itemSource: p.item_source, // user | guest | ai
       description: p.description,
       duration: p.duration,
@@ -1201,7 +1349,6 @@ app.get("/sessions/:id/proposals", async (req, res) => {
     }));
 
     res.json(result);
-
   } catch (err) {
     console.error("Failed to load proposals:", err);
     res.status(500).json({ error: "Failed to load proposals" });
@@ -1615,7 +1762,7 @@ app.post("/sessions/:id/join-live", async (req, res) => {
       headersAuth: req.headers.authorization,
       headersGuest: req.headers["x-guest-token"],
       ip: req.ip,
-      cookies: req.headers.cookie
+      cookies: req.headers.cookie,
     });
 
     const token = req.headers.authorization?.split(" ")[1];
@@ -1626,7 +1773,7 @@ app.post("/sessions/:id/join-live", async (req, res) => {
 
     console.log("🔍 [JOIN-LIVE] Token decoded:", {
       user: user ? { id: user.id, name: user.name } : null,
-      guest: guest ? { id: guest.id, tempName: guest.tempName } : null
+      guest: guest ? { id: guest.id, tempName: guest.tempName } : null,
     });
 
     if (!user && !guest) {
@@ -1634,7 +1781,10 @@ app.post("/sessions/:id/join-live", async (req, res) => {
       return res.status(401).json({ error: "Unauthorized" });
     }
 
-    const [sess] = await pool.query("SELECT user_id FROM sessions WHERE id = ?", [id]);
+    const [sess] = await pool.query(
+      "SELECT user_id FROM sessions WHERE id = ?",
+      [id],
+    );
     if (!sess[0]) {
       console.warn("⚠️ [JOIN-LIVE] Session not found:", id);
       return res.status(404).json({ error: "Session not found" });
@@ -1647,31 +1797,37 @@ app.post("/sessions/:id/join-live", async (req, res) => {
       sessionId: id,
       participantId,
       type: user ? "user" : "guest",
-      role: user ? (sess[0].user_id === user.id ? "host" : "user") : "guest"
+      role: user ? (sess[0].user_id === user.id ? "host" : "user") : "guest",
     });
 
     const sessionIdInt = parseInt(id, 10);
     const participantIdInt = parseInt(participantId, 10);
-    const role = user ? (sess[0].user_id === user.id ? "host" : "user") : "guest";
+    const role = user
+      ? sess[0].user_id === user.id
+        ? "host"
+        : "user"
+      : "guest";
 
     // === 1) Prüfen ob Eintrag existiert ===
     const [existing] = await pool.query(
       `SELECT * FROM session_participants 
        WHERE session_id = ? AND ${column} = ?`,
-      [sessionIdInt, participantIdInt]
+      [sessionIdInt, participantIdInt],
     );
 
     if (existing.length > 0) {
       // === 2) Existiert bereits → nur reaktivieren ===
-      console.log("♻️ [JOIN-LIVE] Participant exists — updating is_live=1", existing[0]);
+      console.log(
+        "♻️ [JOIN-LIVE] Participant exists — updating is_live=1",
+        existing[0],
+      );
 
       await pool.query(
         `UPDATE session_participants 
          SET is_live = 1, role = ?
          WHERE session_id = ? AND ${column} = ?`,
-        [role, sessionIdInt, participantIdInt]
+        [role, sessionIdInt, participantIdInt],
       );
-
     } else {
       // === 3) Existiert NICHT → Insert ===
       console.log("🆕 [JOIN-LIVE] Inserting new participant");
@@ -1679,14 +1835,14 @@ app.post("/sessions/:id/join-live", async (req, res) => {
       await pool.query(
         `INSERT INTO session_participants (session_id, ${column}, role, is_live)
          VALUES (?, ?, ?, 1)`,
-        [sessionIdInt, participantIdInt, role]
+        [sessionIdInt, participantIdInt, role],
       );
     }
 
     // === Final check ===
     const [check] = await pool.query(
       `SELECT * FROM session_participants WHERE session_id = ? AND ${column} = ?`,
-      [sessionIdInt, participantIdInt]
+      [sessionIdInt, participantIdInt],
     );
 
     console.log("📝 [JOIN-LIVE] DB state after join:", check);
@@ -1694,17 +1850,15 @@ app.post("/sessions/:id/join-live", async (req, res) => {
     console.log("✅ [JOIN-LIVE] Join successful:", {
       sessionId: sessionIdInt,
       participantId: participantIdInt,
-      role
+      role,
     });
 
     res.json({ success: true });
-
   } catch (err) {
     console.error("❌ [JOIN-LIVE] Error:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
-
 
 // === Leave Live ===
 app.post("/sessions/:id/leave-live", async (req, res) => {
@@ -1723,7 +1877,7 @@ app.post("/sessions/:id/leave-live", async (req, res) => {
 
     await pool.query(
       `UPDATE session_participants SET is_live = 0 WHERE session_id = ? AND ${column} = ?`,
-      [sessionIdInt, participantIdInt]
+      [sessionIdInt, participantIdInt],
     );
 
     io.to(sessionIdInt).emit("participant_left", {
@@ -1848,7 +2002,7 @@ app.get("/youtube-info/:id", async (req, res) => {
     // 1. Erst prüfen, ob es bereits im Cache ist
     const [cached] = await pool.query(
       "SELECT * FROM youtube_video_cache WHERE youtube_id = ?",
-      [id]
+      [id],
     );
 
     if (cached.length) {
@@ -1858,28 +2012,32 @@ app.get("/youtube-info/:id", async (req, res) => {
         id: { videoId: id },
         snippet: {
           title: row.title,
-          description: "",                 // optional
-          channelTitle: "",                // optional
+          description: "", // optional
+          channelTitle: "", // optional
           thumbnails: {
             default: { url: row.thumbnail },
-            medium:  { url: row.thumbnail },
-            high:    { url: row.thumbnail },
+            medium: { url: row.thumbnail },
+            high: { url: row.thumbnail },
           },
         },
       });
     }
 
     // 2. Nicht im Cache → mit ytdl holen
-    const info = await ytdl.getBasicInfo(`https://www.youtube.com/watch?v=${id}`);
+    const info = await ytdl.getBasicInfo(
+      `https://www.youtube.com/watch?v=${id}`,
+    );
 
     const thumbs = info.videoDetails.thumbnails || [];
     const getThumb = (size) => {
       const map = { default: 0, medium: 1, high: thumbs.length - 1 };
-      return thumbs[map[size]]?.url || `https://i.ytimg.com/vi/${id}/${size}.jpg`;
+      return (
+        thumbs[map[size]]?.url || `https://i.ytimg.com/vi/${id}/${size}.jpg`
+      );
     };
 
-    const title     = info.videoDetails.title || "Unbekannter Titel";
-    const thumbnail = getThumb("default");   // wir nutzen nur default im Cache
+    const title = info.videoDetails.title || "Unbekannter Titel";
+    const thumbnail = getThumb("default"); // wir nutzen nur default im Cache
 
     // 3. **In Cache schreiben**
     await pool.query(
@@ -1890,9 +2048,9 @@ app.get("/youtube-info/:id", async (req, res) => {
         id,
         title,
         thumbnail,
-        normalize(title),                 // deine normalize-Funktion
+        normalize(title), // deine normalize-Funktion
         info.videoDetails.lengthSeconds || 0,
-      ]
+      ],
     );
 
     // 4. Antwort im YouTube-API-Format
@@ -1904,8 +2062,8 @@ app.get("/youtube-info/:id", async (req, res) => {
         channelTitle: info.videoDetails.author?.name || "",
         thumbnails: {
           default: { url: thumbnail },
-          medium:  { url: getThumb("medium") },
-          high:    { url: getThumb("high") },
+          medium: { url: getThumb("medium") },
+          high: { url: getThumb("high") },
         },
       },
     });
