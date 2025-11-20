@@ -1253,20 +1253,40 @@ app.post("/sessions/:id/proposals", async (req, res) => {
       [sessionId],
     );
 
-    let votingRoundId = null;
-    let status = "queued";
+   // === Load session + check host role ===
+const [[sessionRow]] = await pool.query(
+  "SELECT user_id, is_live FROM sessions WHERE id = ?",
+  [sessionId]
+);
 
-    if (openRounds.length === 0) {
-      const [result] = await pool.query(
-        "INSERT INTO voting_rounds (session_id, status, created_at) VALUES (?, 'open', NOW())",
-        [sessionId],
-      );
-      votingRoundId = result.insertId;
-      status = "suggested";
-    } else {
-      votingRoundId = openRounds[0].id;
-      status = "suggested";
-    }
+if (!sessionRow) {
+  return res.status(404).json({ error: "Session not found" });
+}
+
+const isHost = user && sessionRow.user_id === user.id;
+const isSessionLive = sessionRow.is_live === 1;
+
+// === Voting-Runde Logik ===
+let votingRoundId = null;
+let status = "queued";
+
+if (openRounds.length === 0) {
+  const [result] = await pool.query(
+    "INSERT INTO voting_rounds (session_id, status, created_at) VALUES (?, 'open', NOW())",
+    [sessionId],
+  );
+  votingRoundId = result.insertId;
+  status = "suggested";
+} else {
+  votingRoundId = openRounds[0].id;
+  status = "suggested";
+}
+
+// === NEW: Host before session is live → queue directly ===
+if (isHost && !isSessionLive) {
+  status = "queued";
+}
+
 
     // === Max. 5 Vorschläge pro Runde ===
     const [proposalCount] = await pool.query(
@@ -1500,6 +1520,22 @@ app.post("/sessions/:id/proposals/:propId/vote", async (req, res) => {
   const guest = await getGuestFromToken(guestToken);
   if (!user && !guest) return res.status(401).json({ error: "Unauthorized" });
 
+  // === Check if session is live ===
+  const [[sessionRow]] = await pool.query(
+    "SELECT is_live FROM sessions WHERE id = ?",
+    [id]
+  );
+
+  if (!sessionRow) {
+    return res.status(404).json({ error: "Session not found" });
+  }
+
+  if (sessionRow.is_live !== 1) {
+    return res.status(403).json({
+      error: "Voting is not allowed before the session goes live.",
+    });
+  }
+
   // Prüfen, ob Proposal existiert
   const [prop] = await pool.query(
     "SELECT voting_round_id FROM queue_items WHERE id = ? AND session_id = ?",
@@ -1612,10 +1648,6 @@ app.post("/sessions/:id/proposals/:propId/vote", async (req, res) => {
         [id, winningId],
       );
 
-      // Optional: Voting-Runde schließen (falls verwendet)
-      // await pool.query(`UPDATE voting_rounds SET status = 'computed', winner_queue_item_id = ? WHERE session_id = ? AND status = 'open'`, [winningId, id]);
-
-      // Informiere alle Clients
       io.to(id).emit("proposals_updated");
       io.to(id).emit("queue_updated");
 
