@@ -94,7 +94,7 @@ const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret_here";
 const YOUTUBE_KEY = process.env.YOUTUBE_KEY;
 
 const httpServer = app.listen(4000, () =>
-  console.log("Server läuft auf https://api.tunevote.com"),
+  console.log("Server läuft auf http://localhost:4000"),
 );
 const io = new Server(httpServer, { cors: { origin: "*" } });
 
@@ -122,7 +122,7 @@ const ensureGuestToken = async () => {
   // Wenn noch kein Token vorhanden, neuen Gast anlegen
   if (!guestToken) {
     try {
-      const { data } = await axios.post("https://api.tunevote.com/guest/join", {
+      const { data } = await axios.post("http://localhost:4000/guest/join", {
         nickname,
       });
       guestToken = data.guestToken;
