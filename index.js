@@ -541,51 +541,54 @@ app.get("/sessions", async (req, res) => {
   let user = null;
   let isGuest = false;
 
-  // 1. Prüfe eingeloggten Nutzer
+  // 1. Token prüfen (normaler User)
   const authHeader = req.headers.authorization;
   const token = authHeader?.split(" ")[1];
+
   if (token) {
     try {
-      user = await getUserFromToken(token);
+      user = await getUserFromToken(token); // Rückgabewert: { id, username, ... }
     } catch (err) {
       return res.status(401).json({ error: "Invalid token" });
     }
   }
 
-  // 2. Prüfe Gast
+  // 2. Gast prüfen
   const guestToken = req.headers["x-guest-token"];
   if (!user && guestToken) {
     try {
       const [rows] = await pool.query(
         "SELECT id, nickname FROM guest_users WHERE guest_token = ?",
-        [guestToken],
+        [guestToken]
       );
       if (rows.length > 0) {
         isGuest = true;
-        user = { id: null, isGuest: true, nickname: rows[0].nickname }; // Optional
+        user = { id: null, isGuest: true, nickname: rows[0].nickname };
       }
     } catch (err) {
       console.error("Guest token check failed:", err);
     }
   }
 
-  // 3. Kein Zugriff?
+  // 3. Kein Zugriff auf Sessions-Übersicht
   if (!user && !isGuest) {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
   try {
+    // Alle Sessions laden (inkl. private / public)
     const [rows] = await pool.query(`
       SELECT 
-        s.id, 
-        s.title, 
-        s.created_at, 
-        u.username AS host, 
-        s.user_id AS hostId, 
+        s.id,
+        s.title,
+        s.created_at,
+        s.user_id AS hostId,
+        u.username AS host,
         s.is_live,
+        s.is_private,
         (
-          SELECT COUNT(*) 
-          FROM session_participants sp 
+          SELECT COUNT(*)
+          FROM session_participants sp
           WHERE sp.session_id = s.id AND sp.is_live = 1
         ) AS participant_count
       FROM sessions s
@@ -593,10 +596,52 @@ app.get("/sessions", async (req, res) => {
       ORDER BY participant_count DESC, s.created_at DESC
     `);
 
-    res.json(rows);
+    // ================
+    // PRIVATE FILTERING
+    // ================
+    const filtered = [];
+
+    for (const session of rows) {
+      const isHost = user?.id && session.hostId === user.id;
+
+      if (session.is_private === 0) {
+        // Öffentliche Session → immer sichtbar
+        filtered.push(session);
+        continue;
+      }
+
+      // Private Session:
+      // 1. Host darf sie sehen
+      if (isHost) {
+        filtered.push(session);
+        continue;
+      }
+
+      // 2. Prüfen ob User eingeladen + akzeptiert hat
+      if (user?.id) {
+        const [[invite]] = await pool.query(
+  `SELECT accepted_at 
+   FROM session_invites 
+   WHERE session_id = ? 
+     AND email = ? 
+   LIMIT 1`,
+  [session.id, user.username] // oder user.email falls du das hast
+);
+
+if (invite && invite.accepted_at) {
+  filtered.push(session);
+  continue;
+}
+
+      }
+
+      // 3. Gäste sehen niemals private Sessions
+    }
+
+    return res.json(filtered);
   } catch (err) {
     console.error("Get sessions error:", err);
-    res.status(500).json({ error: "Server error" });
+    return res.status(500).json({ error: "Server error" });
   }
 });
 
@@ -607,41 +652,39 @@ app.post("/sessions", async (req, res) => {
   const user = await getUserFromToken(token);
   if (!user) return res.status(401).json({ error: "Unauthorized" });
 
-  const { title } = req.body;
-  if (!title?.trim()) return res.status(400).json({ error: "Title required" });
+  const { title, is_private } = req.body;
+
+  if (!title?.trim()) 
+    return res.status(400).json({ error: "Title required" });
+
+  const privateFlag = is_private ? 1 : 0;
 
   try {
     const [result] = await pool.query(
-      "INSERT INTO sessions (user_id, title) VALUES (?, ?)",
-      [user.id, title.trim()],
+      "INSERT INTO sessions (user_id, title, is_private) VALUES (?, ?, ?)",
+      [user.id, title.trim(), privateFlag],
     );
 
-    // 🔽 Hier Logging hinzufügen:
     console.log("🟢 Session insert result:", result);
 
     const sessionId = result.insertId;
-    console.log(
-      "✅ New session created with ID:",
-      sessionId,
-      "by user:",
-      user.id,
-    );
+    console.log("✅ New session created:", sessionId);
 
     await ensureParticipant(sessionId, user, null, true);
 
     const [newSession] = await pool.query(
-      "SELECT s.id, s.title, s.created_at, u.username AS host FROM sessions s JOIN users u ON s.user_id = u.id WHERE s.id = ?",
+      "SELECT s.id, s.title, s.is_private, s.created_at, u.username AS host FROM sessions s JOIN users u ON s.user_id = u.id WHERE s.id = ?",
       [sessionId],
     );
 
-    console.log("📦 Retrieved new session:", newSession[0]);
-
     res.status(201).json(newSession[0]);
+
   } catch (err) {
     console.error("❌ Error creating session:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
+
 
 // Wenn Benutzer ohne guest user & ohne account -> hier soll nach einer Session gesucht werden die Live ist, und danach sollte diese URL bereitgestellt und über das JSON verschickt werden wodurch man sich in der Live Session befindet.
 // === Auto-Join für nicht eingeloggte Benutzer ===
