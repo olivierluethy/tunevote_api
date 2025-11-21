@@ -47,15 +47,17 @@ CREATE TABLE session_invites (
   id INT NOT NULL AUTO_INCREMENT,
   session_id INT NOT NULL,
   email VARCHAR(100) NOT NULL,
-  invite_token CHAR(36) NOT NULL,
+  invited_user_id INT NULL AFTER,
   invited_by_user_id INT NOT NULL,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   accepted_at TIMESTAMP NULL,
+  revoked_at TIMESTAMP NULL,
   PRIMARY KEY (id),
   UNIQUE KEY unique_invite (session_id, email),
   FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
-  FOREIGN KEY (invited_by_user_id) REFERENCES users(id) ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+  FOREIGN KEY (invited_by_user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (invited_user_id) REFERENCES users(id) ON DELETE SET NULL;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4; COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE session_participants (
   id INT NOT NULL AUTO_INCREMENT,
