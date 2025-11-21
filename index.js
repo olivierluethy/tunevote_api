@@ -2321,178 +2321,254 @@ app.get("/youtube-info/:id", async (req, res) => {
 
 app.post("/sessions/:sessionId/invite", async (req, res) => {
   const { sessionId } = req.params;
-  const { email } = req.body;
+  const { email: rawEmail } = req.body;
+
+  // Auth
   const authHeader = req.headers.authorization;
   const token = authHeader?.split(" ")[1];
   const user = token ? await getUserFromToken(token) : null;
+  if (!user) return res.status(401).json({ error: "Unauthenticated" });
 
-  if (!user) {
-    return res.status(401).json({ error: "Unauthenticated" });
-  }
-
+  // E-Mail validieren & normalisieren
+  const email = rawEmail?.trim().toLowerCase();
   if (!email || !/^\S+@\S+\.\S+$/.test(email)) {
     return res.status(400).json({ error: "Ungültige E-Mail-Adresse" });
   }
 
+  // Selbst-Einladung verhindern
+  if (email === user.email) {
+    return res.status(400).json({ error: "Du kannst dich nicht selbst einladen." });
+  }
+
+  let conn;
   try {
-    // 1. Session + Host-Check
-    const [[session]] = await pool.query(
-      "SELECT title, user_id, is_private FROM sessions WHERE id = ?",
-      [sessionId],
+    // Verbindung & Transaktion starten (atomic)
+    conn = await pool.getConnection();
+    await conn.beginTransaction();
+
+    // 1) Session prüfen + Host-Validierung
+    const [[session]] = await conn.query(
+      `SELECT s.title, s.user_id, s.is_private, u.username AS host_name
+       FROM sessions s
+       JOIN users u ON s.user_id = u.id
+       WHERE s.id = ?`,
+      [sessionId]
     );
 
-    if (!session)
+    if (!session) {
+      await conn.rollback();
       return res.status(404).json({ error: "Session nicht gefunden" });
+    }
+    // is_private: wir gehen davon aus, dass 1 = private, 0 = public (dein ursprünglicher Check)
     if (session.is_private === 0) {
-      return res
-        .status(400)
-        .json({ error: "Nur private Sessions können Einladungen versenden" });
+      await conn.rollback();
+      return res.status(400).json({ error: "Nur private Sessions können Einladungen versenden" });
     }
     if (session.user_id !== user.id) {
-      return res
-        .status(403)
-        .json({ error: "Nur der Host darf Einladungen verschicken" });
+      await conn.rollback();
+      return res.status(403).json({ error: "Nur der Host darf Einladungen verschicken" });
     }
 
-    // 2. Prüfen, ob schon eingeladen (optional vermeiden von Duplikaten)
-    const [[existing]] = await pool.query(
-      "SELECT id FROM session_invites WHERE session_id = ? AND email = ?",
-      [sessionId, email],
+    const sessionTitle = session.title?.trim() || "Eine private TuneVote Session";
+    const hostName = session.host_name || "Der Host";
+
+    // 2) Existierenden Benutzer mit dieser E-Mail prüfen (case-insensitive)
+    const [[existingUser]] = await conn.query(
+      `SELECT id FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1`,
+      [email]
     );
+    const invitedUserId = existingUser ? existingUser.id : null;
+    const userExists = !!invitedUserId;
 
-    let inviteToken;
-    if (existing) {
-      // Wiederverwenden des bestehenden Tokens
-      const [[invite]] = await pool.query(
-        "SELECT invite_token FROM session_invites WHERE id = ?",
-        [existing.id],
-      );
-      inviteToken = invite.invite_token;
+    // 3) Existierende Einladung für diese session+email prüfen (lock row for update)
+    const [rows] = await conn.query(
+      `SELECT id, accepted_at, revoked_at, invited_user_id 
+       FROM session_invites 
+       WHERE session_id = ? AND LOWER(email) = LOWER(?) 
+       LIMIT 1 FOR UPDATE`,
+      [sessionId, email]
+    );
+    const existingInvite = rows[0] || null;
+
+    if (existingInvite) {
+      // Einladung existiert bereits
+      if (existingInvite.revoked_at || existingInvite.accepted_at) {
+        // Reaktivieren: reset timestamps, update invited_user_id falls vorhanden
+        await conn.query(
+          `UPDATE session_invites
+           SET revoked_at = NULL,
+               accepted_at = NULL,
+               created_at = NOW(),
+               invited_user_id = COALESCE(?, invited_user_id)
+           WHERE id = ?`,
+          [invitedUserId, existingInvite.id]
+        );
+      } else {
+        // Einladung ist offen: nur invited_user_id nachtragen, falls jetzt bekannt
+        if (invitedUserId && !existingInvite.invited_user_id) {
+          await conn.query(
+            `UPDATE session_invites
+             SET invited_user_id = ?
+             WHERE id = ?`,
+            [invitedUserId, existingInvite.id]
+          );
+        }
+        // sonst: nichts tun (bereits offene Einladung vorhanden)
+      }
     } else {
-      // Neuen Eintrag + Token erstellen
-      inviteToken = crypto.randomUUID(); // 36 Zeichen UUID
-
-      await pool.query(
+      // keine Einladung → neu anlegen (mit invited_user_id falls vorhanden)
+      await conn.query(
         `INSERT INTO session_invites 
-         (session_id, email, invite_token, invited_by_user_id) 
+         (session_id, email, invited_by_user_id, invited_user_id)
          VALUES (?, ?, ?, ?)`,
-        [sessionId, email, inviteToken, user.id],
+        [sessionId, email, user.id, invitedUserId]
       );
     }
 
-    // 3. Einladungs-URL (deine Frontend-URL anpassen!)
-    const inviteLink = `${process.env.FRONTEND_URL || "http://localhost:5173"}/invite/${inviteToken}`;
+    // Commit der DB-Änderungen bevor wir versuchen die Mail zu senden
+    await conn.commit();
 
-    // 4. HTML-E-Mail
-    const mailOptions = {
-      from: `"TuneVote Sessions" <${process.env.GMAIL_USER}>`,
-      to: email,
-      subject: `Einladung zur privaten Session: ${session.title}`,
-      text: `Du wurdest zur privaten Session "${session.title}" eingeladen!\n\nKlicke hier, um beizutreten:\n${inviteLink}`,
-      html: `
-        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; padding: 20px; border: 1px solid #ddd; border-radius: 10px;">
-          <h2 style="color: #4f46e5;">Du wurdest eingeladen!</h2>
-          <p>Der Host lädt dich zur privaten Session ein:</p>
-          <h3 style="color: #1f2937;">${session.title}</h3>
-          <p>Klicke auf den Button, um direkt beizutreten:</p>
-          <a href="${inviteLink}" 
-             style="display: inline-block; background: #4f46e5; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold;">
-            Session beitreten
-          </a>
-          <p style="margin-top: 20px; color: #666; font-size: 0.9em;">
-            Oder kopiere diesen Link: <br/>
-            <a href="${inviteLink}">${inviteLink}</a>
-          </p>
-          <hr style="margin: 30px 0; border: none; border-top: 1px solid #eee;">
-          <p style="color: #999; font-size: 0.8em;">Diese Einladung wurde über TuneVote verschickt.</p>
-        </div>
-      `,
-    };
+    // 4) Email vorbereiten und senden (Fehler beim Senden loggen - DB bleibt bestehen)
+    const baseUrl = process.env.FRONTEND_URL || "https://yourdomain.com";
+    const dashboardLink = `${baseUrl}/dashboard`;
+    const buttonText = userExists ? "Einladung im Dashboard ansehen" : "Registrieren & Session beitreten";
 
-    await transporter.sendMail(mailOptions);
+    // Hier dein HTML-Template einfügen oder dynamisch erstellen
+    const htmlTemplate = `... dein bisheriger HTML-CODE ...`;
 
-    return res.json({ success: true, message: "Einladung verschickt" });
-  } catch (err) {
-    console.error("Invite error:", err);
-    return res
-      .status(500)
-      .json({ error: "Fehler beim Versenden der Einladung" });
-  }
-});
+    const subject = userExists
+      ? `Neue Einladung: ${sessionTitle}`
+      : `${hostName} hat dich zu "${sessionTitle}" eingeladen`;
 
-// GET /invite/:token → Frontend leitet weiter zur Session + setzt Cookie/Token
-app.get("/invite/:token", async (req, res) => {
-  const { token } = req.params;
-
-  try {
-    const [rows] = await pool.query(
-      "SELECT * FROM session_invites WHERE invite_token = ?",
-      [token],
-    );
-
-    if (rows.length === 0) {
-      return res.status(404).json({ error: "Einladung nicht gefunden" });
-    }
-
-    const invite = rows[0];
-
-    // accepted_at setzen
-    if (!invite.accepted_at) {
-      await pool.query(
-        "UPDATE session_invites SET accepted_at = NOW() WHERE id = ?",
-        [invite.id],
-      );
-    }
-
-    // Gast-User anlegen + Cookie setzen (wie bisher)
-    let guestToken = null;
-    const [[existingUser]] = await pool.query(
-      "SELECT id FROM users WHERE email = ?",
-      [invite.email],
-    );
-
-    if (!existingUser) {
-      guestToken = crypto.randomUUID();
-      const nickname = invite.email.split("@")[0];
-
-      const [result] = await pool.query(
-        "INSERT INTO guest_users (guest_token, nickname) VALUES (?, ?)",
-        [guestToken, nickname],
-      );
-
-      // Cookie setzen
-      res.cookie("guest_token", guestToken, {
-        httpOnly: false,
-        sameSite: "lax",
-        secure: process.env.NODE_ENV === "production",
-        maxAge: 30 * 24 * 60 * 60 * 1000,
+    try {
+      await transporter.sendMail({
+        from: `"TuneVote" <${process.env.GMAIL_USER}>`,
+        to: email,
+        subject,
+        text: userExists
+          ? `Du hast eine neue Einladung zu "${sessionTitle}". Öffne dein Dashboard: ${dashboardLink}`
+          : `Du wurdest zu "${sessionTitle}" eingeladen! Erstelle ein Konto oder logge dich ein: ${dashboardLink}`,
+        html: htmlTemplate,
       });
-
-      // Participant eintragen
-      await pool.query(
-        `INSERT IGNORE INTO session_participants 
-         (session_id, guest_id, role, is_live) VALUES (?, ?, 'guest', 0)`,
-        [invite.session_id, result.insertId],
-      );
-    } else {
-      // Registrierter User → Participant eintragen
-      await pool.query(
-        `INSERT IGNORE INTO session_participants 
-         (session_id, user_id, role, is_live) VALUES (?, ?, 'user', 0)`,
-        [invite.session_id, existingUser.id],
-      );
+    } catch (mailErr) {
+      // Mailfehler: loggen, aber nicht DB zurückrollen (Invitation soll bestehen bleiben)
+      console.error("Invite mail send error:", mailErr);
+      return res.status(500).json({
+        success: true,
+        message: "Einladung in der Datenbank gespeichert, aber E-Mail konnte nicht gesendet werden.",
+        emailError: true,
+        alreadyRegistered: userExists,
+      });
     }
 
-    // Statt voller URL nur den relativen Pfad zurückgeben
+    // Alles OK
     return res.json({
       success: true,
-      redirectTo: `/session/${invite.session_id}`, // ← nur der Pfad!
+      message: "Einladung erfolgreich versendet",
+      alreadyRegistered: userExists,
     });
+
   } catch (err) {
-    console.error("/invite/:token error:", err);
-    return res.status(500).json({ error: "Serverfehler" });
+    // Fehlerbehandlung: Rollback falls Transaktion offen
+    console.error("Invite error:", err);
+    try { if (conn) await conn.rollback(); } catch (e) { console.error("Rollback error:", e); }
+    return res.status(500).json({ error: "Fehler beim Versenden der Einladung" });
+  } finally {
+    if (conn) conn.release();
   }
 });
+
+// GET: Einladungen, die du verschickt hast
+app.get("/invites/sent", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.split(" ")[1];
+  const user = token ? await getUserFromToken(token) : null;
+
+  if (!user) return res.status(401).json({ error: "Unauthenticated" });
+
+  const [invites] = await pool.query(
+    `SELECT si.id, si.email, si.created_at, si.accepted_at, si.revoked_at, s.title AS session_title
+     FROM session_invites si
+     JOIN sessions s ON si.session_id = s.id
+     WHERE si.invited_by_user_id = ?`,
+    [user.id]
+  );
+
+  res.json(invites);
+});
+
+// GET: Einladungen, die du erhalten hast
+app.get("/invites/received", async (req, res) => {
+const authHeader = req.headers.authorization;
+  const token = authHeader?.split(" ")[1];
+  const user = token ? await getUserFromToken(token) : null;
+  if (!user) return res.status(401).json({ error: "Unauthenticated" });
+
+  const [invites] = await pool.query(
+    `SELECT 
+       si.id, si.email, si.created_at, si.accepted_at, si.revoked_at, 
+       s.title AS session_title, u.username AS host_name
+     FROM session_invites si
+     JOIN sessions s ON si.session_id = s.id
+     JOIN users u ON s.user_id = u.id
+     WHERE (LOWER(si.email) = LOWER(?) OR si.invited_user_id = ?)
+       AND si.revoked_at IS NULL
+     ORDER BY si.created_at DESC`,
+    [user.email, user.id]
+  );
+
+  res.json(invites);
+});
+
+// POST: Einladung annehmen
+app.post("/invites/:inviteId/accept", async (req, res) => {
+  const { inviteId } = req.params;
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.split(" ")[1];
+  const user = token ? await getUserFromToken(token) : null;
+  if (!user) return res.status(401).json({ error: "Unauthenticated" });
+
+  const [result] = await pool.query(
+    `UPDATE session_invites 
+     SET accepted_at = NOW(),
+         invited_user_id = COALESCE(invited_user_id, ?)   -- falls noch NULL → jetzt setzen
+     WHERE id = ?
+       AND (email = ? OR invited_user_id = ?)
+       AND accepted_at IS NULL 
+       AND revoked_at IS NULL`,
+    [user.id, inviteId, user.email, user.id]
+  );
+
+  if (result.affectedRows === 0) {
+    return res.status(400).json({ error: "Einladung nicht gefunden oder bereits bearbeitet" });
+  }
+
+  res.json({ success: true });
+});
+
+// POST: Einladung ablehnen
+app.post("/invites/:inviteId/revoke", async (req, res) => {
+  const { inviteId } = req.params;
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.split(" ")[1];
+  const user = token ? await getUserFromToken(token) : null;
+  if (!user) return res.status(401).json({ error: "Unauthenticated" });
+
+  const [result] = await pool.query(
+    `UPDATE session_invites 
+     SET revoked_at = NOW() 
+     WHERE id = ? AND invited_by_user_id = ? AND revoked_at IS NULL`,
+    [inviteId, user.id]
+  );
+
+  if (result.affectedRows === 0) {
+    return res.status(400).json({ error: "Einladung nicht gefunden oder bereits widerrufen" });
+  }
+
+  res.json({ success: true });
+});
+
+
 // ============================================================
 // GET /sessions/:sessionId/participants → Nur live Teilnehmer (is_live = 1)
 // + Echtzeit-Updates über Socket.IO
