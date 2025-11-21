@@ -37,10 +37,25 @@ CREATE TABLE sessions (
   is_active TINYINT(1) DEFAULT '1',
   created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
   is_live TINYINT(1) DEFAULT '0',
+  is_private TINYINT(1) DEFAULT 0,
   PRIMARY KEY (id),
   KEY user_id (user_id),
   CONSTRAINT sessions_ibfk_1 FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE session_invites (
+  id INT NOT NULL AUTO_INCREMENT,
+  session_id INT NOT NULL,
+  email VARCHAR(100) NOT NULL,
+  invite_token CHAR(36) NOT NULL,
+  invited_by_user_id INT NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  accepted_at TIMESTAMP NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY unique_invite (session_id, email),
+  FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+  FOREIGN KEY (invited_by_user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE session_participants (
   id INT NOT NULL AUTO_INCREMENT,
