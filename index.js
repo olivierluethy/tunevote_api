@@ -240,6 +240,12 @@ const advanceToNext = async (sessionId) => {
       await pool.query("DELETE FROM playback_sync WHERE session_id = ?", [
         sessionId,
       ]);
+      await pool.query("UPDATE session_participants SET is_live = 0 WHERE session_id = ?", [
+        sessionId,
+      ]);
+      await pool.query("DELETE FROM queue_items WHERE status='suggested' AND session_id = ?", [
+        sessionId,
+      ]);
 
       io.to(sessionId).emit("session_ended");
       io.to(sessionId).emit("queue_updated");
