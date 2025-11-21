@@ -10,6 +10,21 @@ const axios = require("axios");
 const { sendEmail } = require("./email.js");
 const crypto = require("crypto");
 const ytdl = require("ytdl-core");
+const nodemailer = require("nodemailer");
+
+const transporter = nodemailer.createTransport({
+  service: "gmail",
+  auth: {
+    user: process.env.GMAIL_USER,
+    pass: process.env.GMAIL_APP_PASSWORD, // mit Leerzeichen aus App-Passwort!
+  },
+});
+
+// Teste beim Start einmal
+transporter
+  .verify()
+  .then(() => console.log("Gmail ready"))
+  .catch(console.error);
 
 const generateResetToken = () => crypto.randomBytes(32).toString("hex");
 
@@ -240,12 +255,14 @@ const advanceToNext = async (sessionId) => {
       await pool.query("DELETE FROM playback_sync WHERE session_id = ?", [
         sessionId,
       ]);
-      await pool.query("UPDATE session_participants SET is_live = 0 WHERE session_id = ?", [
-        sessionId,
-      ]);
-      await pool.query("DELETE FROM queue_items WHERE status='suggested' AND session_id = ?", [
-        sessionId,
-      ]);
+      await pool.query(
+        "UPDATE session_participants SET is_live = 0 WHERE session_id = ?",
+        [sessionId],
+      );
+      await pool.query(
+        "DELETE FROM queue_items WHERE status='suggested' AND session_id = ?",
+        [sessionId],
+      );
 
       io.to(sessionId).emit("session_ended");
       io.to(sessionId).emit("queue_updated");
@@ -371,6 +388,33 @@ const advanceToNext = async (sessionId) => {
   }
 };
 
+// Hilfsfunktion: Sendet aktuelle Live-Teilnehmer an alle in der Session
+const broadcastLiveParticipants = async (sessionId) => {
+  try {
+    const [participants] = await pool.query(
+      `SELECT 
+         COALESCE(u.username, g.nickname, 'Gast') AS name,
+         (sp.role = 'host') AS isHost
+       FROM session_participants sp
+       LEFT JOIN users u ON sp.user_id = u.id
+       LEFT JOIN guest_users g ON sp.guest_id = g.id
+       WHERE sp.session_id = ? AND sp.is_live = 1
+       ORDER BY sp.joined_at DESC`,
+      [sessionId]
+    );
+
+    const formatted = participants.map(p => ({
+      name: p.name,
+      isHost: !!p.isHost,
+    }));
+
+    // An alle Clients in der Session senden
+    io.to(sessionId.toString()).emit("live_participants_updated", formatted);
+  } catch (err) {
+    console.error("Fehler beim Broadcast von Live-Teilnehmern:", err);
+  }
+};
+
 // === Socket.IO ===
 io.on("connection", (socket) => {
   const sessionId = socket.handshake.query.sessionId;
@@ -436,6 +480,8 @@ io.on("connection", (socket) => {
       [sessionIdInt, participantIdInt],
     );
 
+    await broadcastLiveParticipants(sessionIdInt);
+
     console.log("📝 [WS-DISCONNECT] Marked is_live=0 in DB");
 
     io.to(sessionIdInt).emit("participant_left", {
@@ -454,7 +500,6 @@ io.on("connection", (socket) => {
     console.log("🚪 [WS-DISCONNECT] Completed for:", participantIdInt);
   });
 });
-
 
 // === Playback Sync Endpoint ===
 app.get("/sessions/:id/playback-sync", async (req, res) => {
@@ -541,19 +586,19 @@ app.get("/sessions", async (req, res) => {
   let user = null;
   let isGuest = false;
 
-  // 1. Token prüfen (normaler User)
+  // 1. Bearer Token (eingeloggter User)
   const authHeader = req.headers.authorization;
   const token = authHeader?.split(" ")[1];
 
   if (token) {
     try {
-      user = await getUserFromToken(token); // Rückgabewert: { id, username, ... }
+      user = await getUserFromToken(token); // { id, username, ... } (email kann fehlen!)
     } catch (err) {
       return res.status(401).json({ error: "Invalid token" });
     }
   }
 
-  // 2. Gast prüfen
+  // 2. Gast-Token
   const guestToken = req.headers["x-guest-token"];
   if (!user && guestToken) {
     try {
@@ -566,19 +611,76 @@ app.get("/sessions", async (req, res) => {
         user = { id: null, isGuest: true, nickname: rows[0].nickname };
       }
     } catch (err) {
-      console.error("Guest token check failed:", err);
+      console.error("Guest token error:", err);
     }
   }
 
-  // 3. Kein Zugriff auf Sessions-Übersicht
-  if (!user && !isGuest) {
+  // 3. Kein Zugriff ohne Auth
+  if (!user) {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
   try {
-    // Alle Sessions laden (inkl. private / public)
-    const [rows] = await pool.query(`
-      SELECT 
+    let rows;
+
+    // ——————————————————————————————
+    // Gast → nur öffentliche Sessions
+    // ——————————————————————————————
+    if (isGuest || !user.id) {
+      [rows] = await pool.query(`
+        SELECT 
+          s.id,
+          s.title,
+          s.created_at,
+          s.user_id AS hostId,
+          u.username AS host,
+          s.is_live,
+          s.is_private,
+          (
+            SELECT COUNT(*)
+            FROM session_participants sp
+            WHERE sp.session_id = s.id AND sp.is_live = 1
+          ) AS participant_count
+        FROM sessions s
+        JOIN users u ON s.user_id = u.id
+        WHERE s.is_private = 0
+        ORDER BY participant_count DESC, s.created_at DESC
+      `);
+      return res.json(rows);
+    }
+
+    // ——————————————————————————————
+    // Eingeloggter User → öffentlich + eigene + akzeptierte private Einladungen
+    // ——————————————————————————————
+    const userId = user.id;
+
+    // E-Mail sicher aus der DB holen (auch wenn sie im JWT fehlt)
+    const [[{ email: userEmail }]] = await pool.query(
+      "SELECT email FROM users WHERE id = ?",
+      [userId]
+    );
+
+    if (!userEmail) {
+      // Sollte nie passieren, aber zur Sicherheit: nur öffentliche + eigene Sessions
+      [rows] = await pool.query(`
+        SELECT 
+          s.id, s.title, s.created_at, s.user_id AS hostId, u.username AS host,
+          s.is_live, s.is_private,
+          (
+            SELECT COUNT(*) FROM session_participants sp
+            WHERE sp.session_id = s.id AND sp.is_live = 1
+          ) AS participant_count
+        FROM sessions s
+        JOIN users u ON s.user_id = u.id
+        WHERE s.is_private = 0 OR s.user_id = ?
+        ORDER BY participant_count DESC, s.created_at DESC
+      `, [userId]);
+      return res.json(rows);
+    }
+
+    // Hauptquery: alles in einem Rutsch
+    [rows] = await pool.query(`
+      SELECT DISTINCT
         s.id,
         s.title,
         s.created_at,
@@ -593,52 +695,19 @@ app.get("/sessions", async (req, res) => {
         ) AS participant_count
       FROM sessions s
       JOIN users u ON s.user_id = u.id
+      LEFT JOIN session_invites si 
+        ON si.session_id = s.id 
+       AND si.email = ?
+       AND si.accepted_at IS NOT NULL                 -- WICHTIG: nur akzeptierte!
+      WHERE 
+        s.is_private = 0                               -- öffentlich
+        OR s.user_id = ?                                -- eigener Host
+        OR si.id IS NOT NULL                            -- akzeptierte Einladung
       ORDER BY participant_count DESC, s.created_at DESC
-    `);
+    `, [userEmail, userId]);
 
-    // ================
-    // PRIVATE FILTERING
-    // ================
-    const filtered = [];
+    return res.json(rows);
 
-    for (const session of rows) {
-      const isHost = user?.id && session.hostId === user.id;
-
-      if (session.is_private === 0) {
-        // Öffentliche Session → immer sichtbar
-        filtered.push(session);
-        continue;
-      }
-
-      // Private Session:
-      // 1. Host darf sie sehen
-      if (isHost) {
-        filtered.push(session);
-        continue;
-      }
-
-      // 2. Prüfen ob User eingeladen + akzeptiert hat
-      if (user?.id) {
-        const [[invite]] = await pool.query(
-  `SELECT accepted_at 
-   FROM session_invites 
-   WHERE session_id = ? 
-     AND email = ? 
-   LIMIT 1`,
-  [session.id, user.username] // oder user.email falls du das hast
-);
-
-if (invite && invite.accepted_at) {
-  filtered.push(session);
-  continue;
-}
-
-      }
-
-      // 3. Gäste sehen niemals private Sessions
-    }
-
-    return res.json(filtered);
   } catch (err) {
     console.error("Get sessions error:", err);
     return res.status(500).json({ error: "Server error" });
@@ -654,8 +723,7 @@ app.post("/sessions", async (req, res) => {
 
   const { title, is_private } = req.body;
 
-  if (!title?.trim()) 
-    return res.status(400).json({ error: "Title required" });
+  if (!title?.trim()) return res.status(400).json({ error: "Title required" });
 
   const privateFlag = is_private ? 1 : 0;
 
@@ -678,13 +746,11 @@ app.post("/sessions", async (req, res) => {
     );
 
     res.status(201).json(newSession[0]);
-
   } catch (err) {
     console.error("❌ Error creating session:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
-
 
 // Wenn Benutzer ohne guest user & ohne account -> hier soll nach einer Session gesucht werden die Live ist, und danach sollte diese URL bereitgestellt und über das JSON verschickt werden wodurch man sich in der Live Session befindet.
 // === Auto-Join für nicht eingeloggte Benutzer ===
@@ -806,7 +872,7 @@ app.get("/sessions/:id/recommendations", async (req, res) => {
     `SELECT id FROM voting_rounds 
      WHERE session_id = ? AND status = 'open'
      ORDER BY id DESC LIMIT 1`,
-    [id]
+    [id],
   );
 
   const currentRoundId = votingRoundRows[0]?.id;
@@ -819,13 +885,15 @@ app.get("/sessions/:id/recommendations", async (req, res) => {
     `SELECT COUNT(*) as count 
      FROM queue_items 
      WHERE voting_round_id = ? AND status = 'suggested'`,
-    [currentRoundId]
+    [currentRoundId],
   );
   const numItems = suggestedRows[0].count;
 
   const needed = 3 - numItems;
   if (needed <= 0) {
-    console.log("[AI] Already 3 or more items in voting round. Returning existing AI suggestions.");
+    console.log(
+      "[AI] Already 3 or more items in voting round. Returning existing AI suggestions.",
+    );
     const [existingAi] = await pool.query(
       `SELECT id, title, video_id AS youtubeId, thumbnail
        FROM queue_items
@@ -833,7 +901,7 @@ app.get("/sessions/:id/recommendations", async (req, res) => {
          AND voting_round_id = ?
          AND item_source = 'ai'
          AND status = 'suggested'`,
-      [id, currentRoundId]
+      [id, currentRoundId],
     );
     return res.json(existingAi);
   }
@@ -845,10 +913,12 @@ app.get("/sessions/:id/recommendations", async (req, res) => {
        AND voting_round_id = ?
        AND item_source = 'ai'
        AND status = 'suggested'`,
-    [id, currentRoundId]
+    [id, currentRoundId],
   );
 
-  console.log(`[AI] ${numItems} items in voting round. Generating ${needed} AI suggestion(s)...`);
+  console.log(
+    `[AI] ${numItems} items in voting round. Generating ${needed} AI suggestion(s)...`,
+  );
 
   // ---- Get suggested titles to avoid duplicates ----
   const [suggestedTitleRows] = await pool.query(
@@ -858,7 +928,7 @@ app.get("/sessions/:id/recommendations", async (req, res) => {
     JOIN youtube_video_cache yvc ON qi.video_id = yvc.youtube_id
     WHERE qi.voting_round_id = ? AND qi.status = 'suggested'
     `,
-    [currentRoundId]
+    [currentRoundId],
   );
 
   const allTitles = [...titles, ...suggestedTitleRows.map((r) => r.title)];
@@ -931,7 +1001,8 @@ Instructions:
     const shorter = s1.length > s2.length ? s2 : s1;
     if (longer.length === 0) return 100;
     return Math.round(
-      ((longer.length - levenshteinDistance(longer, shorter)) / longer.length) * 100,
+      ((longer.length - levenshteinDistance(longer, shorter)) / longer.length) *
+        100,
     );
   };
 
@@ -999,7 +1070,7 @@ Instructions:
                   id: bestMatch.youtube_id,
                   key: YOUTUBE_KEY,
                 },
-              }
+              },
             );
 
             const durIso = ytDetails.data.items?.[0]?.contentDetails?.duration;
@@ -1010,18 +1081,21 @@ Instructions:
               durationSeconds = mins * 60 + secs;
               await pool.query(
                 `UPDATE youtube_video_cache SET duration = ? WHERE youtube_id = ?`,
-                [durationSeconds, bestMatch.youtube_id]
+                [durationSeconds, bestMatch.youtube_id],
               );
             }
           } catch (err) {
-            console.warn("[YouTube] Failed to fetch duration from cache match:", err.message);
+            console.warn(
+              "[YouTube] Failed to fetch duration from cache match:",
+              err.message,
+            );
           }
         }
         results.push({
           title: bestMatch.title,
           youtubeId: bestMatch.youtube_id,
           thumbnail: bestMatch.thumbnail || "",
-          duration: durationSeconds
+          duration: durationSeconds,
         });
         if (results.length >= needed) break;
         continue;
@@ -1077,7 +1151,7 @@ Instructions:
                 id: videoId,
                 key: YOUTUBE_KEY,
               },
-            }
+            },
           );
 
           const durIso = ytDetails.data.items?.[0]?.contentDetails?.duration;
@@ -1104,15 +1178,14 @@ Instructions:
         );
 
         // ---- UPDATED: push duration into results ----
-        results.push({ 
-          title, 
-          youtubeId: videoId, 
+        results.push({
+          title,
+          youtubeId: videoId,
           thumbnail,
-          duration: durationSeconds 
+          duration: durationSeconds,
         });
 
         if (results.length >= needed) break;
-
       } catch (err) {
         console.warn(
           `[YouTube] Search failed for "${s.title}":`,
@@ -1132,7 +1205,14 @@ Instructions:
         `INSERT INTO queue_items 
           (session_id, video_id, title, thumbnail, duration, status, item_source, item_type, voting_round_id)
          VALUES (?, ?, ?, ?, ?, 'suggested', 'ai', 'music', ?)`,
-        [id, item.youtubeId, item.title, item.thumbnail, item.duration, currentRoundId],
+        [
+          id,
+          item.youtubeId,
+          item.title,
+          item.thumbnail,
+          item.duration,
+          currentRoundId,
+        ],
       );
 
       created.push({
@@ -1152,7 +1232,6 @@ Instructions:
     res.status(500).json({ error: "Recommendation failed" });
   }
 });
-
 
 // ---------------------------------------------------------------
 // 5. NEW ENDPOINT – ADD RECOMMENDED SONG (click → queue)
@@ -1302,40 +1381,39 @@ app.post("/sessions/:id/proposals", async (req, res) => {
       [sessionId],
     );
 
-   // === Load session + check host role ===
-const [[sessionRow]] = await pool.query(
-  "SELECT user_id, is_live FROM sessions WHERE id = ?",
-  [sessionId]
-);
+    // === Load session + check host role ===
+    const [[sessionRow]] = await pool.query(
+      "SELECT user_id, is_live FROM sessions WHERE id = ?",
+      [sessionId],
+    );
 
-if (!sessionRow) {
-  return res.status(404).json({ error: "Session not found" });
-}
+    if (!sessionRow) {
+      return res.status(404).json({ error: "Session not found" });
+    }
 
-const isHost = user && sessionRow.user_id === user.id;
-const isSessionLive = sessionRow.is_live === 1;
+    const isHost = user && sessionRow.user_id === user.id;
+    const isSessionLive = sessionRow.is_live === 1;
 
-// === Voting-Runde Logik ===
-let votingRoundId = null;
-let status = "queued";
+    // === Voting-Runde Logik ===
+    let votingRoundId = null;
+    let status = "queued";
 
-if (openRounds.length === 0) {
-  const [result] = await pool.query(
-    "INSERT INTO voting_rounds (session_id, status, created_at) VALUES (?, 'open', NOW())",
-    [sessionId],
-  );
-  votingRoundId = result.insertId;
-  status = "suggested";
-} else {
-  votingRoundId = openRounds[0].id;
-  status = "suggested";
-}
+    if (openRounds.length === 0) {
+      const [result] = await pool.query(
+        "INSERT INTO voting_rounds (session_id, status, created_at) VALUES (?, 'open', NOW())",
+        [sessionId],
+      );
+      votingRoundId = result.insertId;
+      status = "suggested";
+    } else {
+      votingRoundId = openRounds[0].id;
+      status = "suggested";
+    }
 
-// === NEW: Host before session is live → queue directly ===
-if (isHost && !isSessionLive) {
-  status = "queued";
-}
-
+    // === NEW: Host before session is live → queue directly ===
+    if (isHost && !isSessionLive) {
+      status = "queued";
+    }
 
     // === Max. 5 Vorschläge pro Runde ===
     const [proposalCount] = await pool.query(
@@ -1572,7 +1650,7 @@ app.post("/sessions/:id/proposals/:propId/vote", async (req, res) => {
   // === Check if session is live ===
   const [[sessionRow]] = await pool.query(
     "SELECT is_live FROM sessions WHERE id = ?",
-    [id]
+    [id],
   );
 
   if (!sessionRow) {
@@ -1905,7 +1983,9 @@ app.post("/sessions/:id/join-live", async (req, res) => {
     });
 
     if (!user && !guest) {
-      console.warn("❌ [JOIN-LIVE] Unauthorized — no valid token or guest token");
+      console.warn(
+        "❌ [JOIN-LIVE] Unauthorized — no valid token or guest token",
+      );
       return res.status(401).json({ error: "Unauthorized" });
     }
 
@@ -1942,13 +2022,18 @@ app.post("/sessions/:id/join-live", async (req, res) => {
     );
 
     if (existing.length > 0) {
-      console.log("♻️ [JOIN-LIVE] Participant already exists. Reactivating is_live=1", existing[0]);
+      console.log(
+        "♻️ [JOIN-LIVE] Participant already exists. Reactivating is_live=1",
+        existing[0],
+      );
       await pool.query(
         `UPDATE session_participants SET is_live = 1, role = ? WHERE session_id = ? AND ${column} = ?`,
         [role, parseInt(id, 10), parseInt(participantId, 10)],
       );
     } else {
-      console.log("🆕 [JOIN-LIVE] Participant not found in DB. Inserting new record.");
+      console.log(
+        "🆕 [JOIN-LIVE] Participant not found in DB. Inserting new record.",
+      );
       await pool.query(
         `INSERT INTO session_participants (session_id, ${column}, role, is_live) VALUES (?, ?, ?, 1)`,
         [parseInt(id, 10), parseInt(participantId, 10), role],
@@ -1969,6 +2054,7 @@ app.post("/sessions/:id/join-live", async (req, res) => {
       role,
     });
 
+    await broadcastLiveParticipants(parseInt(id, 10));
     res.json({ success: true });
   } catch (err) {
     console.error("❌ [JOIN-LIVE] Error occurred:", err);
@@ -2001,7 +2087,9 @@ app.post("/sessions/:id/leave-live", async (req, res) => {
     });
 
     if (!user && !guest) {
-      console.warn("❌ [LEAVE-LIVE] Unauthorized — no valid token or guest token");
+      console.warn(
+        "❌ [LEAVE-LIVE] Unauthorized — no valid token or guest token",
+      );
       return res.status(401).json({ error: "Unauthorized" });
     }
 
@@ -2038,15 +2126,17 @@ app.post("/sessions/:id/leave-live", async (req, res) => {
       isGuest: !!guest,
     });
 
-    console.log("✅ [LEAVE-LIVE] Participant left successfully, event emitted.");
+    console.log(
+      "✅ [LEAVE-LIVE] Participant left successfully, event emitted.",
+    );
 
+    await broadcastLiveParticipants(sessionIdInt);
     res.json({ success: true });
   } catch (err) {
     console.error("❌ [LEAVE-LIVE] Error occurred:", err);
     res.status(500).json({ error: "Server error" });
   }
 });
-
 
 // === Live stream endpoint (HOOK) ===
 app.get("/sessions/:id/live/stream", async (req, res) => {
@@ -2226,5 +2316,243 @@ app.get("/youtube-info/:id", async (req, res) => {
   } catch (err) {
     console.error("YTDL error:", err);
     res.status(500).json({ error: "Failed to fetch video info" });
+  }
+});
+
+app.post("/sessions/:sessionId/invite", async (req, res) => {
+  const { sessionId } = req.params;
+  const { email } = req.body;
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.split(" ")[1];
+  const user = token ? await getUserFromToken(token) : null;
+
+  if (!user) {
+    return res.status(401).json({ error: "Unauthenticated" });
+  }
+
+  if (!email || !/^\S+@\S+\.\S+$/.test(email)) {
+    return res.status(400).json({ error: "Ungültige E-Mail-Adresse" });
+  }
+
+  try {
+    // 1. Session + Host-Check
+    const [[session]] = await pool.query(
+      "SELECT title, user_id, is_private FROM sessions WHERE id = ?",
+      [sessionId],
+    );
+
+    if (!session)
+      return res.status(404).json({ error: "Session nicht gefunden" });
+    if (session.is_private === 0) {
+      return res
+        .status(400)
+        .json({ error: "Nur private Sessions können Einladungen versenden" });
+    }
+    if (session.user_id !== user.id) {
+      return res
+        .status(403)
+        .json({ error: "Nur der Host darf Einladungen verschicken" });
+    }
+
+    // 2. Prüfen, ob schon eingeladen (optional vermeiden von Duplikaten)
+    const [[existing]] = await pool.query(
+      "SELECT id FROM session_invites WHERE session_id = ? AND email = ?",
+      [sessionId, email],
+    );
+
+    let inviteToken;
+    if (existing) {
+      // Wiederverwenden des bestehenden Tokens
+      const [[invite]] = await pool.query(
+        "SELECT invite_token FROM session_invites WHERE id = ?",
+        [existing.id],
+      );
+      inviteToken = invite.invite_token;
+    } else {
+      // Neuen Eintrag + Token erstellen
+      inviteToken = crypto.randomUUID(); // 36 Zeichen UUID
+
+      await pool.query(
+        `INSERT INTO session_invites 
+         (session_id, email, invite_token, invited_by_user_id) 
+         VALUES (?, ?, ?, ?)`,
+        [sessionId, email, inviteToken, user.id],
+      );
+    }
+
+    // 3. Einladungs-URL (deine Frontend-URL anpassen!)
+    const inviteLink = `${process.env.FRONTEND_URL || "http://localhost:5173"}/invite/${inviteToken}`;
+
+    // 4. HTML-E-Mail
+    const mailOptions = {
+      from: `"TuneVote Sessions" <${process.env.GMAIL_USER}>`,
+      to: email,
+      subject: `Einladung zur privaten Session: ${session.title}`,
+      text: `Du wurdest zur privaten Session "${session.title}" eingeladen!\n\nKlicke hier, um beizutreten:\n${inviteLink}`,
+      html: `
+        <div style="font-family: Arial, sans-serif; max-width: 600px; margin: auto; padding: 20px; border: 1px solid #ddd; border-radius: 10px;">
+          <h2 style="color: #4f46e5;">Du wurdest eingeladen!</h2>
+          <p>Der Host lädt dich zur privaten Session ein:</p>
+          <h3 style="color: #1f2937;">${session.title}</h3>
+          <p>Klicke auf den Button, um direkt beizutreten:</p>
+          <a href="${inviteLink}" 
+             style="display: inline-block; background: #4f46e5; color: white; padding: 12px 24px; text-decoration: none; border-radius: 6px; font-weight: bold;">
+            Session beitreten
+          </a>
+          <p style="margin-top: 20px; color: #666; font-size: 0.9em;">
+            Oder kopiere diesen Link: <br/>
+            <a href="${inviteLink}">${inviteLink}</a>
+          </p>
+          <hr style="margin: 30px 0; border: none; border-top: 1px solid #eee;">
+          <p style="color: #999; font-size: 0.8em;">Diese Einladung wurde über TuneVote verschickt.</p>
+        </div>
+      `,
+    };
+
+    await transporter.sendMail(mailOptions);
+
+    return res.json({ success: true, message: "Einladung verschickt" });
+  } catch (err) {
+    console.error("Invite error:", err);
+    return res
+      .status(500)
+      .json({ error: "Fehler beim Versenden der Einladung" });
+  }
+});
+
+// GET /invite/:token → Frontend leitet weiter zur Session + setzt Cookie/Token
+app.get("/invite/:token", async (req, res) => {
+  const { token } = req.params;
+
+  try {
+    const [rows] = await pool.query(
+      "SELECT * FROM session_invites WHERE invite_token = ?",
+      [token],
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ error: "Einladung nicht gefunden" });
+    }
+
+    const invite = rows[0];
+
+    // accepted_at setzen
+    if (!invite.accepted_at) {
+      await pool.query(
+        "UPDATE session_invites SET accepted_at = NOW() WHERE id = ?",
+        [invite.id],
+      );
+    }
+
+    // Gast-User anlegen + Cookie setzen (wie bisher)
+    let guestToken = null;
+    const [[existingUser]] = await pool.query(
+      "SELECT id FROM users WHERE email = ?",
+      [invite.email],
+    );
+
+    if (!existingUser) {
+      guestToken = crypto.randomUUID();
+      const nickname = invite.email.split("@")[0];
+
+      const [result] = await pool.query(
+        "INSERT INTO guest_users (guest_token, nickname) VALUES (?, ?)",
+        [guestToken, nickname],
+      );
+
+      // Cookie setzen
+      res.cookie("guest_token", guestToken, {
+        httpOnly: false,
+        sameSite: "lax",
+        secure: process.env.NODE_ENV === "production",
+        maxAge: 30 * 24 * 60 * 60 * 1000,
+      });
+
+      // Participant eintragen
+      await pool.query(
+        `INSERT IGNORE INTO session_participants 
+         (session_id, guest_id, role, is_live) VALUES (?, ?, 'guest', 0)`,
+        [invite.session_id, result.insertId],
+      );
+    } else {
+      // Registrierter User → Participant eintragen
+      await pool.query(
+        `INSERT IGNORE INTO session_participants 
+         (session_id, user_id, role, is_live) VALUES (?, ?, 'user', 0)`,
+        [invite.session_id, existingUser.id],
+      );
+    }
+
+    // Statt voller URL nur den relativen Pfad zurückgeben
+    return res.json({
+      success: true,
+      redirectTo: `/session/${invite.session_id}`, // ← nur der Pfad!
+    });
+  } catch (err) {
+    console.error("/invite/:token error:", err);
+    return res.status(500).json({ error: "Serverfehler" });
+  }
+});
+// ============================================================
+// GET /sessions/:sessionId/participants → Nur live Teilnehmer (is_live = 1)
+// + Echtzeit-Updates über Socket.IO
+// ============================================================
+
+app.get("/sessions/:sessionId/participants", async (req, res) => {
+  const sessionId = parseInt(req.params.sessionId, 10);
+
+  if (isNaN(sessionId)) {
+    return res.status(400).json({ error: "Ungültige Session-ID" });
+  }
+
+  const token = req.headers.authorization?.split(" ")[1];
+  const guestToken = req.headers["x-guest-token"];
+
+  const user = token ? await getUserFromToken(token) : null;
+  const guest = guestToken ? await getGuestFromToken(guestToken) : null;
+
+  if (!user && !guest) {
+    return res.status(401).json({ error: "Unauthenticated" });
+  }
+
+  try {
+    // Prüfen, ob der Aufrufer überhaupt zur Session gehört (Sicherheit)
+    const column = user ? "user_id" : "guest_id";
+    const id = user ? user.id : guest.id;
+
+    const [allowed] = await pool.query(
+      `SELECT 1 FROM session_participants 
+       WHERE session_id = ? AND ${column} = ?`,
+      [sessionId, id]
+    );
+
+    if (allowed.length === 0) {
+      return res.status(403).json({ error: "Du bist nicht Teil dieser Session" });
+    }
+
+    // Alle LIVE Teilnehmer holen
+    const [participants] = await pool.query(
+      `SELECT 
+         sp.id,
+         sp.role,
+         COALESCE(u.username, g.nickname, 'Gast') AS name,
+         (sp.role = 'host') AS isHost
+       FROM session_participants sp
+       LEFT JOIN users u ON sp.user_id = u.id
+       LEFT JOIN guest_users g ON sp.guest_id = g.id
+       WHERE sp.session_id = ? AND sp.is_live = 1
+       ORDER BY sp.joined_at DESC`,
+      [sessionId]
+    );
+
+    const formatted = participants.map(p => ({
+      name: p.name,
+      isHost: !!p.isHost,
+    }));
+
+    res.json(formatted);
+  } catch (err) {
+    console.error("Fehler beim Laden der Live-Teilnehmer:", err);
+    res.status(500).json({ error: "Serverfehler" });
   }
 });
