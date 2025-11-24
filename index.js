@@ -524,21 +524,38 @@ app.post("/register", async (req, res) => {
     return res.status(400).json({ error: "Missing fields" });
 
   try {
+    // Prüfen ob es den User schon gibt
     const [exists] = await pool.query(
       "SELECT 1 FROM users WHERE email = ? OR username = ?",
-      [email, username],
+      [email, username]
     );
     if (exists.length > 0)
       return res.status(409).json({ error: "User exists" });
 
+    // Benutzer anlegen
     const password_hash = await bcrypt.hash(password, 10);
     const [result] = await pool.query(
       "INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)",
-      [username, email, password_hash],
+      [username, email, password_hash]
     );
-    const token = jwt.sign({ id: result.insertId, username }, JWT_SECRET, {
+
+    const newUserId = result.insertId;
+
+    // ⭐ NACHREGISTRIERTER BENUTZER: INVITES VERKNÜPFEN
+    // Alle offenen Einladungen anhand der E-Mail nachträglich verbinden
+    await pool.query(
+      `UPDATE session_invites
+       SET invited_user_id = ?
+       WHERE invited_user_id IS NULL
+         AND LOWER(email) = LOWER(?)`,
+      [newUserId, email]
+    );
+
+    // JWT erstellen
+    const token = jwt.sign({ id: newUserId, username }, JWT_SECRET, {
       expiresIn: "7d",
     });
+
     res.json({ token, username });
   } catch (err) {
     console.error(err);
@@ -2323,19 +2340,19 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
   const { sessionId } = req.params;
   const { email: rawEmail } = req.body;
 
-  // Auth
+  // === Authentifizierung ===
   const authHeader = req.headers.authorization;
   const token = authHeader?.split(" ")[1];
   const user = token ? await getUserFromToken(token) : null;
   if (!user) return res.status(401).json({ error: "Unauthenticated" });
 
-  // E-Mail validieren & normalisieren
+  // === E-Mail Validierung & Normalisierung ===
   const email = rawEmail?.trim().toLowerCase();
   if (!email || !/^\S+@\S+\.\S+$/.test(email)) {
     return res.status(400).json({ error: "Ungültige E-Mail-Adresse" });
   }
 
-  // Selbst-Einladung verhindern (early)
+  // Selbst-Einladung verhindern
   if (email === user.email) {
     return res.status(400).json({ error: "Du kannst dich nicht selbst einladen." });
   }
@@ -2345,7 +2362,7 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
-    // 1) Session prüfen + Host-Validierung (+ Host-Email holen)
+    // === 1. Session + Host-Validierung (inkl. host_email) ===
     const [[session]] = await conn.query(
       `SELECT s.title, s.user_id, s.is_private, u.username AS host_name, u.email AS host_email
        FROM sessions s
@@ -2366,9 +2383,7 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
       await conn.rollback();
       return res.status(403).json({ error: "Nur der Host darf Einladungen verschicken" });
     }
-
-    // Prevent inviting the host's email (edge-case)
-    if (email === (session.host_email || "").toLowerCase()) {
+    if (email === session.host_email?.toLowerCase()) {
       await conn.rollback();
       return res.status(400).json({ error: "Der Session-Host kann nicht eingeladen werden." });
     }
@@ -2376,7 +2391,7 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
     const sessionTitle = session.title?.trim() || "Eine private TuneVote Session";
     const hostName = session.host_name || "Der Host";
 
-    // 2) Existierenden Benutzer mit dieser E-Mail prüfen (case-insensitive)
+    // === 2. Prüfen, ob der Benutzer bereits registriert ist ===
     const [[existingUser]] = await conn.query(
       `SELECT id FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1`,
       [email]
@@ -2384,22 +2399,17 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
     const invitedUserId = existingUser ? existingUser.id : null;
     const userExists = !!invitedUserId;
 
-    // 3) Existierende Einladung prüfen (lock row for update)
-    const [rows] = await conn.query(
-      `SELECT * 
-       FROM session_invites 
+    // === 3. Existierende Einladung prüfen & ggf. reaktivieren/neu anlegen ===
+    const [inviteRows] = await conn.query(
+      `SELECT * FROM session_invites 
        WHERE session_id = ? AND LOWER(email) = LOWER(?) 
        LIMIT 1 FOR UPDATE`,
       [sessionId, email]
     );
-    const existingInvite = rows[0] || null;
+    const existingInvite = inviteRows[0] || null;
 
     if (existingInvite) {
-      console.error("Found existing invite:", existingInvite);
-      // Einladung existiert bereits
       if (existingInvite.status === "revoked" || existingInvite.status === "rejected") {
-        console.log("Reactivating revoked/rejected invite");
-        // Reaktivieren
         await conn.query(
           `UPDATE session_invites 
            SET status = 'pending',
@@ -2414,30 +2424,139 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
         );
       }
     } else {
-      // keine Einladung → neu anlegen (mit invited_user_id falls vorhanden)
       await conn.query(
         `INSERT INTO session_invites 
-         (session_id, email, invited_by_user_id, invited_user_id)
-         VALUES (?, ?, ?, ?)`,
+         (session_id, email, invited_by_user_id, invited_user_id, status)
+         VALUES (?, ?, ?, ?, 'pending')`,
         [sessionId, email, user.id, invitedUserId]
       );
     }
 
-    // Commit DB Änderungen
     await conn.commit();
 
-    // 4) Email vorbereiten und senden
-    const baseUrl = process.env.FRONTEND_URL || "https://yourdomain.com";
+    // === 4. E-Mail-Inhalte je nach Registrierungsstatus unterscheiden ===
+    const baseUrl = process.env.FRONTEND_URL || "https://tunevote.com";
     const dashboardLink = `${baseUrl}/dashboard`;
-    const buttonText = userExists ? "Einladung im Dashboard ansehen" : "Registrieren & Session beitreten";
+    const primaryColor = "#4f46e5";
 
-    // Platzhalter-Template (ersetze durch dein HTML)
-    const htmlTemplate = `... dein bisheriger HTML-CODE ...`;
+    // Zwei komplett unterschiedliche Templates – klar getrennt
+    const htmlForExistingUser = `
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Neue Einladung zu "${sessionTitle}"</title>
+</head>
+<body style="margin:0;padding:0;background:#f9fafb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f9fafb;padding:20px;">
+    <tr>
+      <td align="center">
+        <table width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 10px 25px rgba(0,0,0,0.05);">
+          <tr>
+            <td style="background:${primaryColor};padding:32px 40px;text-align:center;">
+              <h1 style="margin:0;color:#ffffff;font-size:24px;font-weight:600;">TuneVote</h1>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:40px;color:#1f2937;">
+              <h2 style="margin-top:0;font-size:22px;color:#111827;">Du hast eine neue Einladung!</h2>
+              <p style="font-size:16px;line-height:1.6;color:#374151;">
+                Hallo!<br><br>
+                <strong>${hostName}</strong> hat dich zur privaten TuneVote-Session eingeladen:
+              </p>
+              <div style="background:#f3f4f6;padding:20px;border-radius:8px;margin:24px 0;">
+                <h3 style="margin:0;font-size:18px;color:#111827;">${sessionTitle}</h3>
+              </div>
+              <p style="font-size:16px;line-height:1.6;color:#374151;">
+                Da du bereits ein TuneVote-Konto hast, findest du die Einladung direkt in deinem Dashboard.
+              </p>
+              <div style="text-align:center;margin:32px 0;">
+                <a href="${dashboardLink}" style="display:inline-block;background:${primaryColor};color:#ffffff;font-weight:600;font-size:16px;padding:14px 32px;border-radius:8px;text-decoration:none;">
+                  Einladung im Dashboard ansehen
+                </a>
+              </div>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:30px;background:#f3f4f6;text-align:center;color:#9ca3af;font-size:13px;">
+              <p style="margin:0;">
+                Diese Einladung wurde über <strong>TuneVote</strong> versendet.<br>
+                © ${new Date().getFullYear()} TuneVote – Alle Rechte vorbehalten.
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+
+    const htmlForNewUser = `
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Einladung zu "${sessionTitle}"</title>
+</head>
+<body style="margin:0;padding:0;background:#f9fafb;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f9fafb;padding:20px;">
+    <tr>
+      <td align="center">
+        <table width="100%" cellpadding="0" cellspacing="0" style="max-width:600px;background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 10px 25px rgba(0,0,0,0.05);">
+          <tr>
+            <td style="background:${primaryColor};padding:32px 40px;text-align:center;">
+              <h1 style="margin:0;color:#ffffff;font-size:24px;font-weight:600;">TuneVote</h1>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:40px;color:#1f2937;">
+              <h2 style="margin-top:0;font-size:22px;color:#111827;">Du wurdest zu einer Session eingeladen!</h2>
+              <p style="font-size:16px;line-height:1.6;color:#374151;">
+                Hallo!<br><br>
+                <strong>${hostName}</strong> hat dich zu einer privaten TuneVote-Session eingeladen:
+              </p>
+              <div style="background:#f3f4f6;padding:20px;border-radius:8px;margin:24px 0;">
+                <h3 style="margin:0;font-size:18px;color:#111827;">${sessionTitle}</h3>
+              </div>
+              <p style="font-size:16px;line-height:1.6;color:#374151;">
+                Erstelle jetzt kostenlos ein Konto, um der Session beizutreten und mit abzustimmen!
+              </p>
+              <div style="text-align:center;margin:32px 0;">
+                <a href="${dashboardLink}" style="display:inline-block;background:${primaryColor};color:#ffffff;font-weight:600;font-size:16px;padding:14px 32px;border-radius:8px;text-decoration:none;">
+                  Registrieren & Session beitreten
+                </a>
+              </div>
+              <p style="font-size:14px;color:#6b7280;text-align:center;margin-top:32px;">
+                Oder direkt hier klicken:<br>
+                <a href="${dashboardLink}" style="color:${primaryColor};">${dashboardLink}</a>
+              </p>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:30px;background:#f3f4f6;text-align:center;color:#9ca3af;font-size:13px;">
+              <p style="margin:0;">
+                Diese Einladung wurde über <strong>TuneVote</strong> versendet.<br>
+                © ${new Date().getFullYear()} TuneVote – Alle Rechte vorbehalten.
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
 
     const subject = userExists
       ? `Neue Einladung: ${sessionTitle}`
       : `${hostName} hat dich zu "${sessionTitle}" eingeladen`;
 
+    const html = userExists ? htmlForExistingUser : htmlForNewUser;
+
+    // === 5. E-Mail versenden ===
     try {
       await transporter.sendMail({
         from: `"TuneVote" <${process.env.GMAIL_USER}>`,
@@ -2445,14 +2564,14 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
         subject,
         text: userExists
           ? `Du hast eine neue Einladung zu "${sessionTitle}". Öffne dein Dashboard: ${dashboardLink}`
-          : `Du wurdest zu "${sessionTitle}" eingeladen! Erstelle ein Konto oder logge dich ein: ${dashboardLink}`,
-        html: htmlTemplate,
+          : `Du wurdest zu "${sessionTitle}" eingeladen! Erstelle ein Konto: ${dashboardLink}`,
+        html,
       });
     } catch (mailErr) {
-      console.error("Invite mail send error:", mailErr);
+      console.error("E-Mail-Versand fehlgeschlagen:", mailErr);
       return res.status(500).json({
         success: true,
-        message: "Einladung in der Datenbank gespeichert, aber E-Mail konnte nicht gesendet werden.",
+        message: "Einladung gespeichert, aber E-Mail konnte nicht gesendet werden.",
         emailError: true,
         alreadyRegistered: userExists,
       });
@@ -2466,7 +2585,7 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
 
   } catch (err) {
     console.error("Invite error:", err);
-    try { if (conn) await conn.rollback(); } catch (e) { console.error("Rollback error:", e); }
+    if (conn) await conn.rollback().catch(() => {});
     return res.status(500).json({ error: "Fehler beim Versenden der Einladung" });
   } finally {
     if (conn) conn.release();
