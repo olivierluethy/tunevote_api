@@ -2335,20 +2335,19 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
     return res.status(400).json({ error: "Ungültige E-Mail-Adresse" });
   }
 
-  // Selbst-Einladung verhindern
+  // Selbst-Einladung verhindern (early)
   if (email === user.email) {
     return res.status(400).json({ error: "Du kannst dich nicht selbst einladen." });
   }
 
   let conn;
   try {
-    // Verbindung & Transaktion starten (atomic)
     conn = await pool.getConnection();
     await conn.beginTransaction();
 
-    // 1) Session prüfen + Host-Validierung
+    // 1) Session prüfen + Host-Validierung (+ Host-Email holen)
     const [[session]] = await conn.query(
-      `SELECT s.title, s.user_id, s.is_private, u.username AS host_name
+      `SELECT s.title, s.user_id, s.is_private, u.username AS host_name, u.email AS host_email
        FROM sessions s
        JOIN users u ON s.user_id = u.id
        WHERE s.id = ?`,
@@ -2359,7 +2358,6 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
       await conn.rollback();
       return res.status(404).json({ error: "Session nicht gefunden" });
     }
-    // is_private: wir gehen davon aus, dass 1 = private, 0 = public (dein ursprünglicher Check)
     if (session.is_private === 0) {
       await conn.rollback();
       return res.status(400).json({ error: "Nur private Sessions können Einladungen versenden" });
@@ -2367,6 +2365,12 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
     if (session.user_id !== user.id) {
       await conn.rollback();
       return res.status(403).json({ error: "Nur der Host darf Einladungen verschicken" });
+    }
+
+    // Prevent inviting the host's email (edge-case)
+    if (email === (session.host_email || "").toLowerCase()) {
+      await conn.rollback();
+      return res.status(400).json({ error: "Der Session-Host kann nicht eingeladen werden." });
     }
 
     const sessionTitle = session.title?.trim() || "Eine private TuneVote Session";
@@ -2380,7 +2384,7 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
     const invitedUserId = existingUser ? existingUser.id : null;
     const userExists = !!invitedUserId;
 
-    // 3) Existierende Einladung für diese session+email prüfen (lock row for update)
+    // 3) Existierende Einladung prüfen (lock row for update)
     const [rows] = await conn.query(
       `SELECT id, accepted_at, revoked_at, invited_user_id 
        FROM session_invites 
@@ -2425,15 +2429,15 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
       );
     }
 
-    // Commit der DB-Änderungen bevor wir versuchen die Mail zu senden
+    // Commit DB Änderungen
     await conn.commit();
 
-    // 4) Email vorbereiten und senden (Fehler beim Senden loggen - DB bleibt bestehen)
+    // 4) Email vorbereiten und senden
     const baseUrl = process.env.FRONTEND_URL || "https://yourdomain.com";
     const dashboardLink = `${baseUrl}/dashboard`;
     const buttonText = userExists ? "Einladung im Dashboard ansehen" : "Registrieren & Session beitreten";
 
-    // Hier dein HTML-Template einfügen oder dynamisch erstellen
+    // Platzhalter-Template (ersetze durch dein HTML)
     const htmlTemplate = `... dein bisheriger HTML-CODE ...`;
 
     const subject = userExists
@@ -2451,7 +2455,6 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
         html: htmlTemplate,
       });
     } catch (mailErr) {
-      // Mailfehler: loggen, aber nicht DB zurückrollen (Invitation soll bestehen bleiben)
       console.error("Invite mail send error:", mailErr);
       return res.status(500).json({
         success: true,
@@ -2461,7 +2464,6 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
       });
     }
 
-    // Alles OK
     return res.json({
       success: true,
       message: "Einladung erfolgreich versendet",
@@ -2469,7 +2471,6 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
     });
 
   } catch (err) {
-    // Fehlerbehandlung: Rollback falls Transaktion offen
     console.error("Invite error:", err);
     try { if (conn) await conn.rollback(); } catch (e) { console.error("Rollback error:", e); }
     return res.status(500).json({ error: "Fehler beim Versenden der Einladung" });
@@ -2478,7 +2479,9 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
   }
 });
 
+
 // GET: Einladungen, die du verschickt hast
+// GET: Einladungen, die du verschickt hast (nur offene)
 app.get("/invites/sent", async (req, res) => {
   const authHeader = req.headers.authorization;
   const token = authHeader?.split(" ")[1];
@@ -2490,16 +2493,21 @@ app.get("/invites/sent", async (req, res) => {
     `SELECT si.id, si.email, si.created_at, si.accepted_at, si.revoked_at, s.title AS session_title
      FROM session_invites si
      JOIN sessions s ON si.session_id = s.id
-     WHERE si.invited_by_user_id = ?`,
+     WHERE si.invited_by_user_id = ?
+       AND si.accepted_at IS NULL
+       AND si.revoked_at IS NULL
+     ORDER BY si.created_at DESC`,
     [user.id]
   );
 
   res.json(invites);
 });
 
-// GET: Einladungen, die du erhalten hast
+
+// GET: Einladungen, die du erhalten hast - Wenn benuzer revoked hat mit revoked datum soll es nicht mehr angezeigt werden
+// GET: Einladungen, die du erhalten hast (nur unbearbeitet)
 app.get("/invites/received", async (req, res) => {
-const authHeader = req.headers.authorization;
+  const authHeader = req.headers.authorization;
   const token = authHeader?.split(" ")[1];
   const user = token ? await getUserFromToken(token) : null;
   if (!user) return res.status(401).json({ error: "Unauthenticated" });
@@ -2512,6 +2520,7 @@ const authHeader = req.headers.authorization;
      JOIN sessions s ON si.session_id = s.id
      JOIN users u ON s.user_id = u.id
      WHERE (LOWER(si.email) = LOWER(?) OR si.invited_user_id = ?)
+       AND si.accepted_at IS NULL
        AND si.revoked_at IS NULL
      ORDER BY si.created_at DESC`,
     [user.email, user.id]
@@ -2520,7 +2529,8 @@ const authHeader = req.headers.authorization;
   res.json(invites);
 });
 
-// POST: Einladung annehmen
+
+// POST: Einladung annehmen - Wenn Benutzer bereits abgelehnt hat, soll es nicht mehr funktionieren
 app.post("/invites/:inviteId/accept", async (req, res) => {
   const { inviteId } = req.params;
   const authHeader = req.headers.authorization;
@@ -2531,7 +2541,7 @@ app.post("/invites/:inviteId/accept", async (req, res) => {
   const [result] = await pool.query(
     `UPDATE session_invites 
      SET accepted_at = NOW(),
-         invited_user_id = COALESCE(invited_user_id, ?)   -- falls noch NULL → jetzt setzen
+         invited_user_id = COALESCE(invited_user_id, ?)
      WHERE id = ?
        AND (email = ? OR invited_user_id = ?)
        AND accepted_at IS NULL 
@@ -2540,13 +2550,42 @@ app.post("/invites/:inviteId/accept", async (req, res) => {
   );
 
   if (result.affectedRows === 0) {
-    return res.status(400).json({ error: "Einladung nicht gefunden oder bereits bearbeitet" });
+    return res.status(400).json({ 
+      error: "Einladung nicht gefunden, bereits angenommen oder abgelehnt" 
+    });
   }
 
   res.json({ success: true });
 });
 
-// POST: Einladung ablehnen
+app.post("/invites/:inviteId/reject", async (req, res) => {
+  const { inviteId } = req.params;
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.split(" ")[1];
+  const user = token ? await getUserFromToken(token) : null;
+  if (!user) return res.status(401).json({ error: "Unauthenticated" });
+
+  const [result] = await pool.query(
+    `UPDATE session_invites 
+     SET revoked_at = NOW()
+     WHERE id = ?
+       AND (email = ? OR invited_user_id = ?)
+       AND revoked_at IS NULL
+       AND accepted_at IS NULL`,
+    [inviteId, user.email, user.id]
+  );
+
+  if (result.affectedRows === 0) {
+    return res.status(400).json({
+      error: "Einladung nicht gefunden, bereits abgelehnt oder bereits akzeptiert"
+    });
+  }
+
+  res.json({ success: true });
+});
+
+
+// POST: Einladung ablehnen - Funktioniert noch nicht / Wenn die Einladung aber schon angenommen wurde, soll es nicht mehr funktionieren
 app.post("/invites/:inviteId/revoke", async (req, res) => {
   const { inviteId } = req.params;
   const authHeader = req.headers.authorization;
@@ -2556,17 +2595,23 @@ app.post("/invites/:inviteId/revoke", async (req, res) => {
 
   const [result] = await pool.query(
     `UPDATE session_invites 
-     SET revoked_at = NOW() 
-     WHERE id = ? AND invited_by_user_id = ? AND revoked_at IS NULL`,
-    [inviteId, user.id]
+     SET revoked_at = NOW()
+     WHERE id = ?
+       AND (email = ? OR invited_user_id = ?)
+       AND revoked_at IS NULL
+       AND accepted_at IS NULL`,
+    [inviteId, user.email, user.id]
   );
 
   if (result.affectedRows === 0) {
-    return res.status(400).json({ error: "Einladung nicht gefunden oder bereits widerrufen" });
+    return res.status(400).json({
+      error: "Einladung nicht gefunden, bereits abgelehnt oder bereits akzeptiert"
+    });
   }
 
   res.json({ success: true });
 });
+
 
 
 // ============================================================
