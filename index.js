@@ -2386,7 +2386,7 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
 
     // 3) Existierende Einladung prüfen (lock row for update)
     const [rows] = await conn.query(
-      `SELECT id, accepted_at, revoked_at, invited_user_id 
+      `SELECT * 
        FROM session_invites 
        WHERE session_id = ? AND LOWER(email) = LOWER(?) 
        LIMIT 1 FOR UPDATE`,
@@ -2395,29 +2395,23 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
     const existingInvite = rows[0] || null;
 
     if (existingInvite) {
+      console.error("Found existing invite:", existingInvite);
       // Einladung existiert bereits
-      if (existingInvite.revoked_at || existingInvite.accepted_at) {
-        // Reaktivieren: reset timestamps, update invited_user_id falls vorhanden
+      if (existingInvite.status === "revoked" || existingInvite.status === "rejected") {
+        console.log("Reactivating revoked/rejected invite");
+        // Reaktivieren
         await conn.query(
-          `UPDATE session_invites
-           SET revoked_at = NULL,
+          `UPDATE session_invites 
+           SET status = 'pending',
+               invited_user_id = ?,
+               invited_by_user_id = ?,
+               updated_at = NOW(),
                accepted_at = NULL,
-               created_at = NOW(),
-               invited_user_id = COALESCE(?, invited_user_id)
+               rejected_at = NULL,
+               revoked_at = NULL
            WHERE id = ?`,
-          [invitedUserId, existingInvite.id]
+          [invitedUserId, user.id, existingInvite.id]
         );
-      } else {
-        // Einladung ist offen: nur invited_user_id nachtragen, falls jetzt bekannt
-        if (invitedUserId && !existingInvite.invited_user_id) {
-          await conn.query(
-            `UPDATE session_invites
-             SET invited_user_id = ?
-             WHERE id = ?`,
-            [invitedUserId, existingInvite.id]
-          );
-        }
-        // sonst: nichts tun (bereits offene Einladung vorhanden)
       }
     } else {
       // keine Einladung → neu anlegen (mit invited_user_id falls vorhanden)
@@ -2479,8 +2473,6 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
   }
 });
 
-
-// GET: Einladungen, die du verschickt hast
 // GET: Einladungen, die du verschickt hast (nur offene)
 app.get("/invites/sent", async (req, res) => {
   const authHeader = req.headers.authorization;
@@ -2490,22 +2482,30 @@ app.get("/invites/sent", async (req, res) => {
   if (!user) return res.status(401).json({ error: "Unauthenticated" });
 
   const [invites] = await pool.query(
-    `SELECT si.id, si.email, si.created_at, si.accepted_at, si.revoked_at, s.title AS session_title
-     FROM session_invites si
-     JOIN sessions s ON si.session_id = s.id
-     WHERE si.invited_by_user_id = ?
-       AND si.accepted_at IS NULL
-       AND si.revoked_at IS NULL
-     ORDER BY si.created_at DESC`,
+    `SELECT 
+      si.id,
+      si.email,
+
+      -- Dynamischer Status
+      si.status,
+      si.created_at,
+      si.accepted_at,
+      si.rejected_at,
+      si.revoked_at,
+      si.updated_at,
+      s.title AS session_title
+      FROM session_invites si
+      JOIN sessions s ON si.session_id = s.id
+      WHERE si.invited_by_user_id = ? AND si.status = 'pending'
+      ORDER BY si.created_at DESC
+  `,
     [user.id]
   );
 
   res.json(invites);
 });
 
-
-// GET: Einladungen, die du erhalten hast - Wenn benuzer revoked hat mit revoked datum soll es nicht mehr angezeigt werden
-// GET: Einladungen, die du erhalten hast (nur unbearbeitet)
+// GET: Einladungen, die du erhalten hast (nur unbearbeitet / pending)
 app.get("/invites/received", async (req, res) => {
   const authHeader = req.headers.authorization;
   const token = authHeader?.split(" ")[1];
@@ -2514,14 +2514,15 @@ app.get("/invites/received", async (req, res) => {
 
   const [invites] = await pool.query(
     `SELECT 
-       si.id, si.email, si.created_at, si.accepted_at, si.revoked_at, 
-       s.title AS session_title, u.username AS host_name
+       si.id, si.email, si.created_at, si.accepted_at, si.rejected_at, si.revoked_at,
+       si.status,
+       s.title AS session_title, 
+       u.username AS host_name
      FROM session_invites si
      JOIN sessions s ON si.session_id = s.id
      JOIN users u ON s.user_id = u.id
      WHERE (LOWER(si.email) = LOWER(?) OR si.invited_user_id = ?)
-       AND si.accepted_at IS NULL
-       AND si.revoked_at IS NULL
+       AND si.status = 'pending'
      ORDER BY si.created_at DESC`,
     [user.email, user.id]
   );
@@ -2529,29 +2530,28 @@ app.get("/invites/received", async (req, res) => {
   res.json(invites);
 });
 
-
 // POST: Einladung annehmen - Wenn Benutzer bereits abgelehnt hat, soll es nicht mehr funktionieren
 app.post("/invites/:inviteId/accept", async (req, res) => {
   const { inviteId } = req.params;
-  const authHeader = req.headers.authorization;
-  const token = authHeader?.split(" ")[1];
+  const token = req.headers.authorization?.split(" ")[1];
   const user = token ? await getUserFromToken(token) : null;
   if (!user) return res.status(401).json({ error: "Unauthenticated" });
 
   const [result] = await pool.query(
-    `UPDATE session_invites 
-     SET accepted_at = NOW(),
-         invited_user_id = COALESCE(invited_user_id, ?)
+    `UPDATE session_invites
+     SET status = 'accepted',
+         accepted_at = NOW(),
+         invited_user_id = COALESCE(invited_user_id, ?),
+         updated_at = NOW()
      WHERE id = ?
-       AND (email = ? OR invited_user_id = ?)
-       AND accepted_at IS NULL 
-       AND revoked_at IS NULL`,
+       AND status = 'pending'
+       AND (LOWER(email) = LOWER(?) OR invited_user_id = ?)`,
     [user.id, inviteId, user.email, user.id]
   );
 
   if (result.affectedRows === 0) {
-    return res.status(400).json({ 
-      error: "Einladung nicht gefunden, bereits angenommen oder abgelehnt" 
+    return res.status(400).json({
+      error: "Einladung nicht gefunden oder nicht mehr gültig"
     });
   }
 
@@ -2560,24 +2560,24 @@ app.post("/invites/:inviteId/accept", async (req, res) => {
 
 app.post("/invites/:inviteId/reject", async (req, res) => {
   const { inviteId } = req.params;
-  const authHeader = req.headers.authorization;
-  const token = authHeader?.split(" ")[1];
+  const token = req.headers.authorization?.split(" ")[1];
   const user = token ? await getUserFromToken(token) : null;
   if (!user) return res.status(401).json({ error: "Unauthenticated" });
 
   const [result] = await pool.query(
-    `UPDATE session_invites 
-     SET revoked_at = NOW()
+    `UPDATE session_invites
+     SET status = 'rejected',
+         rejected_at = NOW(),
+         updated_at = NOW()
      WHERE id = ?
-       AND (email = ? OR invited_user_id = ?)
-       AND revoked_at IS NULL
-       AND accepted_at IS NULL`,
+       AND status = 'pending'
+       AND (LOWER(email) = LOWER(?) OR invited_user_id = ?)`,
     [inviteId, user.email, user.id]
   );
 
   if (result.affectedRows === 0) {
     return res.status(400).json({
-      error: "Einladung nicht gefunden, bereits abgelehnt oder bereits akzeptiert"
+      error: "Einladung nicht gefunden oder bereits verarbeitet"
     });
   }
 
@@ -2585,34 +2585,32 @@ app.post("/invites/:inviteId/reject", async (req, res) => {
 });
 
 
-// POST: Einladung ablehnen - Funktioniert noch nicht / Wenn die Einladung aber schon angenommen wurde, soll es nicht mehr funktionieren
+// POST: Einladung ablehnen
 app.post("/invites/:inviteId/revoke", async (req, res) => {
   const { inviteId } = req.params;
-  const authHeader = req.headers.authorization;
-  const token = authHeader?.split(" ")[1];
+  const token = req.headers.authorization?.split(" ")[1];
   const user = token ? await getUserFromToken(token) : null;
   if (!user) return res.status(401).json({ error: "Unauthenticated" });
 
   const [result] = await pool.query(
-    `UPDATE session_invites 
-     SET revoked_at = NOW()
+    `UPDATE session_invites
+     SET status = 'revoked',
+         revoked_at = NOW(),
+         updated_at = NOW()
      WHERE id = ?
-       AND (email = ? OR invited_user_id = ?)
-       AND revoked_at IS NULL
-       AND accepted_at IS NULL`,
-    [inviteId, user.email, user.id]
+       AND invited_by_user_id = ?
+       AND status = 'pending'`,
+    [inviteId, user.id]
   );
 
   if (result.affectedRows === 0) {
     return res.status(400).json({
-      error: "Einladung nicht gefunden, bereits abgelehnt oder bereits akzeptiert"
+      error: "Einladung nicht gefunden oder nicht mehr widerrufbar"
     });
   }
 
   res.json({ success: true });
 });
-
-
 
 // ============================================================
 // GET /sessions/:sessionId/participants → Nur live Teilnehmer (is_live = 1)
