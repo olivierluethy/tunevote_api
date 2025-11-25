@@ -556,7 +556,7 @@ app.post("/register", async (req, res) => {
       expiresIn: "7d",
     });
 
-    res.json({ token, username });
+    res.json({ success: true, message: "Registration successful! Redirecting...", username });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
