@@ -129,6 +129,98 @@ const getUserFromToken = async (token) => {
   }
 };
 
+const phaseTimers = {}; // { sessionId: timeout }
+
+async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
+  if (phaseTimers[sessionId]) clearTimeout(phaseTimers[sessionId]);
+
+  // KORREKTUR: closed → geht immer in neue suggesting-Phase
+  const nextPhase = currentPhase === 'suggesting' ? 'voting' : 'suggesting'; // ← Das war der Bug!
+
+  phaseTimers[sessionId] = setTimeout(async () => {
+    try {
+      if (nextPhase === 'voting') {
+        // --- Wechsel zu Voting-Phase
+        const votingEnds = new Date(Date.now() + 60 * 1000);
+        await pool.query(`
+          UPDATE voting_rounds 
+          SET phase = 'voting', phase_ends_at = ? 
+          WHERE id = ? AND session_id = ?
+        `, [votingEnds, roundId, sessionId]);
+
+        io.to(sessionId).emit("voting_phase_changed", {
+          phase: "voting",
+          endsAt: votingEnds.getTime(),
+          roundId,
+          duration: 60
+        });
+
+        // Nächster Timer (bleibt auf derselben Runde)
+        startPhaseTimer(sessionId, roundId, 'voting', 60);
+
+      } else if (nextPhase === 'suggesting') {
+        // --- Voting beendet → Gewinner bestimmen + neue Runde starten
+        const [winnerRows] = await pool.query(`
+          SELECT qi.id, COUNT(v.id) AS votes
+          FROM queue_items qi
+          LEFT JOIN votes v ON qi.id = v.queue_item_id
+          WHERE qi.voting_round_id = ? AND qi.status = 'suggested'
+          GROUP BY qi.id
+          ORDER BY votes DESC, qi.created_at ASC
+          LIMIT 1
+        `, [roundId]);
+
+        let winnerId = null;
+        if (winnerRows.length > 0 && winnerRows[0].votes > 0) {
+          winnerId = winnerRows[0].id;
+          await pool.query("UPDATE queue_items SET status = 'queued' WHERE id = ?", [winnerId]);
+        }
+
+        // Rest archivieren
+        await pool.query(`
+          UPDATE queue_items 
+          SET status = 'archived' 
+          WHERE voting_round_id = ? AND status = 'suggested' AND id != ?
+        `, [roundId, winnerId || 0]);
+
+        // Alte Runde schließen
+        await pool.query(`
+          UPDATE voting_rounds 
+          SET status = 'closed', phase = 'closed', winner_queue_item_id = ? 
+          WHERE id = ?
+        `, [winnerId, roundId]);
+
+        io.to(sessionId).emit("voting_round_completed", { winnerId, roundId });
+        io.to(sessionId).emit("queue_updated");
+        io.to(sessionId).emit("proposals_updated");
+
+        // --- Neue Runde nach 3 Sekunden starten
+        setTimeout(async () => {
+          const newEnds = new Date(Date.now() + 90 * 1000);
+          const [newRound] = await pool.query(`
+            INSERT INTO voting_rounds 
+              (session_id, status, phase, phase_ends_at, suggestion_duration, voting_duration)
+            VALUES (?, 'open', 'suggesting', ?, 90, 60)
+          `, [sessionId, newEnds]);
+
+          const newRoundId = newRound.insertId;
+
+          io.to(sessionId).emit("voting_phase_changed", {
+            phase: "suggesting",
+            endsAt: newEnds.getTime(),
+            roundId: newRoundId,
+            duration: 90
+          });
+
+          startPhaseTimer(sessionId, newRoundId, 'suggesting', 90);
+        }, 3000);
+      }
+    } catch (err) {
+      console.error("Phase timer error:", err);
+    }
+  }, seconds * 1000);
+}
+
 const ensureGuestToken = async () => {
   let guestToken = localStorage.getItem("guestToken");
   const nickname = localStorage.getItem("guestName") || "Gast";
@@ -903,40 +995,56 @@ app.get("/sessions/:id/recommendations", async (req, res) => {
      WHERE voting_round_id = ? AND status = 'suggested'`,
     [currentRoundId],
   );
-  const numItems = suggestedRows[0].count;
+  
+    const numItems = suggestedRows[0].count;
 
-  const needed = 3 - numItems;
-  if (needed <= 0) {
-    console.log(
-      "[AI] Already 3 or more items in voting round. Returning existing AI suggestions.",
-    );
-    const [existingAi] = await pool.query(
-      `SELECT id, title, video_id AS youtubeId, thumbnail
-       FROM queue_items
-       WHERE session_id = ?
-         AND voting_round_id = ?
-         AND item_source = 'ai'
-         AND status = 'suggested'`,
-      [id, currentRoundId],
-    );
-    return res.json(existingAi);
-  }
-
-  const [existingAi] = await pool.query(
+  // === 1. Alle aktuellen KI-Vorschläge laden ===
+  let existingAi = await pool.query(
     `SELECT id, title, video_id AS youtubeId, thumbnail
      FROM queue_items
      WHERE session_id = ?
        AND voting_round_id = ?
        AND item_source = 'ai'
-       AND status = 'suggested'`,
+       AND status = 'suggested'
+     ORDER BY id ASC`,
     [id, currentRoundId],
   );
+  existingAi = existingAi[0]; // weil pool.query immer [[rows], fields] zurückgibt
+
+  // === 2. Falls mehr als 3 KI-Vorschläge existieren → überschüssige löschen ===
+  if (existingAi.length > 3) {
+    const toDelete = existingAi.slice(3).map(item => item.id);
+    await pool.query(
+      `DELETE FROM queue_items WHERE id IN (?) AND item_source = 'ai'`,
+      [toDelete]
+    );
+    console.log(`[AI] Cleaned up ${toDelete.length} excess AI suggestions → keeping only the oldest 3`);
+
+    // Nach dem Löschen neu laden (nur die verbleibenden 3)
+    const [cleaned] = await pool.query(
+      `SELECT id, title, video_id AS youtubeId, thumbnail
+       FROM queue_items
+       WHERE session_id = ? AND voting_round_id = ? AND item_source = 'ai' AND status = 'suggested'
+       ORDER BY id ASC`,
+      [id, currentRoundId]
+    );
+    existingAi = cleaned;
+  }
+
+  // === 3. Genau auf 3 KI-Vorschläge auffüllen ===
+  const needed = 3 - existingAi.length;
+
+  if (needed <= 0) {
+    console.log(`[AI] Already exactly ${existingAi.length} AI suggestions → returning them`);
+    return res.json(existingAi);
+  }
 
   console.log(
-    `[AI] ${numItems} items in voting round. Generating ${needed} AI suggestion(s)...`,
+    `[AI] ${numItems} total suggested items. Generating ${needed} new AI suggestion(s)...`,
   );
 
   // ---- Get suggested titles to avoid duplicates ----
+
   const [suggestedTitleRows] = await pool.query(
     `
     SELECT yvc.title
@@ -1391,13 +1499,7 @@ app.post("/sessions/:id/proposals", async (req, res) => {
       }
     }
 
-    // === Voting-Runde Logik ===
-    let [openRounds] = await pool.query(
-      "SELECT id FROM voting_rounds WHERE session_id = ? AND status = 'open' LIMIT 1",
-      [sessionId],
-    );
-
-    // === Load session + check host role ===
+    // === Session-Status & Host-Check ===
     const [[sessionRow]] = await pool.query(
       "SELECT user_id, is_live FROM sessions WHERE id = ?",
       [sessionId],
@@ -1410,42 +1512,49 @@ app.post("/sessions/:id/proposals", async (req, res) => {
     const isHost = user && sessionRow.user_id === user.id;
     const isSessionLive = sessionRow.is_live === 1;
 
-    // === Voting-Runde Logik ===
+    // === NEU: Aktuelle Phase prüfen (nur relevant, wenn Session live ist) ===
+    let currentPhase = null;
     let votingRoundId = null;
     let status = "queued";
 
-    if (openRounds.length === 0) {
-      const [result] = await pool.query(
-        "INSERT INTO voting_rounds (session_id, status, created_at) VALUES (?, 'open', NOW())",
+    if (isSessionLive) {
+      // Session ist live → Phasensteuerung aktiv!
+      const [[round]] = await pool.query(
+        `SELECT id, phase, phase_ends_at 
+         FROM voting_rounds 
+         WHERE session_id = ? AND status = 'open' 
+         ORDER BY id DESC LIMIT 1`,
         [sessionId],
       );
-      votingRoundId = result.insertId;
-      status = "suggested";
+
+      if (!round) {
+        return res.status(403).json({
+          error: "Keine aktive Voting-Runde – Vorschläge momentan nicht möglich",
+        });
+      }
+
+      currentPhase = round.phase;
+      votingRoundId = round.id;
+
+      // WICHTIG: Nur in suggesting-Phase erlaubt!
+      if (currentPhase !== "suggesting") {
+        return res.status(403).json({
+          error: "Vorschläge sind nur in der Vorschlagsphase erlaubt (gerade läuft Voting oder Runde ist geschlossen)",
+        });
+      }
+
+      status = "suggested"; // live → immer suggested
     } else {
-      votingRoundId = openRounds[0].id;
-      status = "suggested";
+      // Session noch nicht live → Host darf direkt in Queue
+      if (isHost) {
+        status = "queued";
+      } else {
+        // Nicht-Host vor Start → trotzdem suggested (wird beim Start übernommen)
+        status = "suggested";
+      }
     }
 
-    // === NEW: Host before session is live → queue directly ===
-    if (isHost && !isSessionLive) {
-      status = "queued";
-    }
-
-    // === Max. 5 Vorschläge pro Runde ===
-    const [proposalCount] = await pool.query(
-      `SELECT COUNT(*) AS count 
-       FROM queue_items 
-       WHERE session_id = ? 
-         AND status = 'suggested'
-         AND voting_round_id = ?`,
-      [sessionId, votingRoundId],
-    );
-
-    if (proposalCount[0].count >= 5) {
-      return res.status(400).json({
-        message: "Maximal 5 Songs pro Voting-Runde erlaubt.",
-      });
-    }
+    // === Max. Vorschläge pro Runde (nur bei live & suggesting) ===
 
     // === Vorschlag in DB speichern ===
     await pool.query(
@@ -1461,7 +1570,7 @@ app.post("/sessions/:id/proposals", async (req, res) => {
         guest?.id || null,
         status,
         duration,
-        votingRoundId,
+        votingRoundId, // kann NULL sein (vor Start)
         user ? "user" : "guest",
       ],
     );
@@ -1484,6 +1593,7 @@ app.post("/sessions/:id/proposals", async (req, res) => {
       type: "music",
       status,
       votingRoundId,
+      phase: currentPhase || (isSessionLive ? "unknown" : "pre-live"),
     });
   } catch (err) {
     console.error("Proposal error:", err);
@@ -1654,6 +1764,36 @@ async function checkQuorum(votingRoundId, sessionId) {
   }
 }
 
+// GET /sessions/:id/current-phase
+app.get("/sessions/:id/current-phase", async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const [[round]] = await pool.query(
+      `SELECT phase, phase_ends_at, 
+              TIMESTAMPDIFF(SECOND, created_at, phase_ends_at) AS duration
+       FROM voting_rounds 
+       WHERE session_id = ? AND status = 'open' 
+       ORDER BY id DESC LIMIT 1`,
+      [id]
+    );
+
+    if (!round || !round.phase_ends_at) {
+      return res.status(404).json({ error: "No active phase" });
+    }
+
+    res.json({
+      phase: round.phase,
+      endsAt: new Date(round.phase_ends_at).toISOString(),
+      duration: round.duration || 90,
+      roundId: round.id,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 // === Voting ===
 app.post("/sessions/:id/proposals/:propId/vote", async (req, res) => {
   const { id, propId } = req.params;
@@ -1663,7 +1803,7 @@ app.post("/sessions/:id/proposals/:propId/vote", async (req, res) => {
   const guest = await getGuestFromToken(guestToken);
   if (!user && !guest) return res.status(401).json({ error: "Unauthorized" });
 
-  // === Check if session is live ===
+  // === Session existiert & ist live? ===
   const [[sessionRow]] = await pool.query(
     "SELECT is_live FROM sessions WHERE id = ?",
     [id],
@@ -1679,12 +1819,29 @@ app.post("/sessions/:id/proposals/:propId/vote", async (req, res) => {
     });
   }
 
-  // Prüfen, ob Proposal existiert
+  // === NEU: Aktuelle Phase prüfen – nur in 'voting' erlaubt! ===
+  const [[currentRound]] = await pool.query(
+    `SELECT phase 
+     FROM voting_rounds 
+     WHERE session_id = ? AND status = 'open' 
+     ORDER BY id DESC LIMIT 1`,
+    [id],
+  );
+
+  if (!currentRound || currentRound.phase !== 'voting') {
+    return res.status(403).json({ 
+      error: "Abstimmen momentan nicht möglich – aktuell läuft keine Voting-Phase" 
+    });
+  }
+
+  // Prüfen, ob Proposal existiert und zur aktuellen Runde gehört
   const [prop] = await pool.query(
-    "SELECT voting_round_id FROM queue_items WHERE id = ? AND session_id = ?",
+    `SELECT voting_round_id 
+     FROM queue_items 
+     WHERE id = ? AND session_id = ? AND status = 'suggested'`,
     [propId, id],
   );
-  if (!prop[0]) return res.status(404).json({ error: "Not found" });
+  if (!prop[0]) return res.status(404).json({ error: "Vorschlag nicht gefunden oder nicht abstimmbar" });
 
   const voterColumn = user ? "user_id" : "guest_id";
   const voterId = user?.id || guest?.id;
@@ -1709,7 +1866,7 @@ app.post("/sessions/:id/proposals/:propId/vote", async (req, res) => {
     );
   }
 
-  // Event für alle Clients
+  // Event für alle Clients – Stimmenstand hat sich geändert
   io.to(id).emit("proposals_updated");
 
   // === Prüfen, ob ALLE Teilnehmer abgestimmt haben ===
@@ -1754,9 +1911,8 @@ app.post("/sessions/:id/proposals/:propId/vote", async (req, res) => {
     `Abstimmung: ${votedParticipants}/${totalParticipants} haben abgestimmt`,
   );
 
-  // Nur wenn ALLE abgestimmt haben
+  // Nur wenn ALLE abgestimmt haben → sofort auswerten
   if (totalParticipants > 0 && votedParticipants >= totalParticipants) {
-    // === Gewinner ermitteln ===
     const [winnerResult] = await pool.query(
       `
     SELECT 
@@ -1777,17 +1933,15 @@ app.post("/sessions/:id/proposals/:propId/vote", async (req, res) => {
     if (winnerResult.length > 0) {
       const winningId = winnerResult[0].id;
 
-      // Gewinner in Queue verschieben
       await pool.query(
         `UPDATE queue_items SET status = 'queued' WHERE id = ?`,
         [winningId],
       );
 
-      // Alle anderen suggested → archived
       await pool.query(
         `UPDATE queue_items 
-       SET status = 'archived' 
-       WHERE session_id = ? AND status = 'suggested' AND id != ?`,
+         SET status = 'archived' 
+         WHERE session_id = ? AND status = 'suggested' AND id != ?`,
         [id, winningId],
       );
 
@@ -1899,77 +2053,127 @@ app.post("/sessions/:id/start", async (req, res) => {
   const user = await getUserFromToken(token);
   if (!user) return res.status(401).json({ error: "Unauthorized" });
 
-  const [sess] = await pool.query("SELECT is_live FROM sessions WHERE id = ?", [
-    id,
-  ]);
-  if (sess[0]?.is_live) {
+  const [[sess]] = await pool.query(
+    "SELECT is_live, user_id FROM sessions WHERE id = ?",
+    [id],
+  );
+  if (!sess) return res.status(404).json({ error: "Session not found" });
+  if (sess.user_id !== user.id) return res.status(403).json({ error: "Nur Host" });
+  if (sess.is_live) {
     return res.status(400).json({ error: "Session already live" });
   }
 
-  // 🧹 Reset playback_sync
+  // 🧹 Reset playback_sync – bleibt erhalten
   await pool.query(`DELETE FROM playback_sync WHERE session_id = ?`, [id]);
 
-  // 🚀 Set session to live
+  // Alle bisherigen "suggested" Vorschläge (aus Vorbereitung) werden direkt in die Queue übernommen
+  await pool.query(`
+    UPDATE queue_items 
+    SET status = 'queued', voting_round_id = NULL 
+    WHERE session_id = ? AND status = 'suggested'
+  `, [id]);
+
+  // 🚀 Session geht live
   await pool.query("UPDATE sessions SET is_live = 1 WHERE id = ?", [id]);
 
-  // 🎵 Fetch first unplayed song
+  // 🎵 Prüfen, ob bereits Songs in der Queue sind → sofort abspielen (wie bisher)
   const [first] = await pool.query(
-    "SELECT id, video_id, duration FROM queue_items WHERE session_id = ? AND played = 0 ORDER BY id ASC LIMIT 1",
+    "SELECT id, video_id, duration, title FROM queue_items WHERE session_id = ? AND played = 0 AND status = 'queued' ORDER BY id ASC LIMIT 1",
     [id],
   );
 
-  if (!first[0]) {
+  let firstSongStarted = false;
+  if (first[0]) {
+    const firstId = first[0].id;
+    const firstVideoId = first[0].video_id;
+    const duration = first[0].duration || 180;
+    const startTime = Date.now();
+
+    // 🕒 Markiere ersten Song als playing
+    await pool.query(
+      `UPDATE queue_items SET status = 'playing', startedAt = NOW() WHERE id = ?`,
+      [firstId],
+    );
+
+    // 🧩 playback_sync setzen
+    await pool.query(
+      `INSERT INTO playback_sync (session_id, current_video_id, progress_seconds, is_playing, video_start_time)
+       VALUES (?, ?, 0, 1, ?)
+       ON DUPLICATE KEY UPDATE
+         current_video_id = VALUES(current_video_id),
+         video_start_time = VALUES(video_start_time),
+         is_playing = 1`,
+      [id, firstVideoId, startTime],
+    );
+
+    console.log(
+      `[Playback] Session ${id} STARTED with first song: videoId=${firstVideoId} – "${first[0].title}"`,
+    );
+
+    // 📡 Broadcast: Radio geht live + erster Song
+    io.to(id).emit("session_started", {
+      autoStarted: true,
+      firstVideoId,
+      video_start_time: startTime,
+    });
+
+    io.to(id).emit("playback_sync", {
+      current_queue_item_id: firstId,
+      current_video_id: firstVideoId,
+      video_start_time: startTime,
+      is_playing: true,
+    });
+
+    // Timer für Song-Ende (wie bisher)
+    if (sessionTimers[id]) clearTimeout(sessionTimers[id]);
+    sessionTimers[id] = setTimeout(() => advanceToNext(id), duration * 1000);
+
+    firstSongStarted = true;
+  } else {
     io.to(id).emit("queue_empty");
-    return res.status(400).json({ error: "Queue empty" });
+    console.log(`[Session ${id}] Gestartet – aber Queue ist leer`);
   }
 
-  const firstId = first[0].id;
-  const firstVideoId = first[0].video_id;
-  const duration = first[0].duration;
-  const startTime = Date.now();
+  // ===============================================
+  // NEU: Erste Voting-Runde mit Phasen starten
+  // ===============================================
+  const suggestionDuration = 90;   // Sekunden
+  const votingDuration = 60;       // Sekunden
+  const suggestionEndsAt = new Date(Date.now() + suggestionDuration * 1000);
 
-  // 🕒 Mark first song as playing
-  await pool.query(
-    `UPDATE queue_items SET status = 'playing', playedAt = NOW() WHERE id = ?`,
-    [firstId],
+  const [roundResult] = await pool.query(
+    `INSERT INTO voting_rounds 
+      (session_id, status, phase, phase_ends_at, suggestion_duration, voting_duration)
+     VALUES (?, 'open', 'suggesting', ?, ?, ?)`,
+    [id, suggestionEndsAt, suggestionDuration, votingDuration],
   );
 
-  // 🧩 Set playback sync
-  await pool.query(
-    `INSERT INTO playback_sync (session_id, current_video_id, progress_seconds, is_playing, video_start_time)
-     VALUES (?, ?, 0, 1, ?)
-     ON DUPLICATE KEY UPDATE
-       current_video_id = VALUES(current_video_id),
-       video_start_time = VALUES(video_start_time),
-       is_playing = 1`,
-    [id, firstVideoId, startTime],
-  );
-  console.log(
-    `[Playback] Session ${id} STARTED with first song: videoId=${firstVideoId}`,
-  );
+  const votingRoundId = roundResult.insertId;
 
-  // 📡 Broadcast: the radio goes live
-  io.to(id).emit("session_started", {
-    autoStarted: true,
-    firstVideoId,
-    video_start_time: startTime,
+  // Timer für den Phasenwechsel starten (globale Funktion von vorher)
+  startPhaseTimer(id, votingRoundId, 'suggesting', suggestionDuration);
+
+  // Frontend informieren: Vorschlagsphase läuft!
+  io.to(id).emit("voting_phase_changed", {
+    phase: "suggesting",
+    endsAt: suggestionEndsAt.getTime(),
+    roundId: votingRoundId,
+    duration: suggestionDuration,
   });
 
-  // 📻 Broadcast playback state
-  io.to(id).emit("playback_sync", {
-    current_video_id: firstVideoId,
-    video_start_time: startTime,
-    is_playing: true,
-  });
-
-  // Start timer for first song
-  if (sessionTimers[id]) clearTimeout(sessionTimers[id]);
-  sessionTimers[id] = setTimeout(() => advanceToNext(id), duration * 1000);
+  io.to(id).emit("proposals_updated"); // leere Liste oder bestehende anzeigen
+  io.to(id).emit("queue_updated");
 
   console.log(
-    `[Session ${id}] Radio started with first song (${firstVideoId})`,
+    `[Session ${id}] Radio gestartet! Erste Voting-Runde #${votingRoundId} (Vorschläge: ${suggestionDuration}s, Voting: ${votingDuration}s)`,
   );
-  res.json({ success: true });
+
+  res.json({ 
+    success: true,
+    firstSongStarted,
+    votingRoundStarted: true,
+    votingRoundId 
+  });
 });
 
 // === Join Live ===
@@ -2263,6 +2467,7 @@ app.post("/forgot-password", async (req, res) => {
               <p style="margin:0;">
                 Diese E-Mail wurde gesendet, weil jemand das Zurücksetzen des Passworts für<br>
                 <strong>${email}</strong> angefordert hat.<br><br>
+                 TuneVote • Deine Musik. Deine Stimme.<br>
                 © ${new Date().getFullYear()} TuneVote – Alle Rechte vorbehalten.
               </p>
             </td>
