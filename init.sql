@@ -179,6 +179,10 @@ CREATE TABLE voting_rounds (
   started_by_guest_id INT NULL,
   started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   ends_at TIMESTAMP NULL,
+  phase ENUM('suggestion','voting','closed') DEFAULT 'suggestion',
+  phase_ends_at DATETIME NULL,
+  suggestion_duration INT DEFAULT 90,
+  voting_duration INT DEFAULT 60;
   max_suggestions INT DEFAULT 10,
   status ENUM('open','closed','computed') DEFAULT 'open',
   winner_queue_item_id INT NULL,
