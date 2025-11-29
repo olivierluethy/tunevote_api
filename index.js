@@ -1933,7 +1933,6 @@ app.get("/sessions/:id/current-phase", async (req, res) => {
 });
 
 // === Voting ===
-// === Voting ===
 // POST /sessions/:id/proposals/:propId/vote
 app.post("/sessions/:id/proposals/:propId/vote", async (req, res) => {
   const { id, propId } = req.params;
@@ -1997,6 +1996,92 @@ app.post("/sessions/:id/proposals/:propId/vote", async (req, res) => {
   io.to(id).emit("proposals_updated");
 
   res.json({ success: true });
+});
+
+// DELETE /sessions/:sessionId/proposals/:proposalId
+app.delete("/sessions/:sessionId/proposals/:proposalId", async (req, res) => {
+  const { sessionId, proposalId } = req.params;
+  const token = req.headers.authorization?.split(" ")[1];
+  const guestToken = req.headers["x-guest-token"];
+
+  let userId = null;
+  let guestId = null;
+
+  // === Authentifizierung ===
+  if (token) {
+    const user = await getUserFromToken(token);
+    if (!user) return res.status(401).json({ error: "Ungültiger Token" });
+    userId = user.id;
+  } else if (guestToken) {
+    const guest = await getGuestFromToken(guestToken);
+    if (!guest) return res.status(401).json({ error: "Ungültiger Gast-Token" });
+    guestId = guest.id;
+  } else {
+    return res.status(401).json({ error: "Kein Zugriffstoken" });
+  }
+
+  try {
+    // 1. Den suggested queue_item + Host-ID der Session holen
+    const [rows] = await pool.query(
+      `SELECT qi.*, s.user_id AS host_user_id 
+       FROM queue_items qi
+       JOIN sessions s ON qi.session_id = s.id
+       WHERE qi.id = ? 
+         AND qi.session_id = ? 
+         AND qi.status = 'suggested'`,
+      [proposalId, sessionId]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ 
+        message: "Vorschlag nicht gefunden oder nicht mehr löschbar" 
+      });
+    }
+
+    const item = rows[0];
+
+    // 2. Aktuelle Voting-Phase prüfen
+    const [phaseRows] = await pool.query(
+      `SELECT phase FROM voting_rounds 
+       WHERE session_id = ? AND status = 'open' 
+       ORDER BY created_at DESC LIMIT 1`,
+      [sessionId]
+    );
+
+    const currentPhase = phaseRows[0]?.phase || null;
+
+    if (currentPhase !== "suggesting") {
+      return res.status(403).json({ 
+        message: "Löschen nur in der Vorschlagsphase möglich" 
+      });
+    }
+
+    // 3. Berechtigung prüfen: Eigentümer ODER Host
+    const isOwner = 
+      (userId && item.added_by === userId) || 
+      (guestId && item.guest_id === guestId);
+
+    const isHost = userId && item.host_user_id === userId;
+
+    if (!isOwner && !isHost) {
+      return res.status(403).json({ 
+        message: "Du kannst nur deinen eigenen Vorschlag entfernen" 
+      });
+    }
+
+    // 4. Löschen
+    await pool.query("DELETE FROM queue_items WHERE id = ?", [proposalId]);
+
+    // 5. Echtzeit-Update an alle
+    req.io?.to(`session_${sessionId}`).emit("proposals_updated");
+    req.io?.to(`session_${sessionId}`).emit("queue_updated");
+
+    return res.json({ message: "Vorschlag erfolgreich entfernt" });
+
+  } catch (err) {
+    console.error("Fehler beim Löschen des Vorschlags:", err);
+    return res.status(500).json({ message: "Serverfehler" });
+  }
 });
 
 // === Host: direct queue add (blocked if session is_live) ===
