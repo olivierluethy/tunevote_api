@@ -1036,7 +1036,7 @@ app.get("/join", async (req, res) => {
     }
 
     const sessionId = sessions[0].id;
-    const joinUrl = `https://api.tunevote.com/session/${sessionId}`;
+    const joinUrl = `https://tunevote.com/session/${sessionId}`;
 
     // JSON mit Weiterleitungs-URL zurückgeben
     res.json({ redirect: joinUrl });
@@ -2533,7 +2533,7 @@ app.post("/forgot-password", async (req, res) => {
     );
 
     // Korrekter Reset-Link
-    const baseUrl = process.env.FRONTEND_URL || "https://api.tunevote.com";
+    const baseUrl = process.env.FRONTEND_URL || "https://tunevote.com";
     const resetLink = `${baseUrl}/reset-password/${resetToken}`;
 
     const primaryColor = "#4f46e5";

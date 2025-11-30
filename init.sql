@@ -47,7 +47,6 @@ CREATE TABLE sessions (
 
 CREATE TABLE session_invites (
   id INT NOT NULL AUTO_INCREMENT,
-
   session_id INT NOT NULL,
   invited_by_user_id INT NOT NULL,
 
@@ -56,8 +55,8 @@ CREATE TABLE session_invites (
   invited_user_id INT NULL,
 
   -- Status: Modell A
-  status ENUM('pending', 'accepted', 'rejected', 'revoked') 
-      NOT NULL DEFAULT 'pending',
+  status ENUM('pending', 'accepted', 'rejected', 'revoked')
+    NOT NULL DEFAULT 'pending',
 
   -- Timestamps
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -70,7 +69,7 @@ CREATE TABLE session_invites (
   PRIMARY KEY (id),
 
   -- Ein User kann für dieselbe Session nicht mehrfach eingeladen werden
-  unique_invite (session_id, email),
+  UNIQUE KEY unique_invite (session_id, email), -- <-- HIER IST DIE KORREKTUR
 
   -- Performance-Indizes
   INDEX idx_invited_user (invited_user_id),
@@ -79,13 +78,13 @@ CREATE TABLE session_invites (
   INDEX idx_status (status),
 
   -- Foreign Keys
-  FOREIGN KEY (session_id) 
+  FOREIGN KEY (session_id)
     REFERENCES sessions(id) ON DELETE CASCADE,
 
-  FOREIGN KEY (invited_by_user_id) 
+  FOREIGN KEY (invited_by_user_id)
     REFERENCES users(id) ON DELETE CASCADE,
 
-  FOREIGN KEY (invited_user_id) 
+  FOREIGN KEY (invited_user_id)
     REFERENCES users(id) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
@@ -184,7 +183,7 @@ CREATE TABLE voting_rounds (
   phase ENUM('suggestion','voting','closed') DEFAULT 'suggestion',
   phase_ends_at DATETIME NULL,
   suggestion_duration INT DEFAULT 90,
-  voting_duration INT DEFAULT 60;
+  voting_duration INT DEFAULT 60,
   max_suggestions INT DEFAULT 10,
   status ENUM('open','closed','computed') DEFAULT 'open',
   winner_queue_item_id INT NULL,
