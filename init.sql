@@ -6,6 +6,7 @@ CREATE TABLE users (
   created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
   reset_token VARCHAR(64),
   reset_token_expiry DATETIME,
+  updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   UNIQUE KEY username (username),
   UNIQUE KEY email (email)
@@ -36,6 +37,7 @@ CREATE TABLE sessions (
   title VARCHAR(100) NOT NULL,
   is_active TINYINT(1) DEFAULT '1',
   created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  ended_at TIMESTAMP NULL DEFAULT NULL,
   is_live TINYINT(1) DEFAULT '0',
   is_private TINYINT(1) DEFAULT 0,
   PRIMARY KEY (id),
@@ -179,6 +181,10 @@ CREATE TABLE voting_rounds (
   started_by_guest_id INT NULL,
   started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   ends_at TIMESTAMP NULL,
+  phase ENUM('suggestion','voting','closed') DEFAULT 'suggestion',
+  phase_ends_at DATETIME NULL,
+  suggestion_duration INT DEFAULT 90,
+  voting_duration INT DEFAULT 60;
   max_suggestions INT DEFAULT 10,
   status ENUM('open','closed','computed') DEFAULT 'open',
   winner_queue_item_id INT NULL,
