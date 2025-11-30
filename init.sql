@@ -6,6 +6,7 @@ CREATE TABLE users (
   created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
   reset_token VARCHAR(64),
   reset_token_expiry DATETIME,
+  updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   PRIMARY KEY (id),
   UNIQUE KEY username (username),
   UNIQUE KEY email (email)

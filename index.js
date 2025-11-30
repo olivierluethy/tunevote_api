@@ -3339,3 +3339,180 @@ app.get("/sessions/:sessionId/participants", async (req, res) => {
     res.status(500).json({ error: "Serverfehler" });
   }
 });
+
+// ============================================================
+// GET /api/profile → Aktuelle Profildaten des eingeloggten Users
+// ============================================================
+app.get("/profile", async (req, res) => {
+  console.log("\n=== GET /profile aufgerufen ===");
+  console.log("Vollständige Request-Headers:", req.headers);
+  console.log("User-Agent:", req.headers["user-agent"]);
+  console.log("IP:", req.ip || req.connection.remoteAddress);
+
+  // 1. Authorization Header prüfen
+  const authHeader = req.headers.authorization;
+  console.log("Authorization Header:", authHeader || "FEHLT");
+
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    console.log("Kein oder falscher Authorization-Header → 401");
+    return res.status(401).json({ error: "Unauthenticated – kein gültiger Token" });
+  }
+
+  const token = authHeader.split(" ")[1];
+  console.log("Extrahierter JWT-Token:", token ? `${token.slice(0, 15)}...${token.slice(-10)}` : "LEER");
+
+  // 2. Token dekodieren / User holen
+  let user;
+  try {
+    user = await getUserFromToken(token);
+  } catch (err) {
+    console.log("Token ungültig oder abgelaufen:", err.message);
+    return res.status(401).json({ error: "Unauthenticated – Token ungültig" });
+  }
+
+  if (!user) {
+    console.log("getUserFromToken hat null zurückgegeben");
+    return res.status(401).json({ error: "Unauthenticated" });
+  }
+
+  console.log("Erfolgreich authentifizierter User aus Token:", {
+    id: user.id,
+    username: user.username || "(nicht im Token)",
+    email: user.email || "(nicht im Token)",
+    iat: user.iat,
+    exp: user.exp
+  });
+
+  // 3. Datenbankabfrage
+  try {
+    console.log(`Führe DB-Query aus für user.id = ${user.id}`);
+    const [userRow] = await pool.query(
+      `SELECT id, username, email, created_at FROM users WHERE id = ?`,
+      [user.id]
+    );
+
+    console.log("Roh-Ergebnis der DB-Abfrage:", userRow);
+
+    if (!userRow || userRow.length === 0) {
+      console.log("User mit ID", user.id, "nicht in DB gefunden → 404");
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const dbUser = userRow[0];
+    console.log("Gefundener User in DB:", {
+      id: dbUser.id,
+      username: dbUser.username,
+      email: dbUser.email,
+      created_at: dbUser.created_at
+    });
+
+    // 4. Antwort an Frontend
+    console.log("Sende erfolgreiche Antwort an Frontend → 200");
+    console.log("Response Payload:", {
+      username: dbUser.username,
+      email: dbUser.email
+    });
+
+    res.json({
+      username: dbUser.username,
+      email: dbUser.email
+    });
+
+  } catch (err) {
+    console.error("Schwerer Fehler beim Laden des Profils:", err);
+    console.error("Stack:", err.stack);
+    res.status(500).json({ error: "Interner Serverfehler" });
+  }
+
+  console.log("=== GET /profile Ende ===\n");
+});
+
+// ============================================================
+// POST /profile → Profil + Passwort ändern
+// ============================================================
+app.post("/profile", async (req, res) => {
+  const token = req.headers.authorization?.split(" ")[1];
+  const user = token ? await getUserFromToken(token) : null;
+
+  if (!user) {
+    return res.status(401).json({ error: "Unauthenticated" });
+  }
+
+  const { username, email, currentPassword, newPassword, confirmPassword } = req.body;
+
+  // Validierung
+  if (!username || !email) {
+    return res.status(400).json({ error: "Benutzername und E-Mail sind erforderlich" });
+  }
+
+  if (username.length < 3 || username.length > 50) {
+    return res.status(400).json({ error: "Benutzername muss 3–50 Zeichen haben" });
+  }
+
+  if (!/^\S+@\S+\.\S+$/.test(email)) {
+    return res.status(400).json({ error: "Ungültige E-Mail-Adresse" });
+  }
+
+  try {
+    // Prüfen, ob Username oder E-Mail bereits von anderem Nutzer verwendet wird
+    const [existing] = await pool.query(
+      `SELECT id FROM users WHERE (LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?)) AND id != ?`,
+      [username, email, user.id]
+    );
+
+    if (existing.length > 0) {
+      const field = existing[0].username?.toLowerCase() === username.toLowerCase() ? "Benutzername" : "E-Mail";
+      return res.status(409).json({ error: `${field} bereits vergeben` });
+    }
+
+    // Passwort ändern?
+    if (newPassword) {
+      if (!currentPassword) {
+        return res.status(400).json({ error: "Aktuelles Passwort erforderlich" });
+      }
+      if (newPassword !== confirmPassword) {
+        return res.status(400).json({ error: "Neue Passwörter stimmen nicht überein" });
+      }
+      if (newPassword.length < 8) {
+        return res.status(400).json({ error: "Neues Passwort muss mind. 8 Zeichen haben" });
+      }
+
+      // Aktuelles Passwort prüfen
+      const [currentUser] = await pool.query(
+        `SELECT password_hash FROM users WHERE id = ?`,
+        [user.id]
+      );
+
+      const validPassword = await bcrypt.compare(currentPassword, currentUser[0].password_hash);
+      if (!validPassword) {
+        return res.status(400).json({ error: "Aktuelles Passwort ist falsch" });
+      }
+
+      // Neues Passwort hashen
+      const password_hash = await bcrypt.hash(newPassword, 12);
+
+      // Update mit Passwort
+      await pool.query(
+        `UPDATE users 
+         SET username = ?, email = ?, password_hash = ?, updated_at = NOW()
+         WHERE id = ?`,
+        [username, email, password_hash, user.id]
+      );
+    } else {
+      // Nur Name + E-Mail ändern
+      await pool.query(
+        `UPDATE users 
+         SET username = ?, email = ?, updated_at = NOW()
+         WHERE id = ?`,
+        [username, email, user.id]
+      );
+    }
+
+    // Optional: Token neu generieren oder Session aktualisieren (falls du JWT nutzt)
+    // Hier einfach Erfolg zurückgeben
+    res.json({ success: true, message: "Profil erfolgreich aktualisiert" });
+  } catch (err) {
+    console.error("Fehler beim Aktualisieren des Profils:", err);
+    res.status(500).json({ error: "Interner Serverfehler" });
+  }
+});
