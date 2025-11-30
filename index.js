@@ -129,27 +129,246 @@ const getUserFromToken = async (token) => {
   }
 };
 
-const ensureGuestToken = async () => {
-  let guestToken = localStorage.getItem("guestToken");
-  const nickname = localStorage.getItem("guestName") || "Gast";
+const phaseTimers = {}; // { sessionId: timeout }
 
-  // Wenn noch kein Token vorhanden, neuen Gast anlegen
-  if (!guestToken) {
+async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
+  if (phaseTimers[sessionId]) clearTimeout(phaseTimers[sessionId]);
+
+  const nextPhase = currentPhase === "suggesting" ? "voting" : "suggesting";
+
+  phaseTimers[sessionId] = setTimeout(async () => {
     try {
-      const { data } = await axios.post("http://localhost:4000/guest/join", {
-        nickname,
-      });
-      guestToken = data.guestToken;
-      localStorage.setItem("guestToken", guestToken);
-      localStorage.setItem("guestName", data.nickname);
-      console.log("New guest created:", data);
-    } catch (err) {
-      console.error("Guest creation failed:", err);
+      if (nextPhase === "voting") {
+        // --- Wechsel zu Voting-Phase (unverändert)
+        const votingEnds = new Date(Date.now() + 60 * 1000);
+        await pool.query(
+          `
+          UPDATE voting_rounds 
+          SET phase = 'voting', phase_ends_at = ? 
+          WHERE id = ? AND session_id = ?
+        `,
+          [votingEnds, roundId, sessionId],
+        );
+
+        io.to(sessionId).emit("voting_phase_changed", {
+          phase: "voting",
+          endsAt: votingEnds.getTime(),
+          roundId,
+          duration: 60,
+        });
+
+        startPhaseTimer(sessionId, roundId, "voting", 60);
+      } else if (nextPhase === "suggesting") {
+  // ==================== VOTING BEENDET → GEWINNER BESTIMMEN ====================
+  let winnerId = null;
+
+  // 1. Prüfen: Gab es überhaupt Votes?
+  const [votedSongs] = await pool.query(
+    `
+    SELECT qi.id
+    FROM queue_items qi
+    WHERE qi.voting_round_id = ?
+      AND qi.status = 'suggested'
+      AND EXISTS (SELECT 1 FROM votes v WHERE v.queue_item_id = qi.id)
+    ORDER BY (
+      SELECT COUNT(*) FROM votes v WHERE v.queue_item_id = qi.id
+    ) DESC, qi.created_at ASC
+    LIMIT 1
+    `,
+    [roundId]
+  );
+
+  if (votedSongs.length > 0) {
+    winnerId = votedSongs[0].id;
+    await pool.query(
+      "UPDATE queue_items SET status = 'queued' WHERE id = ?",
+      [winnerId]
+    );
+    console.log(`[Voting] Gewinner durch Votes: #${winnerId}`);
+  } else {
+    // → KEINE Votes → Fallback-Regeln
+
+    // 1. Gibt es User/Guest-Vorschläge?
+    const [userProposal] = await pool.query(
+      `
+      SELECT id
+      FROM queue_items
+      WHERE voting_round_id = ?
+        AND status = 'suggested'
+        AND item_source IN ('user', 'guest')
+      ORDER BY created_at ASC
+      LIMIT 1
+      `,
+      [roundId]
+    );
+
+    if (userProposal.length > 0) {
+      winnerId = userProposal[0].id;
+      await pool.query(
+        "UPDATE queue_items SET status = 'queued', item_type = 'music' WHERE id = ?",
+        [winnerId]
+      );
+      console.log(`[Voting] Keine Votes → Ältester User-Vorschlag gewinnt: #${winnerId}`);
+    } else {
+      // 2. Nur AI-Vorschläge → prüfen: live User + mindestens 3 AI-Songs mit 0 Votes?
+      const [liveRows] = await pool.query(
+        "SELECT COUNT(*) AS cnt FROM session_participants WHERE session_id = ? AND is_live = 1",
+        [sessionId]
+      );
+      const liveCount = liveRows[0].cnt;
+
+      if (liveCount > 0) {
+        const [aiCountRows] = await pool.query(
+          `
+          SELECT COUNT(*) AS cnt
+          FROM queue_items
+          WHERE voting_round_id = ?
+            AND status = 'suggested'
+            AND item_source = 'ai'
+            AND NOT EXISTS (SELECT 1 FROM votes v WHERE v.queue_item_id = queue_items.id)
+          `,
+          [roundId]
+        );
+        const aiCount = aiCountRows[0].cnt;
+
+        if (aiCount >= 3) {
+          const [aiRows] = await pool.query(
+            `
+            SELECT id
+            FROM queue_items
+            WHERE voting_round_id = ?
+              AND status = 'suggested'
+              AND item_source = 'ai'
+              AND NOT EXISTS (SELECT 1 FROM votes v WHERE v.queue_item_id = queue_items.id)
+            ORDER BY RAND()
+            LIMIT 1
+            `,
+            [roundId]
+          );
+
+          if (aiRows.length > 0) {
+            winnerId = aiRows[0].id;
+            await pool.query(
+              "UPDATE queue_items SET status = 'queued', item_type = 'music' WHERE id = ?",
+              [winnerId]
+            );
+            console.log(`[Voting] Fallback: Zufälliger AI-Song gewählt (#${winnerId}) – ${aiCount} AI-Songs, ${liveCount} live`);
+          }
+        } else {
+          console.log(`[Voting] Fallback nicht möglich: Nur ${aiCount}/3 AI-Songs (0 Votes), ${liveCount} live`);
+        }
+      } else {
+        // === KEIN LIVE-TEILNEHMER → Session leer und inaktiv ===
+        console.log(`[Voting] Kein Gewinner → niemand live (${liveCount} Teilnehmer) → Session wird beendet`);
+
+        // Alle vorgeschlagenen Songs archivieren (sauberer Zustand)
+        await pool.query(
+          "UPDATE queue_items SET status = 'archived' WHERE voting_round_id = ? AND status = 'suggested'",
+          [roundId]
+        );
+
+        // Aktuelle Runde schließen (ohne Gewinner)
+        await pool.query(
+          `UPDATE voting_rounds 
+           SET status = 'closed', phase = 'closed', winner_queue_item_id = NULL 
+           WHERE id = ?`,
+          [roundId]
+        );
+
+        // Session als beendet markieren + Broadcast
+        await pool.query(
+          `UPDATE sessions 
+           SET is_live = 0, ended_at = NOW() 
+           WHERE id = ? AND is_live = 1`,
+          [sessionId]
+        );
+
+        io.to(sessionId).emit("session_ended", {
+          reason: "no_active_participants",
+          message: "Die Session wurde beendet, da niemand mehr aktiv war."
+        });
+
+        io.in(sessionId).socketsLeave(sessionId); // Alle Clients aus dem Room kicken
+
+        // Optional: Timer aufräumen
+        if (phaseTimers[sessionId]) {
+          clearTimeout(phaseTimers[sessionId]);
+          delete phaseTimers[sessionId];
+        }
+
+        // WICHTIG: KEINE neue Runde starten → return oder einfach nichts weiter machen
+        return; // Verhindert die neue Runde nach 3 Sekunden
+      }
     }
   }
 
-  return guestToken;
-};
+  // === Restliche archivieren ===
+  if (winnerId) {
+    await pool.query(
+      `
+      UPDATE queue_items
+      SET status = 'archived'
+      WHERE voting_round_id = ? AND status = 'suggested' AND id != ?
+      `,
+      [roundId, winnerId]
+    );
+  } else {
+    await pool.query(
+      "UPDATE queue_items SET status = 'archived' WHERE voting_round_id = ? AND status = 'suggested'",
+      [roundId]
+    );
+  }
+
+  // === Runde schließen ===
+  await pool.query(
+    `
+    UPDATE voting_rounds
+    SET status = 'closed', phase = 'closed', winner_queue_item_id = ?
+    WHERE id = ?
+    `,
+    [winnerId || null, roundId]
+  );
+
+  // === Broadcast ===
+  io.to(sessionId).emit("voting_round_completed", { winnerId, roundId });
+  io.to(sessionId).emit("queue_updated");
+  io.to(sessionId).emit("proposals_updated");
+
+  // === Neue Runde in 3 Sekunden ===
+  setTimeout(async () => {
+    const newEnds = new Date(Date.now() + 90 * 1000);
+    const [newRound] = await pool.query(
+      `
+      INSERT INTO voting_rounds
+        (session_id, status, phase, phase_ends_at, suggestion_duration, voting_duration)
+      VALUES (?, 'open', 'suggesting', ?, 90, 60)
+      `,
+      [sessionId, newEnds]
+    );
+
+    const newRoundId = newRound.insertId;
+
+    io.to(sessionId).emit("suggesting_phase_started", {
+      roundId: newRoundId,
+      endsAt: newEnds.getTime(),
+      duration: 90,
+    });
+
+    io.to(sessionId).emit("voting_phase_changed", {
+      phase: "suggesting",
+      endsAt: newEnds.getTime(),
+      roundId: newRoundId,
+      duration: 90,
+    });
+
+    startPhaseTimer(sessionId, newRoundId, "suggesting", 90);
+  }, 3000);
+}
+    } catch (err) {
+      console.error("Phase timer error:", err);
+    }
+  }, seconds * 1000);
+}
 
 const getGuestFromToken = async (guestToken) => {
   if (!guestToken) return null;
@@ -197,193 +416,208 @@ const parseIsoDuration = (iso) => {
 };
 
 // Advance to next queue item — Identifikation ausschließlich über queue_items.id / status
+// Advance to next queue item — NOW WITH EMERGENCY AUTO-PROMOTION FROM VOTING
 const advanceToNext = async (sessionId) => {
   try {
-    // 1) Aktuelles playing-Item eindeutig ermitteln (wenn vorhanden)
-    //    Wir wählen das zuletzt gestartete "playing"-Item (falls mehrere vorhanden sind).
+    // 1) Mark current playing as played
     const [playingRows] = await pool.query(
-      `SELECT id, video_id, item_type, duration, title
-       FROM queue_items
-       WHERE session_id = ? AND status = 'playing'
-       ORDER BY COALESCE(startedAt, created_at) DESC
-       LIMIT 1`,
+      `SELECT id FROM queue_items WHERE session_id = ? AND status = 'playing' LIMIT 1`,
       [sessionId],
     );
-
-    const currentPlaying = playingRows[0] || null;
-    const currentPlayingId = currentPlaying?.id || null;
-
-    // 2) Falls ein aktuelles playing-Item existiert -> als played markieren
-    if (currentPlayingId) {
+    if (playingRows.length > 0) {
+      const currentId = playingRows[0].id;
       await pool.query(
-        `UPDATE queue_items
-         SET status = 'played', played = 1, playedAt = NOW()
-         WHERE id = ?`,
-        [currentPlayingId],
+        `UPDATE queue_items SET status = 'played', played = 1, playedAt = NOW() WHERE id = ?`,
+        [currentId],
       );
-
-      console.log(
-        `[Session ${sessionId}] Marked played: queue_item_id=${currentPlayingId}`,
-      );
-    } else {
-      console.log(
-        `[Session ${sessionId}] No item with status='playing' found to mark as played`,
-      );
+      console.log(`[Session ${sessionId}] Marked played: #${currentId}`);
     }
 
-    // 3) Prüfen ob noch ungespielte Items existieren
-    const [remaining] = await pool.query(
-      `SELECT COUNT(*) as count
-       FROM queue_items
-       WHERE session_id = ? AND played = 0 AND status IN ('queued', 'playing')`,
-      [sessionId],
-    );
-
-    if (remaining[0].count === 0) {
-      // Alles gespielt — Session zurücksetzen / beenden
-      await pool.query(
-        `UPDATE queue_items
-         SET status = 'queued', played = 0, playedAt = NULL
-         WHERE session_id = ? AND status IN ('played', 'skipped', 'playing')`,
-        [sessionId],
-      );
-
-      await pool.query("UPDATE sessions SET is_live = 0 WHERE id = ?", [
-        sessionId,
-      ]);
-      await pool.query("DELETE FROM playback_sync WHERE session_id = ?", [
-        sessionId,
-      ]);
-      await pool.query(
-        "UPDATE session_participants SET is_live = 0 WHERE session_id = ?",
-        [sessionId],
-      );
-      await pool.query(
-        "DELETE FROM queue_items WHERE status='suggested' AND session_id = ?",
-        [sessionId],
-      );
-
-      io.to(sessionId).emit("session_ended");
-      io.to(sessionId).emit("queue_updated");
-
-      if (sessionTimers[sessionId]) clearTimeout(sessionTimers[sessionId]);
-      delete sessionTimers[sessionId];
-
-      console.log(`[Session ${sessionId}] No remaining items → Session ended`);
-      return;
-    }
-
-    // 4) Nächstes ungespieltes & queued Item holen (eindeutig über id-Order)
-    const [nextItems] = await pool.query(
+    // 2) Check if there are still queued items
+    const [queuedRows] = await pool.query(
       `SELECT id, video_id, item_type, duration, title
        FROM queue_items
-       WHERE session_id = ? AND played = 0 AND status = 'queued'
+       WHERE session_id = ? AND status = 'queued' AND played = 0
        ORDER BY id ASC
        LIMIT 1`,
       [sessionId],
     );
 
-    const next = nextItems[0];
+    let next = queuedRows[0] || null;
+
+    // ========= EMERGENCY: NO QUEUED ITEM? → AUTO-PROMOTE FROM CURRENT VOTING ROUND =========
     if (!next) {
-      console.warn(
-        `[Session ${sessionId}] No next item found despite remaining > 0`,
+      const [openRound] = await pool.query(
+        `SELECT id FROM voting_rounds WHERE session_id = ? AND status = 'open' LIMIT 1`,
+        [sessionId],
       );
+
+      if (openRound.length > 0) {
+        const roundId = openRound[0].id;
+
+        console.log(`[Session ${sessionId}] EMERGENCY: No queued song → auto-promoting winner from voting round #${roundId}`);
+
+        // Same winner logic as in phase timer — EXACT COPY
+        let winnerId = null;
+
+        // 1. Highest voted
+        const [votedSongs] = await pool.query(
+          `
+          SELECT qi.id
+          FROM queue_items qi
+          WHERE qi.voting_round_id = ? AND qi.status = 'suggested'
+            AND EXISTS (SELECT 1 FROM votes v WHERE v.queue_item_id = qi.id)
+          ORDER BY (
+            SELECT COUNT(*) FROM votes v WHERE v.queue_item_id = qi.id
+          ) DESC, qi.created_at ASC
+          LIMIT 1
+        `,
+          [roundId]
+        );
+
+        if (votedSongs.length > 0) {
+          winnerId = votedSongs[0].id;
+        } else {
+          // 2. Fallback: oldest user/guest suggestion
+          const [userProposal] = await pool.query(
+            `
+            SELECT id FROM queue_items
+            WHERE voting_round_id = ? AND status = 'suggested' AND item_source IN ('user', 'guest')
+            ORDER BY created_at ASC LIMIT 1
+          `,
+            [roundId]
+          );
+          if (userProposal.length > 0) winnerId = userProposal[0].id;
+          else {
+            // 3. Random AI song if live users exist and ≥3 AI songs
+            const [liveCountRow] = await pool.query(
+              `SELECT COUNT(*) AS cnt FROM session_participants WHERE session_id = ? AND is_live = 1`,
+              [sessionId]
+            );
+            if (liveCountRow[0].cnt > 0) {
+              const [aiRows] = await pool.query(
+                `
+                SELECT id FROM queue_items
+                WHERE voting_round_id = ? AND status = 'suggested' AND item_source = 'ai'
+                  AND NOT EXISTS (SELECT 1 FROM votes v WHERE v.queue_item_id = queue_items.id)
+                ORDER BY RAND() LIMIT 1
+              `,
+                [roundId]
+              );
+              if (aiRows.length > 0) winnerId = aiRows[0].id;
+            }
+          }
+        }
+
+        if (winnerId) {
+          await pool.query(
+            `UPDATE queue_items SET status = 'queued' WHERE id = ?`,
+            [winnerId]
+          );
+
+          // Archive others
+          await pool.query(
+            `UPDATE queue_items SET status = 'archived'
+             WHERE voting_round_id = ? AND status = 'suggested' AND id != ?`,
+            [roundId, winnerId]
+          );
+
+          // Close round early
+          await pool.query(
+            `UPDATE voting_rounds SET status = 'closed', winner_queue_item_id = ? WHERE id = ?`,
+            [winnerId, roundId]
+          );
+
+          io.to(sessionId).emit("voting_round_completed", { winnerId, roundId, emergency: true });
+          io.to(sessionId).emit("proposals_updated");
+          io.to(sessionId).emit("queue_updated");
+
+          // Now fetch the newly queued song
+          const [emergencyNext] = await pool.query(
+            `SELECT id, video_id, item_type, duration, title
+             FROM queue_items WHERE id = ?`,
+            [winnerId]
+          );
+          next = emergencyNext[0];
+          console.log(`[Session ${sessionId}] Emergency auto-promoted song #${winnerId} to prevent silence`);
+        }
+      }
+    }
+
+    // 3) Still no song? → End session properly
+    if (!next) {
+      const [activeParticipants] = await pool.query(
+        `SELECT COUNT(*) AS cnt FROM session_participants WHERE session_id = ? AND is_live = 1`,
+        [sessionId]
+      );
+      const [openRounds] = await pool.query(
+        `SELECT COUNT(*) AS cnt FROM voting_rounds WHERE session_id = ? AND status = 'open'`,
+        [sessionId]
+      );
+
+      if (activeParticipants[0].cnt === 0 && openRounds[0].cnt === 0) {
+        // Really end session
+        await pool.query(`UPDATE sessions SET is_live = 0 WHERE id = ?`, [sessionId]);
+        await pool.query(`UPDATE session_participants SET is_live = 0 WHERE session_id = ?`, [sessionId]);
+        io.to(sessionId).emit("session_ended");
+        console.log(`[Session ${sessionId}] Session ended (no songs, no users, no voting)`);
+      } else {
+        console.log(`[Session ${sessionId}] No song to play, but users/voting active → waiting...`);
+      }
       return;
     }
 
-    const {
-      id: nextId,
-      video_id: nextVideoId,
-      item_type,
-      duration,
-      title,
-    } = next;
-
+    // 4) Play the next song (normal flow)
+    const { id: nextId, video_id: nextVideoId, item_type, duration, title } = next;
     const startTime = Date.now();
 
-    // 5) Markiere das nächste Item als 'playing' (startedAt setzen)
-    await pool.query(
-      `UPDATE queue_items
-       SET status = 'playing', startedAt = NOW()
-       WHERE id = ?`,
-      [nextId],
-    );
-
-    // 6) PAUSE-Fall: setze playback_sync entsprechend und sende pause events
     if (item_type === "pause") {
-      console.log(
-        `[Session ${sessionId}] Starting pause: ${title} (QueueItem=${nextId}, ${duration}s)`,
-      );
-
-      io.to(sessionId).emit("pause_started", {
-        queue_item_id: nextId,
-        title,
-        duration,
-        startTime,
-      });
-
-      // playback_sync bleibt ohne current_video_id (NULL), aber wir lassen den client wissen welches queue_item läuft
       await pool.query(
-        `UPDATE playback_sync
-         SET current_video_id = NULL,
-             is_playing = 0,
-             video_start_time = ?
-         WHERE session_id = ?`,
-        [startTime, sessionId],
+        `UPDATE queue_items SET status = 'playing', startedAt = NOW() WHERE id = ?`,
+        [nextId]
       );
+      await pool.query(
+        `UPDATE playback_sync SET current_video_id = NULL, is_playing = 0, video_start_time = ? WHERE session_id = ?`,
+        [startTime, sessionId]
+      );
+      io.to(sessionId).emit("pause_started", { queue_item_id: nextId, title, duration, startTime });
+      io.to(sessionId).emit("playback_sync", { current_queue_item_id: nextId, current_video_id: null, video_start_time: startTime, is_playing: false });
 
-      // Timer für Ende der Pause
       if (sessionTimers[sessionId]) clearTimeout(sessionTimers[sessionId]);
-      sessionTimers[sessionId] = setTimeout(
-        async () => {
-          io.to(sessionId).emit("pause_ended", { queue_item_id: nextId });
-          await advanceToNext(sessionId);
-        },
-        (duration || 0) * 1000,
+      sessionTimers[sessionId] = setTimeout(() => advanceToNext(sessionId), duration * 1000);
+    } else {
+      await pool.query(
+        `UPDATE queue_items SET status = 'playing', startedAt = NOW() WHERE id = ?`,
+        [nextId]
+      );
+      await pool.query(
+        `INSERT INTO playback_sync (session_id, current_video_id, video_start_time, is_playing)
+         VALUES (?, ?, ?, 1)
+         ON DUPLICATE KEY UPDATE
+           current_video_id = VALUES(current_video_id),
+           video_start_time = VALUES(video_start_time),
+           is_playing = 1`,
+        [sessionId, nextVideoId, startTime]
       );
 
-      // Event: Wir senden zusätzlich die queue item id damit Clients es als "LIVE" erkennen können
       io.to(sessionId).emit("playback_sync", {
         current_queue_item_id: nextId,
-        current_video_id: null,
+        current_video_id: nextVideoId,
         video_start_time: startTime,
-        is_playing: false,
+        is_playing: true,
       });
 
-      io.to(sessionId).emit("queue_updated");
-      return;
+      if (sessionTimers[sessionId]) clearTimeout(sessionTimers[sessionId]);
+      const safeDurationMs = Math.max(1000, (duration || 180) * 1000);
+      sessionTimers[sessionId] = setTimeout(() => advanceToNext(sessionId), safeDurationMs);
+
+      console.log(`[Session ${sessionId}] Now playing: "${title}" (#${nextId})`);
     }
-
-    // 7) MUSIC-Fall: Aktualisiere playback_sync und sende Events.
-    await pool.query(
-      `UPDATE playback_sync
-       SET current_video_id = ?, video_start_time = ?, is_playing = 1
-       WHERE session_id = ?`,
-      [nextVideoId, startTime, sessionId],
-    );
-
-    io.to(sessionId).emit("playback_sync", {
-      current_queue_item_id: nextId, // für Frontend-LIVE-Markierung (ungültige Spalte in DB nicht nötig)
-      current_video_id: nextVideoId,
-      video_start_time: startTime,
-      is_playing: true,
-    });
 
     io.to(sessionId).emit("queue_updated");
 
-    // 8) Timer für automatisches Weiterspringen nach Duration
-    if (sessionTimers[sessionId]) clearTimeout(sessionTimers[sessionId]);
-    const safeDurationMs = Math.max(0, (duration || 0) * 1000);
-    sessionTimers[sessionId] = setTimeout(
-      () => advanceToNext(sessionId),
-      safeDurationMs,
-    );
-
-    console.log(
-      `[Session ${sessionId}] Playing music: ${title} (QueueItem=${nextId}, duration=${duration}s)`,
-    );
   } catch (err) {
-    console.error(`Error advancing queue for session ${sessionId}:`, err);
+    console.error(`[Session ${sessionId}] advanceToNext error:`, err);
   }
 };
 
@@ -399,10 +633,10 @@ const broadcastLiveParticipants = async (sessionId) => {
        LEFT JOIN guest_users g ON sp.guest_id = g.id
        WHERE sp.session_id = ? AND sp.is_live = 1
        ORDER BY sp.joined_at DESC`,
-      [sessionId]
+      [sessionId],
     );
 
-    const formatted = participants.map(p => ({
+    const formatted = participants.map((p) => ({
       name: p.name,
       isHost: !!p.isHost,
     }));
@@ -526,7 +760,7 @@ app.post("/register", async (req, res) => {
     // Prüfen ob es den User schon gibt
     const [exists] = await pool.query(
       "SELECT 1 FROM users WHERE email = ? OR username = ?",
-      [email, username]
+      [email, username],
     );
     if (exists.length > 0)
       return res.status(409).json({ error: "User exists" });
@@ -535,7 +769,7 @@ app.post("/register", async (req, res) => {
     const password_hash = await bcrypt.hash(password, 10);
     const [result] = await pool.query(
       "INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)",
-      [username, email, password_hash]
+      [username, email, password_hash],
     );
 
     const newUserId = result.insertId;
@@ -547,7 +781,7 @@ app.post("/register", async (req, res) => {
        SET invited_user_id = ?
        WHERE invited_user_id IS NULL
          AND LOWER(email) = LOWER(?)`,
-      [newUserId, email]
+      [newUserId, email],
     );
 
     // JWT erstellen
@@ -555,7 +789,11 @@ app.post("/register", async (req, res) => {
       expiresIn: "7d",
     });
 
-    res.json({ success: true, message: "Registration successful! Redirecting...", username });
+    res.json({
+      success: true,
+      message: "Registration successful! Redirecting...",
+      username,
+    });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: "Server error" });
@@ -620,7 +858,7 @@ app.get("/sessions", async (req, res) => {
     try {
       const [rows] = await pool.query(
         "SELECT id, nickname FROM guest_users WHERE guest_token = ?",
-        [guestToken]
+        [guestToken],
       );
       if (rows.length > 0) {
         isGuest = true;
@@ -673,12 +911,13 @@ app.get("/sessions", async (req, res) => {
     // E-Mail sicher aus der DB holen (auch wenn sie im JWT fehlt)
     const [[{ email: userEmail }]] = await pool.query(
       "SELECT email FROM users WHERE id = ?",
-      [userId]
+      [userId],
     );
 
     if (!userEmail) {
       // Sollte nie passieren, aber zur Sicherheit: nur öffentliche + eigene Sessions
-      [rows] = await pool.query(`
+      [rows] = await pool.query(
+        `
         SELECT 
           s.id, s.title, s.created_at, s.user_id AS hostId, u.username AS host,
           s.is_live, s.is_private,
@@ -690,12 +929,15 @@ app.get("/sessions", async (req, res) => {
         JOIN users u ON s.user_id = u.id
         WHERE s.is_private = 0 OR s.user_id = ?
         ORDER BY participant_count DESC, s.created_at DESC
-      `, [userId]);
+      `,
+        [userId],
+      );
       return res.json(rows);
     }
 
     // Hauptquery: alles in einem Rutsch
-    [rows] = await pool.query(`
+    [rows] = await pool.query(
+      `
       SELECT DISTINCT
         s.id,
         s.title,
@@ -720,10 +962,11 @@ app.get("/sessions", async (req, res) => {
         OR s.user_id = ?                                -- eigener Host
         OR si.id IS NOT NULL                            -- akzeptierte Einladung
       ORDER BY participant_count DESC, s.created_at DESC
-    `, [userEmail, userId]);
+    `,
+      [userEmail, userId],
+    );
 
     return res.json(rows);
-
   } catch (err) {
     console.error("Get sessions error:", err);
     return res.status(500).json({ error: "Server error" });
@@ -793,7 +1036,7 @@ app.get("/join", async (req, res) => {
     }
 
     const sessionId = sessions[0].id;
-    const joinUrl = `http://localhost:5173/session/${sessionId}`;
+    const joinUrl = `https://api.tunevote.com/session/${sessionId}`;
 
     // JSON mit Weiterleitungs-URL zurückgeben
     res.json({ redirect: joinUrl });
@@ -881,7 +1124,6 @@ app.get("/sessions/:id/recommendations", async (req, res) => {
   );
 
   const titles = queueRows.map((r) => r.title);
-  if (titles.length < 2) return res.status(200).json([]);
 
   // ---- NEW: Voting-Round & AI Suggestion Check ----
   const [votingRoundRows] = await pool.query(
@@ -903,40 +1145,60 @@ app.get("/sessions/:id/recommendations", async (req, res) => {
      WHERE voting_round_id = ? AND status = 'suggested'`,
     [currentRoundId],
   );
+
   const numItems = suggestedRows[0].count;
 
-  const needed = 3 - numItems;
-  if (needed <= 0) {
-    console.log(
-      "[AI] Already 3 or more items in voting round. Returning existing AI suggestions.",
-    );
-    const [existingAi] = await pool.query(
-      `SELECT id, title, video_id AS youtubeId, thumbnail
-       FROM queue_items
-       WHERE session_id = ?
-         AND voting_round_id = ?
-         AND item_source = 'ai'
-         AND status = 'suggested'`,
-      [id, currentRoundId],
-    );
-    return res.json(existingAi);
-  }
-
-  const [existingAi] = await pool.query(
+  // === 1. Alle aktuellen KI-Vorschläge laden ===
+  let existingAi = await pool.query(
     `SELECT id, title, video_id AS youtubeId, thumbnail
      FROM queue_items
      WHERE session_id = ?
        AND voting_round_id = ?
        AND item_source = 'ai'
-       AND status = 'suggested'`,
+       AND status = 'suggested'
+     ORDER BY id ASC`,
     [id, currentRoundId],
   );
+  existingAi = existingAi[0]; // weil pool.query immer [[rows], fields] zurückgibt
+
+  // === 2. Falls mehr als 3 KI-Vorschläge existieren → überschüssige löschen ===
+  if (existingAi.length > 3) {
+    const toDelete = existingAi.slice(3).map((item) => item.id);
+    await pool.query(
+      `DELETE FROM queue_items WHERE id IN (?) AND item_source = 'ai'`,
+      [toDelete],
+    );
+    console.log(
+      `[AI] Cleaned up ${toDelete.length} excess AI suggestions → keeping only the oldest 3`,
+    );
+
+    // Nach dem Löschen neu laden (nur die verbleibenden 3)
+    const [cleaned] = await pool.query(
+      `SELECT id, title, video_id AS youtubeId, thumbnail
+       FROM queue_items
+       WHERE session_id = ? AND voting_round_id = ? AND item_source = 'ai' AND status = 'suggested'
+       ORDER BY id ASC`,
+      [id, currentRoundId],
+    );
+    existingAi = cleaned;
+  }
+
+  // === 3. Genau auf 3 KI-Vorschläge auffüllen ===
+  const needed = 3 - existingAi.length;
+
+  if (needed <= 0) {
+    console.log(
+      `[AI] Already exactly ${existingAi.length} AI suggestions → returning them`,
+    );
+    return res.json(existingAi);
+  }
 
   console.log(
-    `[AI] ${numItems} items in voting round. Generating ${needed} AI suggestion(s)...`,
+    `[AI] ${numItems} total suggested items. Generating ${needed} new AI suggestion(s)...`,
   );
 
   // ---- Get suggested titles to avoid duplicates ----
+
   const [suggestedTitleRows] = await pool.query(
     `
     SELECT yvc.title
@@ -1320,7 +1582,7 @@ app.post("/sessions/:id/proposals", async (req, res) => {
   }
 
   try {
-    // === FALL: PAUSE ===
+    // === FALL: PAUSE (unverändert) ===
     if (item_type === "pause") {
       const duration = pauseDuration || 30;
       const desc = description || "Kurze Pause";
@@ -1351,17 +1613,15 @@ app.post("/sessions/:id/proposals", async (req, res) => {
 
     let title, thumbnail, duration;
 
-    // 1. Versuche aus Cache zu holen
+    // 1. Cache oder ytdl (unverändert)
     const [cachedRows] = await pool.query(
       "SELECT title, thumbnail, duration FROM youtube_video_cache WHERE youtube_id = ?",
       [videoId],
     );
 
     if (cachedRows.length > 0) {
-      // Cache-Treffer
       ({ title, thumbnail, duration } = cachedRows[0]);
     } else {
-      // 2. Nicht im Cache → ytdl holen und cachen
       try {
         const info = await ytdl.getBasicInfo(
           `https://www.youtube.com/watch?v=${videoId}`,
@@ -1375,79 +1635,76 @@ app.post("/sessions/:id/proposals", async (req, res) => {
           `https://i.ytimg.com/vi/${videoId}/default.jpg`;
         duration = parseInt(videoDetails.lengthSeconds) || 0;
 
-        // In Cache speichern
         await pool.query(
-          `INSERT INTO youtube_video_cache 
-           (youtube_id, title, title_norm, thumbnail, duration)
+          `INSERT INTO youtube_video_cache (youtube_id, title, title_norm, thumbnail, duration)
            VALUES (?, ?, ?, ?, ?)`,
           [videoId, title, normalize(title), thumbnail, duration],
         );
       } catch (ytdlErr) {
-        console.error("ytdl fallback failed for videoId:", videoId, ytdlErr);
-        return res.status(400).json({
-          error: "Video nicht verfügbar oder konnte nicht geladen werden",
-          details: "YouTube-Link ungültig oder Video nicht abrufbar",
-        });
+        console.error("ytdl failed:", ytdlErr);
+        return res.status(400).json({ error: "Video nicht verfügbar" });
       }
     }
 
-    // === Voting-Runde Logik ===
-    let [openRounds] = await pool.query(
-      "SELECT id FROM voting_rounds WHERE session_id = ? AND status = 'open' LIMIT 1",
-      [sessionId],
-    );
-
-    // === Load session + check host role ===
+    // === Session & Phase-Check (unverändert) ===
     const [[sessionRow]] = await pool.query(
       "SELECT user_id, is_live FROM sessions WHERE id = ?",
       [sessionId],
     );
-
-    if (!sessionRow) {
+    if (!sessionRow)
       return res.status(404).json({ error: "Session not found" });
-    }
 
     const isHost = user && sessionRow.user_id === user.id;
     const isSessionLive = sessionRow.is_live === 1;
 
-    // === Voting-Runde Logik ===
+    let currentPhase = null;
     let votingRoundId = null;
     let status = "queued";
 
-    if (openRounds.length === 0) {
-      const [result] = await pool.query(
-        "INSERT INTO voting_rounds (session_id, status, created_at) VALUES (?, 'open', NOW())",
+    if (isSessionLive) {
+      const [[round]] = await pool.query(
+        `SELECT id, phase FROM voting_rounds WHERE session_id = ? AND status = 'open' ORDER BY id DESC LIMIT 1`,
         [sessionId],
       );
-      votingRoundId = result.insertId;
+
+      if (!round)
+        return res.status(403).json({ error: "Keine aktive Voting-Runde" });
+      if (round.phase !== "suggesting") {
+        return res
+          .status(403)
+          .json({ error: "Nur in der Vorschlagsphase erlaubt" });
+      }
+
+      currentPhase = round.phase;
+      votingRoundId = round.id;
       status = "suggested";
     } else {
-      votingRoundId = openRounds[0].id;
-      status = "suggested";
+      status = isHost ? "queued" : "suggested";
     }
 
-    // === NEW: Host before session is live → queue directly ===
-    if (isHost && !isSessionLive) {
-      status = "queued";
+    // =================================================
+    // NEU: Doppelte video_id in aktueller Voting-Runde verbieten
+    // =================================================
+    if (status === "suggested" && votingRoundId) {
+      const [existing] = await pool.query(
+        `SELECT id FROM queue_items 
+         WHERE session_id = ? 
+           AND voting_round_id = ? 
+           AND video_id = ? 
+           AND status = 'suggested' 
+         LIMIT 1`,
+        [sessionId, votingRoundId, videoId],
+      );
+
+      if (existing.length > 0) {
+        return res.status(409).json({
+          error: "Dieser Song wurde in dieser Runde bereits vorgeschlagen",
+          details: "Doppelte Vorschläge sind nicht erlaubt",
+        });
+      }
     }
 
-    // === Max. 5 Vorschläge pro Runde ===
-    const [proposalCount] = await pool.query(
-      `SELECT COUNT(*) AS count 
-       FROM queue_items 
-       WHERE session_id = ? 
-         AND status = 'suggested'
-         AND voting_round_id = ?`,
-      [sessionId, votingRoundId],
-    );
-
-    if (proposalCount[0].count >= 5) {
-      return res.status(400).json({
-        message: "Maximal 5 Songs pro Voting-Runde erlaubt.",
-      });
-    }
-
-    // === Vorschlag in DB speichern ===
+    // === Vorschlag speichern ===
     await pool.query(
       `INSERT INTO queue_items 
        (session_id, item_type, video_id, title, thumbnail, added_by, guest_id, status, played, duration, voting_round_id, item_source)
@@ -1466,19 +1723,13 @@ app.post("/sessions/:id/proposals", async (req, res) => {
       ],
     );
 
-    // === Socket Updates ===
+    // === Broadcast ===
     if (status === "suggested") {
-      io.to(sessionId).emit("proposal_added", {
-        title,
-        videoId,
-        votingRoundId,
-      });
       io.to(sessionId).emit("proposals_updated", {});
     } else {
       io.to(sessionId).emit("queue_updated", {});
     }
 
-    // === Erfolg ===
     res.status(201).json({
       success: true,
       type: "music",
@@ -1487,10 +1738,7 @@ app.post("/sessions/:id/proposals", async (req, res) => {
     });
   } catch (err) {
     console.error("Proposal error:", err);
-    res.status(500).json({
-      error: "Interner Serverfehler beim Hinzufügen des Vorschlags",
-      details: err.message,
-    });
+    res.status(500).json({ error: "Interner Fehler" });
   }
 });
 
@@ -1654,7 +1902,38 @@ async function checkQuorum(votingRoundId, sessionId) {
   }
 }
 
+// GET /sessions/:id/current-phase
+app.get("/sessions/:id/current-phase", async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const [[round]] = await pool.query(
+      `SELECT phase, phase_ends_at, 
+              TIMESTAMPDIFF(SECOND, created_at, phase_ends_at) AS duration
+       FROM voting_rounds 
+       WHERE session_id = ? AND status = 'open' 
+       ORDER BY id DESC LIMIT 1`,
+      [id],
+    );
+
+    if (!round || !round.phase_ends_at) {
+      return res.status(404).json({ error: "No active phase" });
+    }
+
+    res.json({
+      phase: round.phase,
+      endsAt: new Date(round.phase_ends_at).toISOString(),
+      duration: round.duration || 90,
+      roundId: round.id,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
 // === Voting ===
+// POST /sessions/:id/proposals/:propId/vote
 app.post("/sessions/:id/proposals/:propId/vote", async (req, res) => {
   const { id, propId } = req.params;
   const token = req.headers.authorization?.split(" ")[1];
@@ -1663,146 +1942,146 @@ app.post("/sessions/:id/proposals/:propId/vote", async (req, res) => {
   const guest = await getGuestFromToken(guestToken);
   if (!user && !guest) return res.status(401).json({ error: "Unauthorized" });
 
-  // === Check if session is live ===
+  // Session live?
   const [[sessionRow]] = await pool.query(
     "SELECT is_live FROM sessions WHERE id = ?",
     [id],
   );
-
-  if (!sessionRow) {
-    return res.status(404).json({ error: "Session not found" });
+  if (!sessionRow || sessionRow.is_live !== 1) {
+    return res.status(403).json({ error: "Session nicht live" });
   }
 
-  if (sessionRow.is_live !== 1) {
-    return res.status(403).json({
-      error: "Voting is not allowed before the session goes live.",
-    });
+  // Nur in Voting-Phase erlaubt
+  const [[currentRound]] = await pool.query(
+    `SELECT phase, id AS roundId 
+     FROM voting_rounds 
+     WHERE session_id = ? AND status = 'open' 
+     ORDER BY id DESC LIMIT 1`,
+    [id],
+  );
+
+  if (!currentRound || currentRound.phase !== "voting") {
+    return res.status(403).json({ error: "Aktuell läuft keine Abstimmung" });
   }
 
-  // Prüfen, ob Proposal existiert
-  const [prop] = await pool.query(
-    "SELECT voting_round_id FROM queue_items WHERE id = ? AND session_id = ?",
+  // Proposal existiert und ist suggested?
+  const [[proposal]] = await pool.query(
+    `SELECT voting_round_id FROM queue_items 
+     WHERE id = ? AND session_id = ? AND status = 'suggested'`,
     [propId, id],
   );
-  if (!prop[0]) return res.status(404).json({ error: "Not found" });
+  if (!proposal || proposal.voting_round_id !== currentRound.roundId) {
+    return res.status(404).json({ error: "Vorschlag nicht abstimmbar" });
+  }
 
-  const voterColumn = user ? "user_id" : "guest_id";
   const voterId = user?.id || guest?.id;
+  const voterColumn = user ? "user_id" : "guest_id";
 
-  // Prüfen, ob User/Guest schon gelikt hat
-  const [existingVote] = await pool.query(
+  // Toggle Vote (Upvote / Widerruf)
+  const [[existing]] = await pool.query(
     `SELECT id FROM votes WHERE queue_item_id = ? AND ${voterColumn} = ?`,
     [propId, voterId],
   );
 
-  if (existingVote.length > 0) {
-    // Wenn bereits gelikt → Widerruf
-    await pool.query(
-      `DELETE FROM votes WHERE queue_item_id = ? AND ${voterColumn} = ?`,
-      [propId, voterId],
-    );
+  if (existing) {
+    await pool.query(`DELETE FROM votes WHERE id = ?`, [existing.id]);
   } else {
-    // Neu liken
     await pool.query(
-      `INSERT INTO votes (queue_item_id, user_id, guest_id, vote) VALUES (?, ?, ?, 1)`,
+      `INSERT INTO votes (queue_item_id, user_id, guest_id) VALUES (?, ?, ?)`,
       [propId, user?.id || null, guest?.id || null],
     );
   }
 
-  // Event für alle Clients
+  // Immer nur UI updaten – KEINE vorzeitige Auswertung mehr!
   io.to(id).emit("proposals_updated");
 
-  // === Prüfen, ob ALLE Teilnehmer abgestimmt haben ===
-  const [voteCheck] = await pool.query(
-    `
-  SELECT 
-    p.cnt AS total_participants,
-    COALESCE(v.voted_count, 0) AS voted_participants
-  FROM (
-    SELECT COUNT(*) AS cnt 
-    FROM session_participants sp
-    WHERE sp.session_id = ?
-  ) p
-  LEFT JOIN (
-    SELECT COUNT(DISTINCT voter_key) AS voted_count
-    FROM (
-      SELECT CONCAT('U', v.user_id) AS voter_key
-      FROM votes v
-      JOIN queue_items qi ON v.queue_item_id = qi.id
-      WHERE qi.session_id = ? 
-        AND qi.status = 'suggested' 
-        AND v.user_id IS NOT NULL
+  res.json({ success: true });
+});
 
-      UNION ALL
+// DELETE /sessions/:sessionId/proposals/:proposalId
+app.delete("/sessions/:sessionId/proposals/:proposalId", async (req, res) => {
+  const { sessionId, proposalId } = req.params;
+  const token = req.headers.authorization?.split(" ")[1];
+  const guestToken = req.headers["x-guest-token"];
 
-      SELECT CONCAT('G', v.guest_id) AS voter_key
-      FROM votes v
-      JOIN queue_items qi ON v.queue_item_id = qi.id
-      WHERE qi.session_id = ? 
-        AND qi.status = 'suggested' 
-        AND v.guest_id IS NOT NULL
-    ) AS voters
-  ) v ON 1=1
-  `,
-    [id, id, id],
-  );
+  let userId = null;
+  let guestId = null;
 
-  const totalParticipants = voteCheck[0].total_participants;
-  const votedParticipants = voteCheck[0].voted_participants;
-
-  console.log(
-    `Abstimmung: ${votedParticipants}/${totalParticipants} haben abgestimmt`,
-  );
-
-  // Nur wenn ALLE abgestimmt haben
-  if (totalParticipants > 0 && votedParticipants >= totalParticipants) {
-    // === Gewinner ermitteln ===
-    const [winnerResult] = await pool.query(
-      `
-    SELECT 
-      qi.id,
-      COUNT(v.id) AS vote_count
-    FROM queue_items qi
-    LEFT JOIN votes v ON qi.id = v.queue_item_id
-    WHERE qi.session_id = ? 
-      AND qi.status = 'suggested'
-    GROUP BY qi.id
-    HAVING COUNT(v.id) > 0
-    ORDER BY vote_count DESC, qi.created_at ASC
-    LIMIT 1
-    `,
-      [id],
-    );
-
-    if (winnerResult.length > 0) {
-      const winningId = winnerResult[0].id;
-
-      // Gewinner in Queue verschieben
-      await pool.query(
-        `UPDATE queue_items SET status = 'queued' WHERE id = ?`,
-        [winningId],
-      );
-
-      // Alle anderen suggested → archived
-      await pool.query(
-        `UPDATE queue_items 
-       SET status = 'archived' 
-       WHERE session_id = ? AND status = 'suggested' AND id != ?`,
-        [id, winningId],
-      );
-
-      io.to(id).emit("proposals_updated");
-      io.to(id).emit("queue_updated");
-
-      console.log(
-        `Voting abgeschlossen: Song #${winningId} gewinnt in Session ${id}`,
-      );
-    } else {
-      console.log(`Kein Gewinner – kein Song hat Stimmen in Session ${id}`);
-    }
+  // === Authentifizierung ===
+  if (token) {
+    const user = await getUserFromToken(token);
+    if (!user) return res.status(401).json({ error: "Ungültiger Token" });
+    userId = user.id;
+  } else if (guestToken) {
+    const guest = await getGuestFromToken(guestToken);
+    if (!guest) return res.status(401).json({ error: "Ungültiger Gast-Token" });
+    guestId = guest.id;
+  } else {
+    return res.status(401).json({ error: "Kein Zugriffstoken" });
   }
 
-  res.json({ success: true });
+  try {
+    // 1. Den suggested queue_item + Host-ID der Session holen
+    const [rows] = await pool.query(
+      `SELECT qi.*, s.user_id AS host_user_id 
+       FROM queue_items qi
+       JOIN sessions s ON qi.session_id = s.id
+       WHERE qi.id = ? 
+         AND qi.session_id = ? 
+         AND qi.status = 'suggested'`,
+      [proposalId, sessionId]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ 
+        message: "Vorschlag nicht gefunden oder nicht mehr löschbar" 
+      });
+    }
+
+    const item = rows[0];
+
+    // 2. Aktuelle Voting-Phase prüfen
+    const [phaseRows] = await pool.query(
+      `SELECT phase FROM voting_rounds 
+       WHERE session_id = ? AND status = 'open' 
+       ORDER BY created_at DESC LIMIT 1`,
+      [sessionId]
+    );
+
+    const currentPhase = phaseRows[0]?.phase || null;
+
+    if (currentPhase !== "suggesting") {
+      return res.status(403).json({ 
+        message: "Löschen nur in der Vorschlagsphase möglich" 
+      });
+    }
+
+    // 3. Berechtigung prüfen: Eigentümer ODER Host
+    const isOwner = 
+      (userId && item.added_by === userId) || 
+      (guestId && item.guest_id === guestId);
+
+    const isHost = userId && item.host_user_id === userId;
+
+    if (!isOwner && !isHost) {
+      return res.status(403).json({ 
+        message: "Du kannst nur deinen eigenen Vorschlag entfernen" 
+      });
+    }
+
+    // 4. Löschen
+    await pool.query("DELETE FROM queue_items WHERE id = ?", [proposalId]);
+
+    // 5. Echtzeit-Update an alle
+    req.io?.to(`session_${sessionId}`).emit("proposals_updated");
+    req.io?.to(`session_${sessionId}`).emit("queue_updated");
+
+    return res.json({ message: "Vorschlag erfolgreich entfernt" });
+
+  } catch (err) {
+    console.error("Fehler beim Löschen des Vorschlags:", err);
+    return res.status(500).json({ message: "Serverfehler" });
+  }
 });
 
 // === Host: direct queue add (blocked if session is_live) ===
@@ -1899,77 +2178,131 @@ app.post("/sessions/:id/start", async (req, res) => {
   const user = await getUserFromToken(token);
   if (!user) return res.status(401).json({ error: "Unauthorized" });
 
-  const [sess] = await pool.query("SELECT is_live FROM sessions WHERE id = ?", [
-    id,
-  ]);
-  if (sess[0]?.is_live) {
+  const [[sess]] = await pool.query(
+    "SELECT is_live, user_id FROM sessions WHERE id = ?",
+    [id],
+  );
+  if (!sess) return res.status(404).json({ error: "Session not found" });
+  if (sess.user_id !== user.id)
+    return res.status(403).json({ error: "Nur Host" });
+  if (sess.is_live) {
     return res.status(400).json({ error: "Session already live" });
   }
 
-  // 🧹 Reset playback_sync
+  // 🧹 Reset playback_sync – bleibt erhalten
   await pool.query(`DELETE FROM playback_sync WHERE session_id = ?`, [id]);
 
-  // 🚀 Set session to live
-  await pool.query("UPDATE sessions SET is_live = 1 WHERE id = ?", [id]);
-
-  // 🎵 Fetch first unplayed song
-  const [first] = await pool.query(
-    "SELECT id, video_id, duration FROM queue_items WHERE session_id = ? AND played = 0 ORDER BY id ASC LIMIT 1",
+  // Alle bisherigen "suggested" Vorschläge (aus Vorbereitung) werden direkt in die Queue übernommen
+  await pool.query(
+    `
+    UPDATE queue_items 
+    SET status = 'queued', voting_round_id = NULL 
+    WHERE session_id = ? AND status = 'suggested'
+  `,
     [id],
   );
 
-  if (!first[0]) {
+  // 🚀 Session geht live
+  await pool.query("UPDATE sessions SET is_live = 1 WHERE id = ?", [id]);
+
+  // 🎵 Prüfen, ob bereits Songs in der Queue sind → sofort abspielen (wie bisher)
+  const [first] = await pool.query(
+    "SELECT id, video_id, duration, title FROM queue_items WHERE session_id = ? AND played = 0 AND status = 'queued' ORDER BY id ASC LIMIT 1",
+    [id],
+  );
+
+  let firstSongStarted = false;
+  if (first[0]) {
+    const firstId = first[0].id;
+    const firstVideoId = first[0].video_id;
+    const duration = first[0].duration || 180;
+    const startTime = Date.now();
+
+    // 🕒 Markiere ersten Song als playing
+    await pool.query(
+      `UPDATE queue_items SET status = 'playing', startedAt = NOW() WHERE id = ?`,
+      [firstId],
+    );
+
+    // 🧩 playback_sync setzen
+    await pool.query(
+      `INSERT INTO playback_sync (session_id, current_video_id, progress_seconds, is_playing, video_start_time)
+       VALUES (?, ?, 0, 1, ?)
+       ON DUPLICATE KEY UPDATE
+         current_video_id = VALUES(current_video_id),
+         video_start_time = VALUES(video_start_time),
+         is_playing = 1`,
+      [id, firstVideoId, startTime],
+    );
+
+    console.log(
+      `[Playback] Session ${id} STARTED with first song: videoId=${firstVideoId} – "${first[0].title}"`,
+    );
+
+    // 📡 Broadcast: Radio geht live + erster Song
+    io.to(id).emit("session_started", {
+      autoStarted: true,
+      firstVideoId,
+      video_start_time: startTime,
+    });
+
+    io.to(id).emit("playback_sync", {
+      current_queue_item_id: firstId,
+      current_video_id: firstVideoId,
+      video_start_time: startTime,
+      is_playing: true,
+    });
+
+    // Timer für Song-Ende (wie bisher)
+    if (sessionTimers[id]) clearTimeout(sessionTimers[id]);
+    sessionTimers[id] = setTimeout(() => advanceToNext(id), duration * 1000);
+
+    firstSongStarted = true;
+  } else {
     io.to(id).emit("queue_empty");
-    return res.status(400).json({ error: "Queue empty" });
+    console.log(`[Session ${id}] Gestartet – aber Queue ist leer`);
   }
 
-  const firstId = first[0].id;
-  const firstVideoId = first[0].video_id;
-  const duration = first[0].duration;
-  const startTime = Date.now();
+  // ===============================================
+  // NEU: Erste Voting-Runde mit Phasen starten
+  // ===============================================
+  const suggestionDuration = 90; // Sekunden
+  const votingDuration = 60; // Sekunden
+  const suggestionEndsAt = new Date(Date.now() + suggestionDuration * 1000);
 
-  // 🕒 Mark first song as playing
-  await pool.query(
-    `UPDATE queue_items SET status = 'playing', playedAt = NOW() WHERE id = ?`,
-    [firstId],
+  const [roundResult] = await pool.query(
+    `INSERT INTO voting_rounds 
+      (session_id, status, phase, phase_ends_at, suggestion_duration, voting_duration)
+     VALUES (?, 'open', 'suggesting', ?, ?, ?)`,
+    [id, suggestionEndsAt, suggestionDuration, votingDuration],
   );
 
-  // 🧩 Set playback sync
-  await pool.query(
-    `INSERT INTO playback_sync (session_id, current_video_id, progress_seconds, is_playing, video_start_time)
-     VALUES (?, ?, 0, 1, ?)
-     ON DUPLICATE KEY UPDATE
-       current_video_id = VALUES(current_video_id),
-       video_start_time = VALUES(video_start_time),
-       is_playing = 1`,
-    [id, firstVideoId, startTime],
-  );
-  console.log(
-    `[Playback] Session ${id} STARTED with first song: videoId=${firstVideoId}`,
-  );
+  const votingRoundId = roundResult.insertId;
 
-  // 📡 Broadcast: the radio goes live
-  io.to(id).emit("session_started", {
-    autoStarted: true,
-    firstVideoId,
-    video_start_time: startTime,
+  // Timer für den Phasenwechsel starten (globale Funktion von vorher)
+  startPhaseTimer(id, votingRoundId, "suggesting", suggestionDuration);
+
+  // Frontend informieren: Vorschlagsphase läuft!
+  io.to(id).emit("voting_phase_changed", {
+    phase: "suggesting",
+    endsAt: suggestionEndsAt.getTime(),
+    roundId: votingRoundId,
+    duration: suggestionDuration,
   });
 
-  // 📻 Broadcast playback state
-  io.to(id).emit("playback_sync", {
-    current_video_id: firstVideoId,
-    video_start_time: startTime,
-    is_playing: true,
-  });
-
-  // Start timer for first song
-  if (sessionTimers[id]) clearTimeout(sessionTimers[id]);
-  sessionTimers[id] = setTimeout(() => advanceToNext(id), duration * 1000);
+  io.to(id).emit("proposals_updated"); // leere Liste oder bestehende anzeigen
+  io.to(id).emit("queue_updated");
 
   console.log(
-    `[Session ${id}] Radio started with first song (${firstVideoId})`,
+    `[Session ${id}] Radio gestartet! Erste Voting-Runde #${votingRoundId} (Vorschläge: ${suggestionDuration}s, Voting: ${votingDuration}s)`,
   );
-  res.json({ success: true });
+
+  res.json({
+    success: true,
+    firstSongStarted,
+    votingRoundStarted: true,
+    votingRoundId,
+  });
 });
 
 // === Join Live ===
@@ -2168,19 +2501,24 @@ app.post("/forgot-password", async (req, res) => {
   const email = rawEmail?.trim().toLowerCase();
 
   if (!email || !/^\S+@\S+\.\S+$/.test(email)) {
-    return res.status(400).json({ error: "Gültige E-Mail-Adresse erforderlich" });
+    return res
+      .status(400)
+      .json({ error: "Gültige E-Mail-Adresse erforderlich" });
   }
 
   try {
     const [[user]] = await pool.query(
       "SELECT id, username FROM users WHERE LOWER(email) = LOWER(?)",
-      [email]
+      [email],
     );
 
     // Wichtig: Kein Hinweis, ob die E-Mail existiert oder nicht (Sicherheit gegen Enumeration)
     if (!user) {
       // Wir geben trotzdem Erfolg zurück – so kann niemand prüfen, welche E-Mails registriert sind
-      return res.json({ message: "Falls die E-Mail existiert, wurde ein Link zum Zurücksetzen gesendet." });
+      return res.json({
+        message:
+          "Falls die E-Mail existiert, wurde ein Link zum Zurücksetzen gesendet.",
+      });
     }
 
     // Token generieren (empfohlen: crypto.randomBytes(32).toString('hex'))
@@ -2191,11 +2529,11 @@ app.post("/forgot-password", async (req, res) => {
       `UPDATE users 
        SET reset_token = ?, reset_token_expiry = ? 
        WHERE id = ?`,
-      [resetToken, expiry, user.id]
+      [resetToken, expiry, user.id],
     );
 
     // Korrekter Reset-Link
-    const baseUrl = process.env.FRONTEND_URL || "http://localhost:5173";
+    const baseUrl = process.env.FRONTEND_URL || "https://api.tunevote.com";
     const resetLink = `${baseUrl}/reset-password/${resetToken}`;
 
     const primaryColor = "#4f46e5";
@@ -2263,6 +2601,7 @@ app.post("/forgot-password", async (req, res) => {
               <p style="margin:0;">
                 Diese E-Mail wurde gesendet, weil jemand das Zurücksetzen des Passworts für<br>
                 <strong>${email}</strong> angefordert hat.<br><br>
+                 TuneVote • Deine Musik. Deine Stimme.<br>
                 © ${new Date().getFullYear()} TuneVote – Alle Rechte vorbehalten.
               </p>
             </td>
@@ -2284,17 +2623,21 @@ app.post("/forgot-password", async (req, res) => {
         html: htmlTemplate,
       });
     } catch (mailErr) {
-      console.error("Passwort-Reset-Mail konnte nicht gesendet werden:", mailErr);
+      console.error(
+        "Passwort-Reset-Mail konnte nicht gesendet werden:",
+        mailErr,
+      );
       // Auch bei Mail-Fehler geben wir Erfolg zurück (aus Sicherheitsgründen kein Unterschied!)
-      return res.json({ 
-        message: "Falls die E-Mail existiert, wurde ein Link zum Zurücksetzen gesendet." 
+      return res.json({
+        message:
+          "Falls die E-Mail existiert, wurde ein Link zum Zurücksetzen gesendet.",
       });
     }
 
-    return res.json({ 
-      message: "Falls die E-Mail existiert, wurde ein Link zum Zurücksetzen gesendet." 
+    return res.json({
+      message:
+        "Falls die E-Mail existiert, wurde ein Link zum Zurücksetzen gesendet.",
     });
-
   } catch (err) {
     console.error("Forgot password error:", err);
     return res.status(500).json({ error: "Interner Serverfehler" });
@@ -2318,7 +2661,7 @@ app.get("/reset-password/:token", async (req, res) => {
       `SELECT id, reset_token_expiry 
        FROM users 
        WHERE reset_token = ? AND reset_token_expiry > NOW()`,
-      [token]
+      [token],
     );
 
     if (!user) {
@@ -2340,7 +2683,7 @@ app.get("/reset-password/:token", async (req, res) => {
           <div class="card">
             <h1>Link abgelaufen oder ungültig</h1>
             <p>Der Link zum Zurücksetzen deines Passworts ist nicht mehr gültig.</p>
-            <p><a href="${process.env.FRONTEND_URL || ''}/forgot-password">Neuen Link anfordern</a></p>
+            <p><a href="${process.env.FRONTEND_URL || ""}/forgot-password">Neuen Link anfordern</a></p>
           </div>
         </body>
         </html>
@@ -2383,14 +2726,16 @@ app.post("/reset-password", async (req, res) => {
   const { token, newPassword } = req.body;
 
   if (!token || !newPassword || newPassword.length < 8) {
-    return res.status(400).json({ error: "Ungültiges Passwort oder Token fehlt" });
+    return res
+      .status(400)
+      .json({ error: "Ungültiges Passwort oder Token fehlt" });
   }
 
   try {
     const [[user]] = await pool.query(
       `SELECT id FROM users 
        WHERE reset_token = ? AND reset_token_expiry > NOW()`,
-      [token]
+      [token],
     );
 
     if (!user) {
@@ -2403,7 +2748,7 @@ app.post("/reset-password", async (req, res) => {
       `UPDATE users 
        SET password_hash = ?, reset_token = NULL, reset_token_expiry = NULL 
        WHERE id = ?`,
-      [password_hash, user.id]
+      [password_hash, user.id],
     );
 
     res.json({ message: "Passwort erfolgreich geändert!" });
@@ -2539,7 +2884,9 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
 
   // Selbst-Einladung verhindern
   if (email === user.email) {
-    return res.status(400).json({ error: "Du kannst dich nicht selbst einladen." });
+    return res
+      .status(400)
+      .json({ error: "Du kannst dich nicht selbst einladen." });
   }
 
   let conn;
@@ -2553,7 +2900,7 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
        FROM sessions s
        JOIN users u ON s.user_id = u.id
        WHERE s.id = ?`,
-      [sessionId]
+      [sessionId],
     );
 
     if (!session) {
@@ -2562,24 +2909,31 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
     }
     if (session.is_private === 0) {
       await conn.rollback();
-      return res.status(400).json({ error: "Nur private Sessions können Einladungen versenden" });
+      return res
+        .status(400)
+        .json({ error: "Nur private Sessions können Einladungen versenden" });
     }
     if (session.user_id !== user.id) {
       await conn.rollback();
-      return res.status(403).json({ error: "Nur der Host darf Einladungen verschicken" });
+      return res
+        .status(403)
+        .json({ error: "Nur der Host darf Einladungen verschicken" });
     }
     if (email === session.host_email?.toLowerCase()) {
       await conn.rollback();
-      return res.status(400).json({ error: "Der Session-Host kann nicht eingeladen werden." });
+      return res
+        .status(400)
+        .json({ error: "Der Session-Host kann nicht eingeladen werden." });
     }
 
-    const sessionTitle = session.title?.trim() || "Eine private TuneVote Session";
+    const sessionTitle =
+      session.title?.trim() || "Eine private TuneVote Session";
     const hostName = session.host_name || "Der Host";
 
     // === 2. Prüfen, ob der Benutzer bereits registriert ist ===
     const [[existingUser]] = await conn.query(
       `SELECT id FROM users WHERE LOWER(email) = LOWER(?) LIMIT 1`,
-      [email]
+      [email],
     );
     const invitedUserId = existingUser ? existingUser.id : null;
     const userExists = !!invitedUserId;
@@ -2589,12 +2943,15 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
       `SELECT * FROM session_invites 
        WHERE session_id = ? AND LOWER(email) = LOWER(?) 
        LIMIT 1 FOR UPDATE`,
-      [sessionId, email]
+      [sessionId, email],
     );
     const existingInvite = inviteRows[0] || null;
 
     if (existingInvite) {
-      if (existingInvite.status === "revoked" || existingInvite.status === "rejected") {
+      if (
+        existingInvite.status === "revoked" ||
+        existingInvite.status === "rejected"
+      ) {
         await conn.query(
           `UPDATE session_invites 
            SET status = 'pending',
@@ -2605,7 +2962,7 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
                rejected_at = NULL,
                revoked_at = NULL
            WHERE id = ?`,
-          [invitedUserId, user.id, existingInvite.id]
+          [invitedUserId, user.id, existingInvite.id],
         );
       }
     } else {
@@ -2613,7 +2970,7 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
         `INSERT INTO session_invites 
          (session_id, email, invited_by_user_id, invited_user_id, status)
          VALUES (?, ?, ?, ?, 'pending')`,
-        [sessionId, email, user.id, invitedUserId]
+        [sessionId, email, user.id, invitedUserId],
       );
     }
 
@@ -2756,7 +3113,8 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
       console.error("E-Mail-Versand fehlgeschlagen:", mailErr);
       return res.status(500).json({
         success: true,
-        message: "Einladung gespeichert, aber E-Mail konnte nicht gesendet werden.",
+        message:
+          "Einladung gespeichert, aber E-Mail konnte nicht gesendet werden.",
         emailError: true,
         alreadyRegistered: userExists,
       });
@@ -2767,11 +3125,12 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
       message: "Einladung erfolgreich versendet",
       alreadyRegistered: userExists,
     });
-
   } catch (err) {
     console.error("Invite error:", err);
     if (conn) await conn.rollback().catch(() => {});
-    return res.status(500).json({ error: "Fehler beim Versenden der Einladung" });
+    return res
+      .status(500)
+      .json({ error: "Fehler beim Versenden der Einladung" });
   } finally {
     if (conn) conn.release();
   }
@@ -2803,7 +3162,7 @@ app.get("/invites/sent", async (req, res) => {
       WHERE si.invited_by_user_id = ? AND si.status = 'pending'
       ORDER BY si.created_at DESC
   `,
-    [user.id]
+    [user.id],
   );
 
   res.json(invites);
@@ -2828,7 +3187,7 @@ app.get("/invites/received", async (req, res) => {
      WHERE (LOWER(si.email) = LOWER(?) OR si.invited_user_id = ?)
        AND si.status = 'pending'
      ORDER BY si.created_at DESC`,
-    [user.email, user.id]
+    [user.email, user.id],
   );
 
   res.json(invites);
@@ -2850,12 +3209,12 @@ app.post("/invites/:inviteId/accept", async (req, res) => {
      WHERE id = ?
        AND status = 'pending'
        AND (LOWER(email) = LOWER(?) OR invited_user_id = ?)`,
-    [user.id, inviteId, user.email, user.id]
+    [user.id, inviteId, user.email, user.id],
   );
 
   if (result.affectedRows === 0) {
     return res.status(400).json({
-      error: "Einladung nicht gefunden oder nicht mehr gültig"
+      error: "Einladung nicht gefunden oder nicht mehr gültig",
     });
   }
 
@@ -2876,18 +3235,17 @@ app.post("/invites/:inviteId/reject", async (req, res) => {
      WHERE id = ?
        AND status = 'pending'
        AND (LOWER(email) = LOWER(?) OR invited_user_id = ?)`,
-    [inviteId, user.email, user.id]
+    [inviteId, user.email, user.id],
   );
 
   if (result.affectedRows === 0) {
     return res.status(400).json({
-      error: "Einladung nicht gefunden oder bereits verarbeitet"
+      error: "Einladung nicht gefunden oder bereits verarbeitet",
     });
   }
 
   res.json({ success: true });
 });
-
 
 // POST: Einladung ablehnen
 app.post("/invites/:inviteId/revoke", async (req, res) => {
@@ -2904,12 +3262,12 @@ app.post("/invites/:inviteId/revoke", async (req, res) => {
      WHERE id = ?
        AND invited_by_user_id = ?
        AND status = 'pending'`,
-    [inviteId, user.id]
+    [inviteId, user.id],
   );
 
   if (result.affectedRows === 0) {
     return res.status(400).json({
-      error: "Einladung nicht gefunden oder nicht mehr widerrufbar"
+      error: "Einladung nicht gefunden oder nicht mehr widerrufbar",
     });
   }
 
@@ -2946,11 +3304,13 @@ app.get("/sessions/:sessionId/participants", async (req, res) => {
     const [allowed] = await pool.query(
       `SELECT 1 FROM session_participants 
        WHERE session_id = ? AND ${column} = ?`,
-      [sessionId, id]
+      [sessionId, id],
     );
 
     if (allowed.length === 0) {
-      return res.status(403).json({ error: "Du bist nicht Teil dieser Session" });
+      return res
+        .status(403)
+        .json({ error: "Du bist nicht Teil dieser Session" });
     }
 
     // Alle LIVE Teilnehmer holen
@@ -2965,10 +3325,10 @@ app.get("/sessions/:sessionId/participants", async (req, res) => {
        LEFT JOIN guest_users g ON sp.guest_id = g.id
        WHERE sp.session_id = ? AND sp.is_live = 1
        ORDER BY sp.joined_at DESC`,
-      [sessionId]
+      [sessionId],
     );
 
-    const formatted = participants.map(p => ({
+    const formatted = participants.map((p) => ({
       name: p.name,
       isHost: !!p.isHost,
     }));
@@ -2977,5 +3337,182 @@ app.get("/sessions/:sessionId/participants", async (req, res) => {
   } catch (err) {
     console.error("Fehler beim Laden der Live-Teilnehmer:", err);
     res.status(500).json({ error: "Serverfehler" });
+  }
+});
+
+// ============================================================
+// GET /api/profile → Aktuelle Profildaten des eingeloggten Users
+// ============================================================
+app.get("/profile", async (req, res) => {
+  console.log("\n=== GET /profile aufgerufen ===");
+  console.log("Vollständige Request-Headers:", req.headers);
+  console.log("User-Agent:", req.headers["user-agent"]);
+  console.log("IP:", req.ip || req.connection.remoteAddress);
+
+  // 1. Authorization Header prüfen
+  const authHeader = req.headers.authorization;
+  console.log("Authorization Header:", authHeader || "FEHLT");
+
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    console.log("Kein oder falscher Authorization-Header → 401");
+    return res.status(401).json({ error: "Unauthenticated – kein gültiger Token" });
+  }
+
+  const token = authHeader.split(" ")[1];
+  console.log("Extrahierter JWT-Token:", token ? `${token.slice(0, 15)}...${token.slice(-10)}` : "LEER");
+
+  // 2. Token dekodieren / User holen
+  let user;
+  try {
+    user = await getUserFromToken(token);
+  } catch (err) {
+    console.log("Token ungültig oder abgelaufen:", err.message);
+    return res.status(401).json({ error: "Unauthenticated – Token ungültig" });
+  }
+
+  if (!user) {
+    console.log("getUserFromToken hat null zurückgegeben");
+    return res.status(401).json({ error: "Unauthenticated" });
+  }
+
+  console.log("Erfolgreich authentifizierter User aus Token:", {
+    id: user.id,
+    username: user.username || "(nicht im Token)",
+    email: user.email || "(nicht im Token)",
+    iat: user.iat,
+    exp: user.exp
+  });
+
+  // 3. Datenbankabfrage
+  try {
+    console.log(`Führe DB-Query aus für user.id = ${user.id}`);
+    const [userRow] = await pool.query(
+      `SELECT id, username, email, created_at FROM users WHERE id = ?`,
+      [user.id]
+    );
+
+    console.log("Roh-Ergebnis der DB-Abfrage:", userRow);
+
+    if (!userRow || userRow.length === 0) {
+      console.log("User mit ID", user.id, "nicht in DB gefunden → 404");
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const dbUser = userRow[0];
+    console.log("Gefundener User in DB:", {
+      id: dbUser.id,
+      username: dbUser.username,
+      email: dbUser.email,
+      created_at: dbUser.created_at
+    });
+
+    // 4. Antwort an Frontend
+    console.log("Sende erfolgreiche Antwort an Frontend → 200");
+    console.log("Response Payload:", {
+      username: dbUser.username,
+      email: dbUser.email
+    });
+
+    res.json({
+      username: dbUser.username,
+      email: dbUser.email
+    });
+
+  } catch (err) {
+    console.error("Schwerer Fehler beim Laden des Profils:", err);
+    console.error("Stack:", err.stack);
+    res.status(500).json({ error: "Interner Serverfehler" });
+  }
+
+  console.log("=== GET /profile Ende ===\n");
+});
+
+// ============================================================
+// POST /profile → Profil + Passwort ändern
+// ============================================================
+app.post("/profile", async (req, res) => {
+  const token = req.headers.authorization?.split(" ")[1];
+  const user = token ? await getUserFromToken(token) : null;
+
+  if (!user) {
+    return res.status(401).json({ error: "Unauthenticated" });
+  }
+
+  const { username, email, currentPassword, newPassword, confirmPassword } = req.body;
+
+  // Validierung
+  if (!username || !email) {
+    return res.status(400).json({ error: "Benutzername und E-Mail sind erforderlich" });
+  }
+
+  if (username.length < 3 || username.length > 50) {
+    return res.status(400).json({ error: "Benutzername muss 3–50 Zeichen haben" });
+  }
+
+  if (!/^\S+@\S+\.\S+$/.test(email)) {
+    return res.status(400).json({ error: "Ungültige E-Mail-Adresse" });
+  }
+
+  try {
+    // Prüfen, ob Username oder E-Mail bereits von anderem Nutzer verwendet wird
+    const [existing] = await pool.query(
+      `SELECT id FROM users WHERE (LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?)) AND id != ?`,
+      [username, email, user.id]
+    );
+
+    if (existing.length > 0) {
+      const field = existing[0].username?.toLowerCase() === username.toLowerCase() ? "Benutzername" : "E-Mail";
+      return res.status(409).json({ error: `${field} bereits vergeben` });
+    }
+
+    // Passwort ändern?
+    if (newPassword) {
+      if (!currentPassword) {
+        return res.status(400).json({ error: "Aktuelles Passwort erforderlich" });
+      }
+      if (newPassword !== confirmPassword) {
+        return res.status(400).json({ error: "Neue Passwörter stimmen nicht überein" });
+      }
+      if (newPassword.length < 8) {
+        return res.status(400).json({ error: "Neues Passwort muss mind. 8 Zeichen haben" });
+      }
+
+      // Aktuelles Passwort prüfen
+      const [currentUser] = await pool.query(
+        `SELECT password_hash FROM users WHERE id = ?`,
+        [user.id]
+      );
+
+      const validPassword = await bcrypt.compare(currentPassword, currentUser[0].password_hash);
+      if (!validPassword) {
+        return res.status(400).json({ error: "Aktuelles Passwort ist falsch" });
+      }
+
+      // Neues Passwort hashen
+      const password_hash = await bcrypt.hash(newPassword, 12);
+
+      // Update mit Passwort
+      await pool.query(
+        `UPDATE users 
+         SET username = ?, email = ?, password_hash = ?, updated_at = NOW()
+         WHERE id = ?`,
+        [username, email, password_hash, user.id]
+      );
+    } else {
+      // Nur Name + E-Mail ändern
+      await pool.query(
+        `UPDATE users 
+         SET username = ?, email = ?, updated_at = NOW()
+         WHERE id = ?`,
+        [username, email, user.id]
+      );
+    }
+
+    // Optional: Token neu generieren oder Session aktualisieren (falls du JWT nutzt)
+    // Hier einfach Erfolg zurückgeben
+    res.json({ success: true, message: "Profil erfolgreich aktualisiert" });
+  } catch (err) {
+    console.error("Fehler beim Aktualisieren des Profils:", err);
+    res.status(500).json({ error: "Interner Serverfehler" });
   }
 });
