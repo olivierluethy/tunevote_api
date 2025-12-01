@@ -1036,7 +1036,7 @@ app.get("/join", async (req, res) => {
     }
 
     const sessionId = sessions[0].id;
-    const joinUrl = `https://tunevote.com/session/${sessionId}`;
+    const joinUrl = `http://localhost:5173 /session/${sessionId}`;
 
     // JSON mit Weiterleitungs-URL zurückgeben
     res.json({ redirect: joinUrl });
@@ -1062,6 +1062,61 @@ app.get("/sessions/:id", async (req, res) => {
   if (!sess[0]) return res.status(404).json({ error: "Not found" });
 
   res.json({ ...sess[0], hostId: sess[0].user_id, is_live: !!sess[0].is_live });
+});
+
+// === PATCH: Session-Namen ändern (nur Host!) ===
+app.patch("/sessions/:id", async (req, res) => {
+  const { id } = req.params;
+  const { title } = req.body;
+
+  // Authentifizierung
+  const token = req.headers.authorization?.split(" ")[1];
+  const guestToken = req.headers["x-guest-token"];
+  const user = token ? await getUserFromToken(token) : null;
+  const guest = guestToken ? await getGuestFromToken(guestToken) : null;
+
+  if (!user && !guest) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  // Nur angemeldete User (keine Gäste!) dürfen Session-Namen ändern
+  if (!user) {
+    return res.status(403).json({ error: "Gäste dürfen den Session-Namen nicht ändern" });
+  }
+
+  // Validierung
+  if (!title || typeof title !== "string" || title.trim().length < 1 || title.trim().length > 100) {
+    return res.status(400).json({ error: "Ungültiger Name (1–100 Zeichen)" });
+  }
+
+  const cleanTitle = title.trim();
+
+  try {
+    // Prüfen, ob Session existiert und der User der Host ist
+    const [rows] = await pool.query(
+      "SELECT user_id FROM sessions WHERE id = ?",
+      [id]
+    );
+
+    if (!rows[0]) {
+      return res.status(404).json({ error: "Session nicht gefunden" });
+    }
+
+    if (rows[0].user_id !== user.id) {
+      return res.status(403).json({ error: "Nur der Host darf den Namen ändern" });
+    }
+
+    // Update durchführen
+    await pool.query(
+      "UPDATE sessions SET title = ? WHERE id = ?",
+      [cleanTitle, id]
+    );
+
+    res.json({ success: true, title: cleanTitle });
+  } catch (err) {
+    console.error("Fehler beim Umbenennen der Session:", err);
+    res.status(500).json({ error: "Interner Serverfehler" });
+  }
 });
 
 // === Queue endpoints ===
@@ -2533,7 +2588,7 @@ app.post("/forgot-password", async (req, res) => {
     );
 
     // Korrekter Reset-Link
-    const baseUrl = process.env.FRONTEND_URL || "https://tunevote.com";
+    const baseUrl = process.env.FRONTEND_URL || "http://localhost:5173 ";
     const resetLink = `${baseUrl}/reset-password/${resetToken}`;
 
     const primaryColor = "#4f46e5";
@@ -2977,7 +3032,7 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
     await conn.commit();
 
     // === 4. E-Mail-Inhalte je nach Registrierungsstatus unterscheiden ===
-    const baseUrl = process.env.FRONTEND_URL || "https://tunevote.com";
+    const baseUrl = process.env.FRONTEND_URL || "http://localhost:5173 ";
     const dashboardLink = `${baseUrl}/dashboard`;
     const primaryColor = "#4f46e5";
 
