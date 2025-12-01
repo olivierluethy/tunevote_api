@@ -957,6 +957,7 @@ app.get("/sessions", async (req, res) => {
         ON si.session_id = s.id 
        AND si.email = ?
        AND si.accepted_at IS NOT NULL                 -- WICHTIG: nur akzeptierte!
+       AND si.status != 'revoked'
       WHERE 
         s.is_private = 0                               -- öffentlich
         OR s.user_id = ?                                -- eigener Host
@@ -1613,6 +1614,100 @@ app.post("/sessions/:id/recommendations/add", async (req, res) => {
     console.error("Add recommendation error:", err);
     res.status(500).json({ error: "Failed to add song" });
   }
+});
+
+app.get("/sessions/:id/invites/accepted", async (req, res) => {
+  const sessionId = parseInt(req.params.id, 10);
+
+  // === 1. Token prüfen (genau wie in deinen anderen Routes) ===
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith("Bearer ") ? authHeader.split(" ")[1] : null;
+  const guestToken = req.headers["x-guest-token"];
+
+  let user = null;
+  if (token) {
+    user = await getUserFromToken(token);
+  }
+  // Gäste dürfen diese Route NICHT nutzen
+  if (!user || guestToken) {
+    return res.status(401).json({ error: "Nur eingeloggte User (keine Gäste) dürfen diese Route nutzen" });
+  }
+
+  try {
+    // === 2. Session direkt per SQL holen + Berechtigung prüfen ===
+    const [sessionRows] = await pool.query(
+      `SELECT id, user_id, title, is_private, is_live 
+       FROM sessions 
+       WHERE id = ? 
+       LIMIT 1`,
+      [sessionId]
+    );
+
+    if (sessionRows.length === 0) {
+      return res.status(404).json({ message: "Session nicht gefunden" });
+    }
+
+    const session = sessionRows[0];
+
+    if (session.is_private !== 1) {
+      return res.status(400).json({ message: "Session ist nicht privat" });
+    }
+
+    if (session.user_id !== user.id) {
+      return res.status(403).json({ message: "Nur der Host darf die akzeptierten Einladungen sehen" });
+    }
+
+    // === 3. Akzeptierte Einladungen holen ===
+    const [invites] = await pool.query(
+      `SELECT 
+          si.id,
+          si.email AS invitee_email,
+          si.invited_user_id,
+          u.username AS invitee_name,
+          si.accepted_at
+       FROM session_invites si
+       LEFT JOIN users u ON si.invited_user_id = u.id
+       WHERE si.session_id = ?
+         AND si.status = 'accepted'
+       ORDER BY si.accepted_at DESC`,
+      [sessionId]
+    );
+
+    // === 4. Perfektes Format für dein Frontend ===
+    const formatted = invites.map(invite => ({
+      id: invite.id,
+      invitee_email: invite.invitee_email,
+      invitee_name: invite.invitee_name || null,
+      accepted_at: invite.accepted_at,
+    }));
+
+    return res.json(formatted);
+
+  } catch (err) {
+    console.error("Fehler in GET /sessions/:id/invites/accepted:", err);
+    return res.status(500).json({ message: "Interner Serverfehler" });
+  }
+});
+
+app.delete("/sessions/:id/invites/:inviteId", async (req, res) => {
+  const sessionId = parseInt(req.params.id);
+  const inviteId = parseInt(req.params.inviteId);
+
+  const token = req.headers.authorization?.split(" ")[1];
+  const user = token ? await getUserFromToken(token) : null;
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+
+  const [session] = await pool.query("SELECT user_id FROM sessions WHERE id = ?", [sessionId]);
+  if (!session || session[0].user_id !== user.id) {
+    return res.status(403).json({ message: "Nur Host" });
+  }
+
+  await pool.query(
+    "UPDATE session_invites SET status = 'revoked', revoked_at = NOW() WHERE id = ? AND session_id = ?",
+    [inviteId, sessionId]
+  );
+
+  res.json({ success: true });
 });
 
 // === Proposals endpoint (POST) ===
