@@ -1037,7 +1037,7 @@ app.get("/join", async (req, res) => {
     }
 
     const sessionId = sessions[0].id;
-    const joinUrl = `http://localhost:5173 /session/${sessionId}`;
+    const joinUrl = `http://localhost:5173/session/${sessionId}`;
 
     // JSON mit Weiterleitungs-URL zurückgeben
     res.json({ redirect: joinUrl });
@@ -3343,32 +3343,76 @@ app.get("/invites/received", async (req, res) => {
   res.json(invites);
 });
 
-// POST: Einladung annehmen - Wenn Benutzer bereits abgelehnt hat, soll es nicht mehr funktionieren
+// POST: Einladung annehmen + Socket.IO Event an Host schicken
 app.post("/invites/:inviteId/accept", async (req, res) => {
-  const { inviteId } = req.params;
+  const inviteId = parseInt(req.params.inviteId, 10);
   const token = req.headers.authorization?.split(" ")[1];
   const user = token ? await getUserFromToken(token) : null;
   if (!user) return res.status(401).json({ error: "Unauthenticated" });
 
-  const [result] = await pool.query(
-    `UPDATE session_invites
-     SET status = 'accepted',
-         accepted_at = NOW(),
-         invited_user_id = COALESCE(invited_user_id, ?),
-         updated_at = NOW()
-     WHERE id = ?
-       AND status = 'pending'
-       AND (LOWER(email) = LOWER(?) OR invited_user_id = ?)`,
-    [user.id, inviteId, user.email, user.id],
-  );
+  let connection;
+  try {
+    connection = await pool.getConnection();
+    await connection.beginTransaction();
 
-  if (result.affectedRows === 0) {
-    return res.status(400).json({
-      error: "Einladung nicht gefunden oder nicht mehr gültig",
-    });
+    // 1. Invite mit Session-Info und aktuellem Status holen + sperren
+    const [invites] = await connection.query(
+      `SELECT si.*, s.user_id AS host_id 
+       FROM session_invites si
+       JOIN sessions s ON si.session_id = s.id
+       WHERE si.id = ? 
+         AND si.status = 'pending'
+         AND (LOWER(si.email) = LOWER(?) OR si.invited_user_id = ?)
+       FOR UPDATE`,
+      [inviteId, user.email, user.id]
+    );
+
+    if (invites.length === 0) {
+      await connection.rollback();
+      return res.status(400).json({
+        error: "Einladung nicht gefunden, bereits bearbeitet oder nicht für dich",
+      });
+    }
+
+    const invite = invites[0];
+
+    // 2. Einladung als akzeptiert markieren
+    await connection.query(
+      `UPDATE session_invites 
+       SET status = 'accepted',
+           accepted_at = NOW(),
+           invited_user_id = COALESCE(invited_user_id, ?),
+           updated_at = NOW()
+       WHERE id = ?`,
+      [user.id, inviteId]
+    );
+
+    await connection.commit();
+
+    // 3. Fertiges Objekt für Frontend + Socket.IO bauen
+    const formattedInvite = {
+      id: invite.id,
+      invitee_email: invite.email,
+      invitee_name: user.username || null,           // wichtig!
+      accepted_at: new Date().toISOString(),
+    };
+
+    // 4. Socket.IO Event nur an den Host der Session schicken
+    io.to(`session-host-${invite.session_id}`).emit("invite:accepted", formattedInvite);
+
+    // Optional: auch global an alle im Session-Raum (falls Co-Hosts etc.)
+    // io.to(`session-${invite.session_id}`).emit("invite:accepted", formattedInvite);
+
+    // 5. Erfolgreiche Antwort ans Frontend (kann der Client ignorieren, weil er ja eh updatet)
+    return res.json({ success: true, invite: formattedInvite });
+
+  } catch (err) {
+    if (connection) await connection.rollback();
+    console.error("Fehler beim Akzeptieren der Einladung:", err);
+    return res.status(500).json({ error: "Interner Serverfehler" });
+  } finally {
+    if (connection) connection.release();
   }
-
-  res.json({ success: true });
 });
 
 app.post("/invites/:inviteId/reject", async (req, res) => {
