@@ -10,6 +10,7 @@ const axios = require("axios");
 const crypto = require("crypto");
 const ytdl = require("ytdl-core");
 const nodemailer = require("nodemailer");
+const multer = require('multer');
 
 const transporter = nodemailer.createTransport({
   service: "gmail",
@@ -329,6 +330,9 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
     [winnerId || null, roundId]
   );
 
+  // 🔥 NEU: Top-Charts aktualisieren, weil ein Song jetzt aktiv ist!
+await broadcastTodayTopArtists(io);
+
   // === Broadcast ===
   io.to(sessionId).emit("voting_round_completed", { winnerId, roundId });
   io.to(sessionId).emit("queue_updated");
@@ -341,7 +345,7 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
       `
       INSERT INTO voting_rounds
         (session_id, status, phase, phase_ends_at, suggestion_duration, voting_duration)
-      VALUES (?, 'open', 'suggesting', ?, 90, 60)
+      VALUES (?, 'open', 'suggestion', ?, 90, 60)
       `,
       [sessionId, newEnds]
     );
@@ -430,6 +434,9 @@ const advanceToNext = async (sessionId) => {
         `UPDATE queue_items SET status = 'played', played = 1, playedAt = NOW() WHERE id = ?`,
         [currentId],
       );
+
+      // 🔥 Optional: Auch hier broadcasten (falls played-Songs mitzählen sollen)
+await broadcastTodayTopArtists(io);
       console.log(`[Session ${sessionId}] Marked played: #${currentId}`);
     }
 
@@ -489,7 +496,7 @@ const advanceToNext = async (sessionId) => {
           );
           if (userProposal.length > 0) winnerId = userProposal[0].id;
           else {
-            // 3. Random AI song if live users exist and ≥3 AI songs
+            // 3. Random AI song if live users exist and ≥3 AI songs (deine Logik prüft nur Existenz, aber Kommentar sagt ≥3 – belassen wie ist)
             const [liveCountRow] = await pool.query(
               `SELECT COUNT(*) AS cnt FROM session_participants WHERE session_id = ? AND is_live = 1`,
               [sessionId]
@@ -528,6 +535,9 @@ const advanceToNext = async (sessionId) => {
             [winnerId, roundId]
           );
 
+          // 🔥 NEU: Auch hier zählt der Song jetzt mit!
+  await broadcastTodayTopArtists(io);
+
           io.to(sessionId).emit("voting_round_completed", { winnerId, roundId, emergency: true });
           io.to(sessionId).emit("proposals_updated");
           io.to(sessionId).emit("queue_updated");
@@ -544,7 +554,7 @@ const advanceToNext = async (sessionId) => {
       }
     }
 
-    // 3) Still no song? → End session properly
+    // 3) Still no song? → End session properly (with extra safety check)
     if (!next) {
       const [activeParticipants] = await pool.query(
         `SELECT COUNT(*) AS cnt FROM session_participants WHERE session_id = ? AND is_live = 1`,
@@ -555,14 +565,28 @@ const advanceToNext = async (sessionId) => {
         [sessionId]
       );
 
-      if (activeParticipants[0].cnt === 0 && openRounds[0].cnt === 0) {
-        // Really end session
+      // NEUE PRÜFUNG: Gibt es noch einen aktiven "playing" Eintrag?
+      const [currentlyPlaying] = await pool.query(
+        `SELECT COUNT(*) AS cnt FROM queue_items WHERE session_id = ? AND status = 'playing'`,
+        [sessionId]
+      );
+
+      const noActiveUsers = activeParticipants[0].cnt === 0;
+      const noOpenVoting = openRounds[0].cnt === 0;
+      const nothingPlaying = currentlyPlaying[0].cnt === 0;
+
+      if (noActiveUsers && noOpenVoting && nothingPlaying) {
+        // Jetzt wirklich sicher: nichts läuft mehr → Session beenden
         await pool.query(`UPDATE sessions SET is_live = 0 WHERE id = ?`, [sessionId]);
         await pool.query(`UPDATE session_participants SET is_live = 0 WHERE session_id = ?`, [sessionId]);
         io.to(sessionId).emit("session_ended");
-        console.log(`[Session ${sessionId}] Session ended (no songs, no users, no voting)`);
+        console.log(`[Session ${sessionId}] Session ended (no songs playing, no queued next, no users, no voting)`);
       } else {
-        console.log(`[Session ${sessionId}] No song to play, but users/voting active → waiting...`);
+        let reasons = [];
+        if (!noActiveUsers) reasons.push("active users");
+        if (!noOpenVoting) reasons.push("open voting");
+        if (!nothingPlaying) reasons.push("song currently playing");
+        console.log(`[Session ${sessionId}] No song to play next, but session stays alive → ${reasons.join(", ")}`);
       }
       return;
     }
@@ -1385,7 +1409,8 @@ Instructions:
       let bestScore = 0;
 
       for (const row of rows) {
-        const score = levenshteinRatio(normalizedAI, row.title_norm);
+        const normalizedCache = normalize(row.title_norm);  // jetzt wirklich genutzt!
+        const score = levenshteinRatio(normalizedAI, normalizedCache);
         if (score > bestScore) {
           bestScore = score;
           bestMatch = row;
@@ -2145,7 +2170,10 @@ app.post("/sessions/:id/proposals/:propId/vote", async (req, res) => {
   // Immer nur UI updaten – KEINE vorzeitige Auswertung mehr!
   io.to(id).emit("proposals_updated");
 
-  res.json({ success: true });
+// 🔥 NEU: Top-Charts aktualisieren (Votes zählen ja mit!)
+await broadcastTodayTopArtists(io);
+
+res.json({ success: true });
 });
 
 // DELETE /sessions/:sessionId/proposals/:proposalId
@@ -2423,7 +2451,7 @@ app.post("/sessions/:id/start", async (req, res) => {
   const [roundResult] = await pool.query(
     `INSERT INTO voting_rounds 
       (session_id, status, phase, phase_ends_at, suggestion_duration, voting_duration)
-     VALUES (?, 'open', 'suggesting', ?, ?, ?)`,
+     VALUES (?, 'open', 'suggestion', ?, ?, ?)`,
     [id, suggestionEndsAt, suggestionDuration, votingDuration],
   );
 
@@ -2554,6 +2582,17 @@ app.post("/sessions/:id/join-live", async (req, res) => {
     });
 
     await broadcastLiveParticipants(parseInt(id, 10));
+    
+    const [[{ count }]] = await pool.query(
+  "SELECT COUNT(*) AS count FROM session_participants WHERE session_id = ? AND is_live = 1",
+  [parseInt(id, 10)]
+);
+
+io.emit("participant_count_update", {
+  sessionId: parseInt(id, 10),
+  count: count || 0,
+});
+
     res.json({ success: true });
   } catch (err) {
     console.error("❌ [JOIN-LIVE] Error occurred:", err);
@@ -2630,6 +2669,16 @@ app.post("/sessions/:id/leave-live", async (req, res) => {
     );
 
     await broadcastLiveParticipants(sessionIdInt);
+    
+    const [[{ count }]] = await pool.query(
+  "SELECT COUNT(*) AS count FROM session_participants WHERE session_id = ? AND is_live = 1",
+  [parseInt(id, 10)]
+);
+
+io.emit("participant_count_update", {
+  sessionId: parseInt(id, 10),
+  count: count || 0,
+});
     res.json({ success: true });
   } catch (err) {
     console.error("❌ [LEAVE-LIVE] Error occurred:", err);
@@ -3577,46 +3626,57 @@ app.get("/profile", async (req, res) => {
     exp: user.exp
   });
 
-  // 3. Datenbankabfrage
-  try {
-    console.log(`Führe DB-Query aus für user.id = ${user.id}`);
-    const [userRow] = await pool.query(
-      `SELECT id, username, email, created_at FROM users WHERE id = ?`,
-      [user.id]
-    );
+  // 3. Datenbankabfrage – jetzt MIT Profilbild-Daten
+try {
+  console.log(`Führe DB-Query aus für user.id = ${user.id}`);
+  const [userRow] = await pool.query(
+    `SELECT 
+       id, 
+       username, 
+       email, 
+       created_at,
+       imageType,
+       imageData 
+     FROM users 
+     WHERE id = ?`,
+    [user.id]
+  );
 
-    console.log("Roh-Ergebnis der DB-Abfrage:", userRow);
+  console.log("Roh-Ergebnis der DB-Abfrage:", userRow);
 
-    if (!userRow || userRow.length === 0) {
-      console.log("User mit ID", user.id, "nicht in DB gefunden → 404");
-      return res.status(404).json({ error: "User not found" });
-    }
+  if (!userRow || userRow.length === 0) {
+    console.log("User mit ID", user.id, "nicht in DB gefunden → 404");
+    return res.status(404).json({ error: "User not found" });
+  }
 
-    const dbUser = userRow[0];
-    console.log("Gefundener User in DB:", {
-      id: dbUser.id,
-      username: dbUser.username,
-      email: dbUser.email,
-      created_at: dbUser.created_at
-    });
+  const dbUser = userRow[0];
+  console.log("Gefundener User in DB (inkl. Bild):", {
+    id: dbUser.id,
+    username: dbUser.username,
+    email: dbUser.email,
+    hasImage: !!(dbUser.imageType && dbUser.imageData)
+  });
 
-    // 4. Antwort an Frontend
+  // 4. Antwort an Frontend – jetzt mit imageType und imageData
     console.log("Sende erfolgreiche Antwort an Frontend → 200");
-    console.log("Response Payload:", {
-      username: dbUser.username,
-      email: dbUser.email
-    });
+    console.log("imageData type:", typeof dbUser.imageData);
+    console.log("imageData is Buffer:", Buffer.isBuffer(dbUser.imageData));
+    console.log("imageData length:", dbUser.imageData?.length);
 
     res.json({
-      username: dbUser.username,
-      email: dbUser.email
-    });
+    username: dbUser.username,
+    email: dbUser.email,
+    imageType: dbUser.imageType || null,
+        imageData: dbUser.imageData
+      ? dbUser.imageData.toString('base64')  // Direkt vom Buffer → Base64
+      : null,
+  });
 
-  } catch (err) {
-    console.error("Schwerer Fehler beim Laden des Profils:", err);
-    console.error("Stack:", err.stack);
-    res.status(500).json({ error: "Interner Serverfehler" });
-  }
+} catch (err) {
+  console.error("Schwerer Fehler beim Laden des Profils:", err);
+  console.error("Stack:", err.stack);
+  res.status(500).json({ error: "Interner Serverfehler" });
+}
 
   console.log("=== GET /profile Ende ===\n");
 });
@@ -3710,3 +3770,383 @@ app.post("/profile", async (req, res) => {
     res.status(500).json({ error: "Interner Serverfehler" });
   }
 });
+
+app.get("/profile/user-stats", async (req, res) => {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Unauthenticated – kein Token" });
+  }
+
+  const token = authHeader.split(" ")[1];
+
+  try {
+    user = await getUserFromToken(token);
+    if (!user || !user.id) {
+      return res.status(401).json({ error: "Ungültiger Token" });
+    }
+  } catch (err) {
+    return res.status(401).json({ error: "Ungültiger Token" });
+  }
+
+  const userId = user.id;
+
+  try {
+    // Hilfsfunktion: Extrahiere Zahl aus [rows, fields] → rows[0]?.value || 0
+    const getValue = (result, field = "count") => {
+      return result && result[0] && result[0][0] ? Number(result[0][0][field] || 0) : 0;
+    };
+
+    const getSingleRowValue = (result, field) => {
+      if (!result || !result[0] || result[0].length === 0) return 0;
+      return Number(result[0][0][field] || 0);
+    };
+
+    const [
+      votesOnOwnSuggestionsRes,
+      winsAgainstQueueRes,
+      maxStreakWinsRes,
+      votesOnOwnButLostRes,
+      votesOnOthersAndWonRes,
+      votesOnOthersAndLostRes,
+      streaksForeignVotesRes,
+      sessionsWithoutVoteRes,
+      maxStreakNoVoteRes,
+    ] = await Promise.all([
+      // 1. Wie oft wurde über eigene Vorschläge abgestimmt?
+      pool.query(`
+        SELECT COUNT(DISTINCT v.queue_item_id) AS count
+        FROM votes v
+        JOIN queue_items qi ON v.queue_item_id = qi.id
+        WHERE qi.added_by = ?
+      `, [userId]),
+
+      // 2. Wie oft hat der User mit eigenem Vorschlag gewonnen?
+      pool.query(`
+        SELECT COUNT(*) AS count
+        FROM voting_rounds vr
+        JOIN queue_items qi ON vr.winner_queue_item_id = qi.id
+        WHERE qi.added_by = ?
+      `, [userId]),
+
+      // 3. Längster Gewinn-Streak (aufeinanderfolgende Siege mit eigenem Song)
+      pool.query(`
+        WITH wins AS (
+          SELECT vr.started_at
+          FROM voting_rounds vr
+          JOIN queue_items qi ON vr.winner_queue_item_id = qi.id
+          WHERE qi.added_by = ?
+          ORDER BY vr.started_at
+        ),
+        ranked AS (
+          SELECT 
+            started_at,
+            ROW_NUMBER() OVER (ORDER BY started_at) AS rn,
+            ROW_NUMBER() OVER (ORDER BY started_at) AS grp
+          FROM wins
+        )
+        SELECT MAX(rn - grp + 1) AS max_streak
+        FROM ranked
+      `, [userId]),
+
+      // 4. Eigener Song bekam Votes, hat aber NICHT gewonnen
+      pool.query(`
+        SELECT COUNT(DISTINCT qi.id) AS count
+        FROM queue_items qi
+        JOIN votes v ON v.queue_item_id = qi.id
+        LEFT JOIN voting_rounds vr ON qi.voting_round_id = vr.id AND vr.winner_queue_item_id = qi.id
+        WHERE qi.added_by = ? AND vr.winner_queue_item_id IS NULL
+      `, [userId]),
+
+      // 5. Auf fremden Song gevotet → der hat gewonnen
+
+      // Gewonnen heisst wenn queued_items status auf "queued", "playing", "played" ist
+      // added_by NOT logged IN User ID
+      // votes WHERE user_id = logged IN User ID
+      // AND queue_items equals to votes.queue_items_id = queued_items.id
+      pool.query(`
+  SELECT COUNT(*) AS count
+  FROM votes v
+  JOIN queue_items qi ON v.queue_item_id = qi.id
+  WHERE v.user_id = ?
+    AND qi.added_by != ?
+    AND qi.added_by IS NOT NULL                    -- kein AI-Vorschlag
+    AND qi.voting_round_id IS NOT NULL             -- war definitiv ein Voting-Vorschlag
+    AND qi.status IN ('queued', 'playing', 'played')  -- hat es in die echte Queue geschafft → gewonnen
+`, [userId, userId]),
+
+      // 6. Auf fremden Song gevotet → der hat verloren
+      pool.query(`
+        SELECT COUNT(*) AS count
+        FROM votes v
+        JOIN queue_items qi ON v.queue_item_id = qi.id
+        JOIN voting_rounds vr ON qi.voting_round_id = vr.id
+        WHERE v.user_id = ? 
+          AND qi.added_by != ? 
+          AND (vr.winner_queue_item_id != qi.id OR vr.winner_queue_item_id IS NULL)
+      `, [userId, userId]),
+
+      // 7+8. Streaks: aufeinanderfolgende erfolgreiche / erfolglose Votes auf fremde Songs
+      pool.query(`
+        WITH foreign_votes AS (
+          SELECT 
+            v.created_at,
+            (vr.winner_queue_item_id = qi.id) AS did_win
+          FROM votes v
+          JOIN queue_items qi ON v.queue_item_id = qi.id
+          LEFT JOIN voting_rounds vr ON qi.voting_round_id = vr.id
+          WHERE v.user_id = ? AND qi.added_by != ?
+          ORDER BY v.created_at
+        ),
+        ranked AS (
+          SELECT 
+            did_win,
+            ROW_NUMBER() OVER (ORDER BY created_at) AS rn,
+            ROW_NUMBER() OVER (PARTITION BY did_win ORDER BY created_at) AS grp
+          FROM foreign_votes
+        ),
+        streaks AS (
+          SELECT did_win, MAX(rn - grp + 1) AS streak_length
+          FROM ranked
+          GROUP BY did_win
+        )
+        SELECT 
+          MAX(CASE WHEN did_win = 1 THEN streak_length ELSE 0 END) AS max_winning_streak,
+          MAX(CASE WHEN did_win = 0 THEN streak_length ELSE 0 END) AS max_losing_streak
+        FROM streaks
+      `, [userId, userId]),
+
+      // 9. Anzahl Sessions, in denen der User gar nicht gevotet hat
+      pool.query(`
+        SELECT COUNT(*) AS count
+        FROM sessions s
+        WHERE s.user_id = ?
+          AND NOT EXISTS (
+            SELECT 1 
+            FROM votes v 
+            JOIN queue_items qi ON v.queue_item_id = qi.id 
+            WHERE v.user_id = ? AND qi.session_id = s.id
+          )
+      `, [userId, userId]),
+
+      // 10. Längster Streak von Sessions ohne Vote
+      pool.query(`
+        WITH session_activity AS (
+          SELECT 
+            s.created_at,
+            CASE WHEN EXISTS (
+              SELECT 1 FROM votes v
+              JOIN queue_items qi ON v.queue_item_id = qi.id
+              WHERE v.user_id = ? AND qi.session_id = s.id
+            ) THEN 1 ELSE 0 END AS has_voted
+          FROM sessions s
+          WHERE s.user_id = ?
+          ORDER BY s.created_at
+        ),
+        ranked AS (
+          SELECT 
+            has_voted,
+            ROW_NUMBER() OVER (ORDER BY created_at) AS rn,
+            ROW_NUMBER() OVER (PARTITION BY has_voted ORDER BY created_at) AS grp
+          FROM session_activity
+        )
+        SELECT MAX(CASE WHEN has_voted = 0 THEN (rn - grp + 1) ELSE 0 END) AS max_streak
+        FROM ranked
+      `, [userId, userId]),
+    ]);
+
+    const stats = {
+      votesOnOwnSuggestions: getValue(votesOnOwnSuggestionsRes),
+      winsAgainstQueue: getValue(winsAgainstQueueRes),
+      maxStreakWinsAgainstQueue: getSingleRowValue(maxStreakWinsRes, "max_streak"),
+      votesOnOwnButLost: getValue(votesOnOwnButLostRes),
+      votesOnOthersAndWon: getValue(votesOnOthersAndWonRes),
+      votesOnOthersAndLost: getValue(votesOnOthersAndLostRes),
+      maxStreakVotesOnWinningOthers: getSingleRowValue(streaksForeignVotesRes, "max_winning_streak"),
+      maxStreakVotesOnLosingOthers: getSingleRowValue(streaksForeignVotesRes, "max_losing_streak"),
+      sessionsWithoutVote: getValue(sessionsWithoutVoteRes),
+      maxStreakSessionsWithoutVote: getSingleRowValue(maxStreakNoVoteRes, "max_streak"),
+    };
+
+    res.json(stats);
+
+  } catch (error) {
+    console.error("Error fetching user stats:", error);
+    res.status(500).json({ error: "Interner Serverfehler beim Laden der Statistiken" });
+  }
+});
+
+app.get("/top-today", async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT
+        a.id AS artist_id,
+        a.name AS artist_name,
+        a.image_url,
+        COUNT(v.id) AS vote_count
+      FROM votes v
+      JOIN queue_items qi ON qi.id = v.queue_item_id
+      JOIN youtube_video_cache yvc ON yvc.youtube_id = qi.video_id
+      JOIN artists a ON a.id = yvc.artist_id
+      WHERE DATE(v.created_at) = CURDATE()
+      GROUP BY a.id, a.name, a.image_url
+      ORDER BY vote_count DESC
+       LIMIT 10`,
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error("Top Today error:", err);
+    res.status(500).json({ error: "Serverfehler" });
+  }
+});
+
+app.get("/top-weekly-songs", async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      `
+      SELECT
+        yvc.youtube_id,
+        yvc.title AS song_title,
+        yvc.thumbnail,
+        a.id AS artist_id,
+        a.name AS artist_name,
+        COUNT(qi.id) AS queue_count
+      FROM queue_items qi
+      JOIN youtube_video_cache yvc ON yvc.youtube_id = qi.video_id
+      JOIN artists a ON a.id = yvc.artist_id
+      WHERE
+        qi.status IN ('played', 'queued')
+        AND YEARWEEK(qi.created_at, 1) = YEARWEEK(CURDATE(), 1)
+      GROUP BY
+        yvc.youtube_id,
+        yvc.title,
+        yvc.thumbnail,
+        a.id,
+        a.name
+      ORDER BY queue_count DESC
+      LIMIT 10
+      `
+    );
+
+    res.json(rows);
+  } catch (err) {
+    console.error("Top Weekly Songs error:", err);
+    res.status(500).json({ error: "Serverfehler" });
+  }
+});
+
+// Multer: Nur eine Datei mit dem Feldnamen "profileImage" akzeptieren
+const upload = multer({
+  storage: multer.memoryStorage(), // Wir speichern temporär im RAM, da wir es direkt als Base64 in die DB schreiben
+  limits: {
+    fileSize: 5 * 1024 * 1024, // Max. 5 MB
+  },
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+    if (allowedTypes.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Nur Bilddateien (JPEG, PNG, GIF, WebP) sind erlaubt'));
+    }
+  },
+});
+
+// Der Endpunkt – Authentifizierung manuell, wie in deinem /sessions-Beispiel
+app.post("/profile/image", upload.single('profileImage'), async (req, res) => {
+  const token = req.headers.authorization?.split(" ")[1];
+  const user = await getUserFromToken(token);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+
+  // 2. Ab hier ist der User authentifiziert → user.id verfügbar
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'Keine Bilddatei hochgeladen' });
+    }
+
+    const imageType = req.file.mimetype; // z. B. "image/jpeg"
+    const imageData = req.file.buffer;  // ← Roh-Bytes, kein Base64!
+
+    // Update in der users-Tabelle
+    const query = `
+      UPDATE users 
+      SET imageType = ?, imageData = ?, updated_at = CURRENT_TIMESTAMP 
+      WHERE id = ?
+    `;
+
+    await pool.query(query, [imageType, imageData, user.id]); 
+    // ← pool.query, wie in deinem Beispiel (nicht db.query)
+
+    // Rückgabe für das Frontend
+    res.json({
+      imageType,
+      imageData: imageData.toString('base64')
+    });
+
+  } catch (err) {
+    console.error('Fehler beim Hochladen des Profilbilds:', err);
+
+    if (err.message === 'Nur Bilddateien sind erlaubt') {
+      return res.status(400).json({ error: 'Nur Bilddateien sind erlaubt' });
+    }
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({ error: 'Bilddatei zu groß (max. 5 MB)' });
+    }
+
+    res.status(500).json({ error: 'Interner Serverfehler beim Speichern des Bildes' });
+  }
+});
+
+app.delete("/profile/image", async (req, res) => {
+  // gleiche Authentifizierung wie bei /profile/image
+  const token = req.headers.authorization?.split(" ")[1];
+  const user = await getUserFromToken(token);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+
+  await pool.query("UPDATE users SET imageType = NULL, imageData = NULL WHERE id = ?", [user.id]);
+  res.json({ imageType: null, imageData: null });
+});
+
+// Irgendwo zentral, z. B. in deiner socket.io oder utils Datei
+// Direkt nach der io-Definition (z. B. nach const io = new Server(...))
+let topArtistsBroadcastTimeout = null;
+
+async function broadcastTodayTopArtists(io) {
+  // Debounce: Max. alle 2 Sekunden broadcasten (verhindert Spam bei vielen Votes)
+  if (topArtistsBroadcastTimeout) {
+    clearTimeout(topArtistsBroadcastTimeout);
+  }
+
+  topArtistsBroadcastTimeout = setTimeout(async () => {
+    try {
+      const [rows] = await pool.query(`
+        SELECT
+          a.id AS artist_id,
+          a.name AS artist_name,
+          a.image_url,
+          COUNT(v.id) AS vote_count
+        FROM votes v
+        JOIN queue_items qi ON qi.id = v.queue_item_id
+        JOIN youtube_video_cache yvc ON yvc.youtube_id = qi.video_id
+        JOIN artists a ON a.id = yvc.artist_id
+        WHERE DATE(v.created_at) = CURDATE()
+          AND qi.status IN ('queued', 'playing', 'played')
+        GROUP BY a.id, a.name, a.image_url
+        ORDER BY vote_count DESC
+        LIMIT 10
+      `);
+
+      // Nur senden, wenn es überhaupt Artists gibt (vermeidet unnötige Events)
+      if (rows.length > 0 || true) { // immer senden, damit Frontend leere Liste erkennt
+        io.emit("today_top_artists_updated", {
+          date: new Date().toISOString().slice(0, 10),
+          artists: rows
+        });
+        console.log("[Live Charts] Top Artists broadcasted →", rows.length, "artists");
+      }
+    } catch (err) {
+      console.error("Error broadcasting today top artists:", err);
+    } finally {
+      topArtistsBroadcastTimeout = null;
+    }
+  }, 1500); // 1,5 Sekunden warten → sammelt mehrere Änderungen
+}
