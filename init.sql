@@ -114,6 +114,7 @@ CREATE TABLE session_participants (
   guest_id INT DEFAULT NULL,
   role ENUM('host', 'user','guest') NOT NULL,
   joined_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  left_at TIMESTAMP NULL,
   is_live TINYINT(1) DEFAULT '0',
   UNIQUE KEY unique_participant (session_id,user_id),
   UNIQUE KEY unique_guest (session_id,guest_id),
@@ -206,3 +207,124 @@ CREATE TABLE voting_rounds (
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE session_song_listens (
+  id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+
+  session_id INT NOT NULL,
+  queue_item_id INT NOT NULL,
+
+  user_id INT NULL,
+  guest_id INT NULL,
+
+  listened_from DATETIME NOT NULL,
+  listened_to DATETIME NOT NULL,
+
+  listen_seconds INT NOT NULL,
+  completed TINYINT(1) DEFAULT 0,
+
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+  -- Constraints
+  CHECK (
+    (user_id IS NOT NULL AND guest_id IS NULL)
+    OR
+    (user_id IS NULL AND guest_id IS NOT NULL)
+  ),
+
+  INDEX idx_session_song (session_id, queue_item_id),
+  INDEX idx_user (user_id),
+  INDEX idx_guest (guest_id),
+
+  FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+  FOREIGN KEY (queue_item_id) REFERENCES queue_items(id) ON DELETE CASCADE,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (guest_id) REFERENCES guest_users(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE badges (
+  id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+
+  -- Eindeutiger technischer Key (für Backend-Logik)
+  key_name VARCHAR(50) NOT NULL UNIQUE,
+
+  -- Anzeige
+  title VARCHAR(100) NOT NULL,
+  description VARCHAR(255) NOT NULL,
+
+  -- Einordnung
+  category ENUM(
+    'progression',
+    'listener',
+    'host',
+    'social',
+    'engagement',
+    'special'
+  ) NOT NULL,
+
+  -- Darstellung (Frontend)
+  icon VARCHAR(100) DEFAULT NULL,     -- z. B. Emoji oder Icon-Key
+  color VARCHAR(20) DEFAULT NULL,     -- z. B. hex oder CSS-Name
+
+  -- Metadaten
+  rarity ENUM('common','uncommon','rare','epic','legendary')
+    DEFAULT 'common',
+
+  -- Flags
+  is_hidden TINYINT(1) DEFAULT 0,      -- Secret / Überraschungs-Badges
+  is_active TINYINT(1) DEFAULT 1,      -- deaktivierbar ohne Löschen
+
+  -- Zeitliche Einschränkung (optional)
+  available_from DATETIME DEFAULT NULL,
+  available_until DATETIME DEFAULT NULL,
+
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE user_badges (
+  id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL,
+  badge_id INT NOT NULL,
+  awarded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+  UNIQUE KEY unique_user_badge (user_id, badge_id),
+
+  FOREIGN KEY (user_id)
+    REFERENCES users(id) ON DELETE CASCADE,
+
+  FOREIGN KEY (badge_id)
+    REFERENCES badges(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE user_badge_progress (
+  user_id INT NOT NULL,
+  badge_id INT NOT NULL,
+  current_value INT NOT NULL,
+  target_value INT NOT NULL,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ON UPDATE CURRENT_TIMESTAMP,
+
+  PRIMARY KEY (user_id, badge_id),
+
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (badge_id) REFERENCES badges(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+INSERT INTO badges (key_name, title, description, category, icon) VALUES
+('beginner', 'Beginner', 'Erste Session gehört', 'progression', '🌱'),
+('regular', 'Regular', '10 Sessions gehört', 'progression', '🎧'),
+('legend', 'Legende', '100 Sessions gehört', 'progression', '🏆'),
+
+('first_listen', 'First Listen', 'Ersten Song gehört', 'listener', '▶️'),
+('music_lover', 'Music Lover', '500 Minuten Musik gehört', 'listener', '❤️'),
+('marathon', 'Marathon', '2 Stunden in einer Session gehört', 'listener', '⏱️'),
+
+('first_host', 'First Session', 'Erste Session erstellt', 'host', '🎤'),
+('session_master', 'Session Master', '10 Sessions erstellt', 'host', '🎚️'),
+('crowd_host', 'Crowd Host', 'Session mit 5 Hörern', 'host', '👥'),
+
+('voter', 'Voter', '10 Votes abgegeben', 'social', '👍'),
+('trendsetter', 'Trendsetter', 'Eigener Song 5× gehört', 'social', '🔥'),
+('collaborator', 'Collaborator', '5 gemeinsame Sessions', 'social', '🤝');
