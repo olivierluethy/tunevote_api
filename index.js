@@ -419,10 +419,88 @@ const parseIsoDuration = (iso) => {
   return seconds;
 };
 
+async function finalizeListeningForCurrentSong(sessionId) {
+  // 1. Aktuellen Song holen
+  const [rows] = await pool.query(
+    `
+    SELECT id, startedAt, duration
+    FROM queue_items
+    WHERE session_id = ? AND status = 'playing'
+    LIMIT 1
+    `,
+    [sessionId]
+  );
+
+  if (rows.length === 0) return;
+
+  const song = rows[0];
+  if (!song.startedAt || !song.duration) return;
+
+  const songStart = new Date(song.startedAt);
+  const songEnd = new Date(songStart.getTime() + song.duration * 1000);
+
+  // 2. Teilnehmer mit Zeitüberschneidung holen
+  const [participants] = await pool.query(
+    `
+    SELECT *
+    FROM session_participants
+    WHERE session_id = ?
+      AND joined_at <= ?
+      AND (left_at IS NULL OR left_at >= ?)
+    `,
+    [sessionId, songEnd, songStart]
+  );
+
+  // 3. Für jeden Teilnehmer Listening berechnen
+  for (const p of participants) {
+    const listenedFrom = new Date(
+      Math.max(songStart.getTime(), new Date(p.joined_at).getTime())
+    );
+
+    const listenedTo = new Date(
+      Math.min(
+        songEnd.getTime(),
+        p.left_at ? new Date(p.left_at).getTime() : songEnd.getTime()
+      )
+    );
+
+    const listenSeconds = Math.floor(
+      (listenedTo - listenedFrom) / 1000
+    );
+
+    // zu kurz? ignorieren
+    if (listenSeconds <= 5) continue;
+
+    const completed = listenSeconds >= song.duration * 0.9 ? 1 : 0;
+
+    await pool.query(
+      `
+      INSERT INTO session_song_listens
+        (session_id, queue_item_id, user_id, guest_id,
+         listened_from, listened_to, listen_seconds, completed)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        sessionId,
+        song.id,
+        p.user_id,
+        p.guest_id,
+        listenedFrom,
+        listenedTo,
+        listenSeconds,
+        completed
+      ]
+    );
+  }
+}
+
 // Advance to next queue item — Identifikation ausschließlich über queue_items.id / status
 // Advance to next queue item — NOW WITH EMERGENCY AUTO-PROMOTION FROM VOTING
 const advanceToNext = async (sessionId) => {
   try {
+    // 🔥 NEU: Listening für aktuellen Song abschließen
+    await finalizeListeningForCurrentSong(sessionId);
+
     // 1) Mark current playing as played
     const [playingRows] = await pool.query(
       `SELECT id FROM queue_items WHERE session_id = ? AND status = 'playing' LIMIT 1`,
@@ -1687,6 +1765,8 @@ app.get("/sessions/:id/invites/accepted", async (req, res) => {
       `SELECT 
           si.id,
           si.email AS invitee_email,
+          u.imageType,
+          u.imageData,
           si.invited_user_id,
           u.username AS invitee_name,
           si.accepted_at
@@ -1698,15 +1778,24 @@ app.get("/sessions/:id/invites/accepted", async (req, res) => {
       [sessionId]
     );
 
-    // === 4. Perfektes Format für dein Frontend ===
-    const formatted = invites.map(invite => ({
+  // === 4. Perfektes Format für dein Frontend ===
+  const formatted = invites.map(invite => {
+    let imageData = null;
+
+    if (invite.imageData && invite.imageType) {
+      imageData = `data:${invite.imageType};base64,${invite.imageData.toString("base64")}`;
+    }
+
+    return {
       id: invite.id,
       invitee_email: invite.invitee_email,
       invitee_name: invite.invitee_name || null,
       accepted_at: invite.accepted_at,
-    }));
+      imageData,
+    };
+  });
 
-    return res.json(formatted);
+  return res.json(formatted);
 
   } catch (err) {
     console.error("Fehler in GET /sessions/:id/invites/accepted:", err);
@@ -2554,17 +2643,30 @@ app.post("/sessions/:id/join-live", async (req, res) => {
         existing[0],
       );
       await pool.query(
-        `UPDATE session_participants SET is_live = 1, role = ? WHERE session_id = ? AND ${column} = ?`,
-        [role, parseInt(id, 10), parseInt(participantId, 10)],
-      );
+  `
+  UPDATE session_participants 
+  SET 
+    is_live = 1,
+    role = ?,
+    left_at = NULL
+  WHERE session_id = ? AND ${column} = ?
+  `,
+  [role, id, participantId]
+);
+
     } else {
       console.log(
         "🆕 [JOIN-LIVE] Participant not found in DB. Inserting new record.",
       );
       await pool.query(
-        `INSERT INTO session_participants (session_id, ${column}, role, is_live) VALUES (?, ?, ?, 1)`,
-        [parseInt(id, 10), parseInt(participantId, 10), role],
-      );
+  `
+  INSERT INTO session_participants 
+    (session_id, ${column}, role, is_live, joined_at)
+  VALUES (?, ?, ?, 1, NOW())
+  `,
+  [id, participantId, role]
+);
+
     }
 
     // === Final DB check ===
@@ -2648,7 +2750,7 @@ app.post("/sessions/:id/leave-live", async (req, res) => {
     console.log("📝 [LEAVE-LIVE] DB state before leaving:", beforeUpdate);
 
     await pool.query(
-      `UPDATE session_participants SET is_live = 0 WHERE session_id = ? AND ${column} = ?`,
+      `UPDATE session_participants SET left_at = NOW(), is_live = 0 WHERE session_id = ? AND ${column} = ?`,
       [sessionIdInt, participantIdInt],
     );
 
@@ -3562,7 +3664,9 @@ app.get("/sessions/:sessionId/participants", async (req, res) => {
          sp.id,
          sp.role,
          COALESCE(u.username, g.nickname, 'Gast') AS name,
-         (sp.role = 'host') AS isHost
+         (sp.role = 'host') AS isHost,
+        u.imageType,
+        u.imageData
        FROM session_participants sp
        LEFT JOIN users u ON sp.user_id = u.id
        LEFT JOIN guest_users g ON sp.guest_id = g.id
@@ -3571,10 +3675,19 @@ app.get("/sessions/:sessionId/participants", async (req, res) => {
       [sessionId],
     );
 
-    const formatted = participants.map((p) => ({
+    const formatted = participants.map((p) => {
+    let profileImage = null;
+
+    if (p.imageType && p.imageData) {
+      profileImage = `data:${p.imageType};base64,${p.imageData.toString("base64")}`;
+    }
+
+    return {
       name: p.name,
       isHost: !!p.isHost,
-    }));
+      profileImage,
+    };
+  });
 
     res.json(formatted);
   } catch (err) {
@@ -3975,6 +4088,170 @@ app.get("/profile/user-stats", async (req, res) => {
     res.status(500).json({ error: "Interner Serverfehler beim Laden der Statistiken" });
   }
 });
+
+// 📊 Listening Summary: Aggregierte Stats, Top-Songs, Top-Artists
+app.get("/profile/listening-summary", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Unauthenticated – kein Token" });
+  }
+
+  const token = authHeader.split(" ")[1];
+
+  let user;
+  try {
+    user = await getUserFromToken(token);
+    if (!user || !user.id) {
+      return res.status(401).json({ error: "Ungültiger Token" });
+    }
+  } catch (err) {
+    return res.status(401).json({ error: "Ungültiger Token" });
+  }
+
+  const userId = user.id;
+
+  try {
+    const [
+      [listeningMinutesRows],
+      [topHeardSongsRows],
+      [topArtistsRows],
+    ] = await Promise.all([
+      pool.query(
+        `SELECT
+           FLOOR(SUM(listen_seconds) / 60) AS total_minutes,
+           COUNT(DISTINCT session_id) AS sessions_count,
+           COUNT(*) AS song_listens
+         FROM session_song_listens
+         WHERE user_id = ?`,
+        [userId]
+      ),
+      pool.query(
+        `SELECT
+           q.title,
+           y.thumbnail,
+           SUM(s.listen_seconds) AS total_seconds,
+           COUNT(*) AS listens
+         FROM session_song_listens s
+         JOIN queue_items q ON q.id = s.queue_item_id
+         LEFT JOIN youtube_video_cache y ON y.youtube_id = q.video_id
+         WHERE s.user_id = ?
+         GROUP BY q.title, y.thumbnail
+         ORDER BY total_seconds DESC
+         LIMIT 10`,
+        [userId]
+      ),
+      pool.query(
+        `SELECT
+            a.id AS artist_id,
+           a.name,
+           a.image_url,
+           SUM(s.listen_seconds) AS total_seconds
+         FROM session_song_listens s
+         JOIN queue_items q ON q.id = s.queue_item_id
+         JOIN youtube_video_cache y ON y.youtube_id = q.video_id
+         JOIN artists a ON a.id = y.artist_id
+         WHERE s.user_id = ?
+         GROUP BY a.id
+         ORDER BY total_seconds DESC
+         LIMIT 5`,
+        [userId]
+      ),
+    ]);
+
+    res.json({
+      stats: listeningMinutesRows[0] || { total_minutes: 0, sessions_count: 0, song_listens: 0 },
+      topSongs: topHeardSongsRows,
+      topArtists: topArtistsRows,
+    });
+  } catch (err) {
+    console.error("Error fetching listening summary:", err);
+    res.status(500).json({ error: "Fehler beim Laden der Hörstatistiken" });
+  }
+});
+
+// 🕒 Recent Listens: Letzte gehörte Songs
+app.get("/profile/recent-listens", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Unauthenticated – kein Token" });
+  }
+
+  const token = authHeader.split(" ")[1];
+
+  let user;
+  try {
+    user = await getUserFromToken(token);
+    if (!user || !user.id) {
+      return res.status(401).json({ error: "Ungültiger Token" });
+    }
+  } catch (err) {
+    return res.status(401).json({ error: "Ungültiger Token" });
+  }
+
+  const userId = user.id;
+
+  try {
+    const [recentListensRows] = await pool.query(
+      `SELECT
+         q.title,
+         y.thumbnail,
+         s.listened_from,
+         s.listen_seconds,
+         s.completed
+       FROM session_song_listens s
+       JOIN queue_items q ON q.id = s.queue_item_id
+       LEFT JOIN youtube_video_cache y ON y.youtube_id = q.video_id
+       WHERE s.user_id = ?
+       ORDER BY s.listened_from DESC
+       LIMIT 20`,
+      [userId]
+    );
+
+    res.json({ recentListens: recentListensRows });
+  } catch (err) {
+    console.error("Error fetching recent listens:", err);
+    res.status(500).json({ error: "Fehler beim Laden der zuletzt gehörten Songs" });
+  }
+});
+
+app.get("/artist/:artistId", async (req, res) => {
+  const user = await getUserFromToken(req.headers.authorization?.split(" ")[1]);
+  const { artistId } = req.params;
+
+  const [[artist]] = await pool.query(
+    `
+    SELECT
+      a.id,
+      a.name,
+      a.image_url,
+      SUM(s.listen_seconds) AS total_seconds
+    FROM session_song_listens s
+    JOIN queue_items q ON q.id = s.queue_item_id
+    JOIN youtube_video_cache y ON y.youtube_id = q.video_id
+    JOIN artists a ON a.id = y.artist_id
+    WHERE s.user_id = ? AND a.id = ?
+    GROUP BY a.id
+    `,
+    [user.id, artistId]
+  );
+
+  const [topSongs] = await pool.query(
+    `
+    SELECT q.id, q.title, SUM(s.listen_seconds) AS total_seconds
+    FROM session_song_listens s
+    JOIN queue_items q ON q.id = s.queue_item_id
+    JOIN youtube_video_cache y ON y.youtube_id = q.video_id
+    WHERE s.user_id = ? AND y.artist_id = ?
+    GROUP BY q.id
+    ORDER BY total_seconds DESC
+    LIMIT 10
+    `,
+    [user.id, artistId]
+  );
+
+  res.json({ artist, topSongs });
+});
+
 
 app.get("/top-today", async (req, res) => {
   try {
