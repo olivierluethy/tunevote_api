@@ -4302,9 +4302,97 @@ app.get("/artist/:artistId", async (req, res) => {
   }
 });
 
-app.get("/user/:userId", async (req, res)=>{
+app.get("/user/:userId", async (req, res) => {
   const { userId } = req.params;
-})
+
+  try {
+    /* =========================
+       1. Basis-User-Daten
+    ========================= */
+    const [[user]] = await pool.query(
+      `
+      SELECT
+        u.id,
+        u.username,
+        u.imageData,
+        SUM(l.listen_seconds) AS total_seconds
+      FROM users u
+      LEFT JOIN session_song_listens l ON l.user_id = u.id
+      WHERE u.id = ?
+      GROUP BY u.id
+      `,
+      [userId]
+    );
+
+    if (!user) {
+      return res.status(404).json({ error: "User nicht gefunden" });
+    }
+
+    /* =========================
+       2. Top Songs des Users
+       (unique pro Song)
+    ========================= */
+    const [topSongs] = await pool.query(
+      `
+      SELECT
+        q.video_id,
+        MAX(q.title)            AS title,
+        MAX(y.thumbnail)        AS thumbnail,
+        SUM(l.listen_seconds)   AS total_seconds,
+        COUNT(*)                AS listen_count
+      FROM session_song_listens l
+      JOIN queue_items q ON q.id = l.queue_item_id
+      JOIN youtube_video_cache y ON y.youtube_id = q.video_id
+      WHERE l.user_id = ?
+      GROUP BY q.video_id
+      ORDER BY total_seconds DESC
+      LIMIT 10
+      `,
+      [userId]
+    );
+
+    /* =========================
+       3. Top andere User,
+       die mit ihm gehört haben
+    ========================= */
+    const [topUsers] = await pool.query(
+      `
+      SELECT
+        u.id,
+        u.username,
+        u.imageData AS profileImage,
+        SUM(l.listen_seconds) AS total_seconds
+      FROM session_song_listens l
+      JOIN session_song_listens l2
+        ON l.session_id = l2.session_id
+       AND l2.user_id = ?
+       AND l.user_id != l2.user_id
+      JOIN users u ON u.id = l.user_id
+      GROUP BY u.id
+      ORDER BY total_seconds DESC
+      LIMIT 10
+      `,
+      [userId]
+    );
+
+    res.json({
+      user: {
+        id: user.id,
+        username: user.username,
+        image_url: user.imageData
+          ? `data:image/jpeg;base64,${user.imageData.toString("base64")}`
+          : null,
+        total_seconds: user.total_seconds || 0
+      },
+      topSongs,
+      topUsers
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "Serverfehler" });
+  }
+});
+
 
 app.get("/top-today", async (req, res) => {
   try {
