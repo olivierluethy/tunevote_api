@@ -4688,8 +4688,23 @@ app.post("/artist/:artistId/shouts", async (req, res) => {
 app.get("/artist/:artistId/shouts", async (req, res) => {
   const { artistId } = req.params;
 
+  const authHeader = req.headers.authorization;
+  let currentUserId = null;
+  
+  // Wenn Token vorhanden, User-ID extrahieren (für is_own_shout)
+  if (authHeader?.startsWith("Bearer ")) {
+    try {
+      const user = await getUserFromToken(authHeader.split(" ")[1]);
+      currentUserId = user.id;
+      console.log(`[GET shouts] Token ok – currentUserId = ${currentUserId}`);  // ← NEU
+    } catch {
+      // Invalid token → kein Problem, is_own_shout wird null/0
+      console.log(`[GET shouts] Token invalid: ${err.message}`);  // ← NEU
+    }
+  }
+
   try {
-    // Alle Shouts für diesen Artist inkl. Usernamen, Profilbilder, Likes
+    // Alle Shouts für diesen Artist inkl. Usernamen, Profilbilder, Likes + is_own_shout + is_deleted
     const [shouts] = await pool.query(
       `
       SELECT 
@@ -4702,7 +4717,9 @@ app.get("/artist/:artistId/shouts", async (req, res) => {
         s.parent_id,
         s.message,
         s.created_at,
-        COALESCE(SUM(sl.user_id IS NOT NULL),0) AS likes
+        s.is_deleted,
+        COALESCE(SUM(sl.user_id IS NOT NULL), 0) AS likes,
+        CASE WHEN s.user_id = ? THEN 1 ELSE 0 END AS is_own_shout
       FROM shouts s
       JOIN users u ON u.id = s.user_id
       LEFT JOIN shout_likes sl ON sl.shout_id = s.id
@@ -4710,7 +4727,7 @@ app.get("/artist/:artistId/shouts", async (req, res) => {
       GROUP BY s.id
       ORDER BY s.created_at ASC
       `,
-      [artistId]
+      [currentUserId, artistId]  // ← currentUserId als 1. Parameter für CASE WHEN
     );
 
     // Profilbilder als Data-URLs konvertieren
@@ -4722,6 +4739,7 @@ app.get("/artist/:artistId/shouts", async (req, res) => {
       return {
         ...s,
         profileImage,
+        is_own_shout: Boolean(s.is_own_shout),  // ← Als Boolean für Frontend
       };
     });
 
