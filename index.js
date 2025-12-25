@@ -4373,6 +4373,137 @@ app.post("/profile/image", upload.single('profileImage'), async (req, res) => {
   }
 });
 
+app.get("/profile/artist/:artistId/insights", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Unauthenticated" });
+  }
+
+  let user;
+  try {
+    user = await getUserFromToken(authHeader.split(" ")[1]);
+  } catch {
+    return res.status(401).json({ error: "Invalid token" });
+  }
+
+  const userId = user.id;
+  const artistId = parseInt(req.params.artistId, 10);
+
+  try {
+    const [[artist]] = await pool.query(
+      `SELECT id, name, image_url FROM artists WHERE id = ?`,
+      [artistId],
+    );
+
+    if (!artist) {
+      return res.status(404).json({ error: "Artist not found" });
+    }
+
+    const [[summary]] = await pool.query(
+      `
+      SELECT
+  SUM(l.listen_seconds)                     AS total_seconds,
+  COUNT(*)                                  AS listen_events,
+  COUNT(DISTINCT q.video_id)                AS song_count,
+  COUNT(DISTINCT l.session_id)              AS session_count,
+  SUM(l.completed) / COUNT(*)               AS completion_rate
+FROM session_song_listens l
+JOIN queue_items q ON q.id = l.queue_item_id
+JOIN youtube_video_cache y ON y.youtube_id = q.video_id
+WHERE l.user_id = ?
+  AND y.artist_id = ?
+
+      `,
+      [userId, artistId],
+    );
+    const [topSongs] = await pool.query(
+      `
+      
+   SELECT
+  q.video_id,
+  MAX(q.title)              AS title,
+  MAX(y.thumbnail)          AS thumbnail,
+  SUM(l.listen_seconds)     AS total_seconds,
+  COUNT(*)                  AS listen_count
+FROM session_song_listens l
+JOIN queue_items q ON q.id = l.queue_item_id
+JOIN youtube_video_cache y ON y.youtube_id = q.video_id
+WHERE l.user_id = ?
+  AND y.artist_id = ?
+GROUP BY q.video_id
+ORDER BY total_seconds DESC
+LIMIT 10
+      `,
+      [userId, artistId],
+    );
+    const [daily] = await pool.query(
+      `
+      SELECT
+  DATE(l.listened_from) AS date,
+  SUM(l.listen_seconds) AS seconds
+FROM session_song_listens l
+JOIN queue_items q ON q.id = l.queue_item_id
+JOIN youtube_video_cache y ON y.youtube_id = q.video_id
+WHERE l.user_id = ?
+  AND y.artist_id = ?
+  AND l.listened_from >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+GROUP BY DATE(l.listened_from)
+ORDER BY date ASC
+
+      `,
+      [userId, artistId],
+    );
+    const [sessions] = await pool.query(
+      `
+      SELECT
+  s.id                    AS session_id,
+  s.title,
+  s.created_at            AS started_at,
+  SUM(l.listen_seconds)   AS artist_seconds
+FROM session_song_listens l
+JOIN sessions s ON s.id = l.session_id
+JOIN queue_items q ON q.id = l.queue_item_id
+JOIN youtube_video_cache y ON y.youtube_id = q.video_id
+WHERE l.user_id = ?
+  AND y.artist_id = ?
+GROUP BY s.id
+ORDER BY artist_seconds DESC
+LIMIT 10
+
+      `,
+      [userId, artistId],
+    );
+
+    summary.total_minutes = Math.floor(summary.total_seconds / 60);
+    summary.avg_seconds_per_song =
+      summary.song_count > 0
+        ? Math.floor(summary.total_seconds / summary.song_count)
+        : 0;
+
+    res.json({
+  artist,
+
+  // 🔹 direkt für die StatCards
+  total_minutes: summary.total_minutes || 0,
+  song_count: summary.song_count || 0,
+  session_count: summary.session_count || 0,
+  avg_minutes_per_song: Math.floor(
+    (summary.avg_seconds_per_song || 0) / 60
+  ),
+
+  // 🔹 detaillierte Daten
+  completion_rate: summary.completion_rate,
+  top_songs: topSongs,
+  daily_activity: daily,
+  sessions,
+});
+
+  } catch (err) {
+    console.error("Artist insights failed:", err);
+    res.status(500).json({ error: "Failed to load artist insights" });
+  }
+});
+
 app.delete("/profile/image", async (req, res) => {
   // gleiche Authentifizierung wie bei /profile/image
   const token = req.headers.authorization?.split(" ")[1];
