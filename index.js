@@ -4215,43 +4215,96 @@ app.get("/profile/recent-listens", async (req, res) => {
 });
 
 app.get("/artist/:artistId", async (req, res) => {
-  const user = await getUserFromToken(req.headers.authorization?.split(" ")[1]);
   const { artistId } = req.params;
 
-  const [[artist]] = await pool.query(
-    `
-    SELECT
-      a.id,
-      a.name,
-      a.image_url,
-      SUM(s.listen_seconds) AS total_seconds
-    FROM session_song_listens s
-    JOIN queue_items q ON q.id = s.queue_item_id
-    JOIN youtube_video_cache y ON y.youtube_id = q.video_id
-    JOIN artists a ON a.id = y.artist_id
-    WHERE s.user_id = ? AND a.id = ?
-    GROUP BY a.id
-    `,
-    [user.id, artistId]
-  );
+  try {
+    //-- Artist-Basisinfos + aggregierte Hördaten über alle User
+    const [[artist]] = await pool.query(
+      `
+      SELECT
+        a.id,
+        a.name,
+        a.image_url,
+        COALESCE(SUM(s.listen_seconds),0) AS total_seconds
+      FROM artists a
+      LEFT JOIN youtube_video_cache y ON y.artist_id = a.id
+      LEFT JOIN queue_items q ON q.video_id = y.youtube_id
+      LEFT JOIN session_song_listens s ON s.queue_item_id = q.id
+      WHERE a.id = ?
+      GROUP BY a.id
+      `,
+      [artistId]
+    );
 
-  const [topSongs] = await pool.query(
-    `
-    SELECT q.id, q.title, SUM(s.listen_seconds) AS total_seconds
-    FROM session_song_listens s
-    JOIN queue_items q ON q.id = s.queue_item_id
-    JOIN youtube_video_cache y ON y.youtube_id = q.video_id
-    WHERE s.user_id = ? AND y.artist_id = ?
-    GROUP BY q.id
-    ORDER BY total_seconds DESC
-    LIMIT 10
-    `,
-    [user.id, artistId]
-  );
+    if (!artist) {
+      return res.status(404).json({ error: "Artist not found" });
+    }
 
-  res.json({ artist, topSongs });
+    //-- Top Songs nach aggregierter Hördauer über alle Nutzer
+    const [topSongs] = await pool.query(
+      `
+      SELECT
+        y.youtube_id AS id,
+        y.title,
+        COALESCE(SUM(s.listen_seconds),0) AS total_seconds
+      FROM youtube_video_cache y
+      JOIN queue_items q ON q.video_id = y.youtube_id
+      LEFT JOIN session_song_listens s ON s.queue_item_id = q.id
+      WHERE y.artist_id = ?
+        AND q.status IN ('played','playing','queued')
+      GROUP BY y.youtube_id
+      ORDER BY total_seconds DESC
+      LIMIT 10
+      `,
+      [artistId]
+    );
+
+    //-- Top User nach gesamter Hördauer für diesen Artist
+    const [topUsersRaw] = await pool.query(
+      `
+      SELECT
+        u.id,
+        u.username,
+        u.imageType,
+        u.imageData,
+        COALESCE(SUM(s.listen_seconds),0) AS total_seconds
+      FROM users u
+      JOIN session_song_listens s ON s.user_id = u.id
+      JOIN queue_items q ON q.id = s.queue_item_id
+      JOIN youtube_video_cache y ON y.youtube_id = q.video_id
+      WHERE y.artist_id = ?
+        AND q.status IN ('played','playing','queued')
+      GROUP BY u.id
+      ORDER BY total_seconds DESC
+      LIMIT 10
+      `,
+      [artistId]
+    );
+
+    // Base64-Profilbilder generieren
+    const topUsers = topUsersRaw.map((u) => {
+      let profileImage = null;
+      if (u.imageType && u.imageData) {
+        profileImage = `data:${u.imageType};base64,${u.imageData.toString("base64")}`;
+      }
+      return {
+        id: u.id,
+        username: u.username,
+        total_seconds: u.total_seconds,
+        profileImage,
+      };
+    });
+
+    res.json({ artist, topSongs, topUsers });
+  } catch (err) {
+    console.error("Artist page failed:", err);
+    res.status(500).json({ error: "Failed to load artist details" });
+  }
 });
 
+app.get("/user/:userId", async (req, res)=>{
+  const { userId } = req.params;
+})
 
 app.get("/top-today", async (req, res) => {
   try {
@@ -4392,7 +4445,7 @@ app.get("/profile/artist/:artistId/insights", async (req, res) => {
   try {
     const [[artist]] = await pool.query(
       `SELECT id, name, image_url FROM artists WHERE id = ?`,
-      [artistId],
+      [artistId]
     );
 
     if (!artist) {
@@ -4402,105 +4455,372 @@ app.get("/profile/artist/:artistId/insights", async (req, res) => {
     const [[summary]] = await pool.query(
       `
       SELECT
-  SUM(l.listen_seconds)                     AS total_seconds,
-  COUNT(*)                                  AS listen_events,
-  COUNT(DISTINCT q.video_id)                AS song_count,
-  COUNT(DISTINCT l.session_id)              AS session_count,
-  SUM(l.completed) / COUNT(*)               AS completion_rate
-FROM session_song_listens l
-JOIN queue_items q ON q.id = l.queue_item_id
-JOIN youtube_video_cache y ON y.youtube_id = q.video_id
-WHERE l.user_id = ?
-  AND y.artist_id = ?
-
+        SUM(l.listen_seconds)        AS total_seconds,
+        COUNT(*)                    AS listen_events,
+        COUNT(DISTINCT q.video_id)  AS song_count,
+        COUNT(DISTINCT l.session_id) AS session_count,
+        SUM(l.completed) / COUNT(*) AS completion_rate
+      FROM session_song_listens l
+      JOIN queue_items q ON q.id = l.queue_item_id
+      JOIN youtube_video_cache y ON y.youtube_id = q.video_id
+      WHERE y.artist_id = ?
+        AND EXISTS (
+          SELECT 1
+          FROM session_participants sp
+          WHERE sp.session_id = l.session_id
+            AND sp.user_id = ?
+        )
       `,
-      [userId, artistId],
+      [artistId, userId]
     );
+
     const [topSongs] = await pool.query(
       `
-      
-   SELECT
-  q.video_id,
-  MAX(q.title)              AS title,
-  MAX(y.thumbnail)          AS thumbnail,
-  SUM(l.listen_seconds)     AS total_seconds,
-  COUNT(*)                  AS listen_count
-FROM session_song_listens l
-JOIN queue_items q ON q.id = l.queue_item_id
-JOIN youtube_video_cache y ON y.youtube_id = q.video_id
-WHERE l.user_id = ?
-  AND y.artist_id = ?
-GROUP BY q.video_id
-ORDER BY total_seconds DESC
-LIMIT 10
+      SELECT
+        q.video_id,
+        MAX(q.title)          AS title,
+        MAX(y.thumbnail)      AS thumbnail,
+        SUM(l.listen_seconds) AS total_seconds,
+        COUNT(*)              AS listen_count
+      FROM session_song_listens l
+      JOIN queue_items q ON q.id = l.queue_item_id
+      JOIN youtube_video_cache y ON y.youtube_id = q.video_id
+      WHERE y.artist_id = ?
+        AND EXISTS (
+          SELECT 1
+          FROM session_participants sp
+          WHERE sp.session_id = l.session_id
+            AND sp.user_id = ?
+        )
+      GROUP BY q.video_id
+      ORDER BY total_seconds DESC
+      LIMIT 10
       `,
-      [userId, artistId],
+      [artistId, userId]
     );
-    const [daily] = await pool.query(
+
+    const [dailySessionsRaw] = await pool.query(
       `
       SELECT
-  DATE(l.listened_from) AS date,
-  SUM(l.listen_seconds) AS seconds
-FROM session_song_listens l
-JOIN queue_items q ON q.id = l.queue_item_id
-JOIN youtube_video_cache y ON y.youtube_id = q.video_id
-WHERE l.user_id = ?
-  AND y.artist_id = ?
-  AND l.listened_from >= DATE_SUB(NOW(), INTERVAL 30 DAY)
-GROUP BY DATE(l.listened_from)
-ORDER BY date ASC
-
+        DATE(l.listened_from) AS date,
+        s.id                  AS session_id,
+        s.title               AS session_title,
+        s.created_at          AS session_started_at,
+        SUM(l.listen_seconds) AS session_seconds
+      FROM session_song_listens l
+      JOIN sessions s ON s.id = l.session_id
+      JOIN queue_items q ON q.id = l.queue_item_id
+      JOIN youtube_video_cache y ON y.youtube_id = q.video_id
+      WHERE y.artist_id = ?
+        AND l.listened_from >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+        AND EXISTS (
+          SELECT 1
+          FROM session_participants sp
+          WHERE sp.session_id = l.session_id
+            AND sp.user_id = ?
+        )
+      GROUP BY DATE(l.listened_from), s.id
+      ORDER BY date ASC, s.created_at ASC
       `,
-      [userId, artistId],
+      [artistId, userId]
     );
+
+    const [dailyRaw] = await pool.query(
+      `
+      SELECT
+        DATE(l.listened_from) AS date,
+        SUM(l.listen_seconds) AS seconds
+      FROM session_song_listens l
+      JOIN queue_items q ON q.id = l.queue_item_id
+      JOIN youtube_video_cache y ON y.youtube_id = q.video_id
+      WHERE y.artist_id = ?
+        AND l.listened_from >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+        AND EXISTS (
+          SELECT 1
+          FROM session_participants sp
+          WHERE sp.session_id = l.session_id
+            AND sp.user_id = ?
+        )
+      GROUP BY DATE(l.listened_from)
+      ORDER BY date ASC
+      `,
+      [artistId, userId]
+    );
+
+    const daily = dailyRaw.map(d => ({
+      date: d.date,
+      seconds: Number(d.seconds) || 0,
+    }));
+
+    const maxDailySeconds = daily.length
+      ? Math.max(...daily.map(d => d.seconds))
+      : 0;
+
     const [sessions] = await pool.query(
       `
       SELECT
-  s.id                    AS session_id,
-  s.title,
-  s.created_at            AS started_at,
-  SUM(l.listen_seconds)   AS artist_seconds
-FROM session_song_listens l
-JOIN sessions s ON s.id = l.session_id
-JOIN queue_items q ON q.id = l.queue_item_id
-JOIN youtube_video_cache y ON y.youtube_id = q.video_id
-WHERE l.user_id = ?
-  AND y.artist_id = ?
-GROUP BY s.id
-ORDER BY artist_seconds DESC
-LIMIT 10
-
+        s.id                  AS session_id,
+        s.title,
+        s.created_at          AS started_at,
+        SUM(l.listen_seconds) AS total_seconds
+      FROM session_song_listens l
+      JOIN sessions s ON s.id = l.session_id
+      JOIN queue_items q ON q.id = l.queue_item_id
+      JOIN youtube_video_cache y ON y.youtube_id = q.video_id
+      WHERE y.artist_id = ?
+        AND EXISTS (
+          SELECT 1
+          FROM session_participants sp
+          WHERE sp.session_id = l.session_id
+            AND sp.user_id = ?
+        )
+      GROUP BY s.id
+      ORDER BY total_seconds DESC
+      LIMIT 10
       `,
-      [userId, artistId],
+      [artistId, userId]
     );
 
-    summary.total_minutes = Math.floor(summary.total_seconds / 60);
-    summary.avg_seconds_per_song =
-      summary.song_count > 0
-        ? Math.floor(summary.total_seconds / summary.song_count)
-        : 0;
+    const dailySessionsMap = {};
+
+    dailySessionsRaw.forEach(row => {
+      const date = row.date;
+      if (!dailySessionsMap[date]) {
+        dailySessionsMap[date] = { date, sessions: [], total_seconds: 0 };
+      }
+
+      const seconds = Number(row.session_seconds) || 0;
+
+      dailySessionsMap[date].sessions.push({
+        session_id: row.session_id,
+        title: row.session_title,
+        started_at: row.session_started_at,
+        seconds,
+        minutes: Math.floor(seconds / 60),
+      });
+
+      dailySessionsMap[date].total_seconds += seconds;
+    });
+
+    const dailySessions = Object.values(dailySessionsMap).sort(
+      (a, b) => new Date(a.date) - new Date(b.date)
+    );
 
     res.json({
-  artist,
-
-  // 🔹 direkt für die StatCards
-  total_minutes: summary.total_minutes || 0,
-  song_count: summary.song_count || 0,
-  session_count: summary.session_count || 0,
-  avg_minutes_per_song: Math.floor(
-    (summary.avg_seconds_per_song || 0) / 60
-  ),
-
-  // 🔹 detaillierte Daten
-  completion_rate: summary.completion_rate,
-  top_songs: topSongs,
-  daily_activity: daily,
-  sessions,
-});
-
+      artist,
+      total_minutes: Math.floor((summary.total_seconds || 0) / 60),
+      song_count: summary.song_count || 0,
+      session_count: summary.session_count || 0,
+      avg_minutes_per_song: Math.floor(
+        ((summary.total_seconds || 0) / Math.max(summary.song_count || 1, 1)) / 60
+      ),
+      completion_rate: summary.completion_rate,
+      top_songs: topSongs,
+      daily_listens: daily,
+      max_daily_seconds: maxDailySeconds,
+      sessions,
+      daily_sessions: dailySessions,
+    });
   } catch (err) {
     console.error("Artist insights failed:", err);
     res.status(500).json({ error: "Failed to load artist insights" });
+  }
+});
+
+app.post("/artist/:artistId/shouts", async (req, res) => {
+  const { artistId } = req.params;
+  const { message, parent_id } = req.body;
+
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Unauthenticated" });
+  }
+
+  let user;
+  try {
+    user = await getUserFromToken(authHeader.split(" ")[1]);
+  } catch {
+    return res.status(401).json({ error: "Invalid token" });
+  }
+
+  if (!message || message.trim().length === 0) {
+    return res.status(400).json({ error: "Message cannot be empty" });
+  }
+
+  try {
+    // Prüfen, ob parent_id existiert und zum gleichen Künstler gehört
+    if (parent_id) {
+      const [[parent]] = await pool.query(
+        `SELECT id FROM shouts WHERE id = ? AND artist_id = ?`,
+        [parent_id, artistId]
+      );
+      if (!parent) {
+        return res.status(400).json({ error: "Invalid parent shout" });
+      }
+    }
+
+    const [result] = await pool.query(
+      `
+      INSERT INTO shouts (artist_id, user_id, parent_id, message, created_at)
+      VALUES (?, ?, ?, ?, NOW())
+      `,
+      [artistId, user.id, parent_id || null, message]
+    );
+
+    res.json({
+      success: true,
+      shout: {
+        id: result.insertId,
+        artist_id: artistId,
+        user_id: user.id,
+        parent_id: parent_id || null,
+        message,
+        username: user.username,
+        created_at: new Date(),
+      },
+    });
+  } catch (err) {
+    console.error("Failed to post shout:", err);
+    res.status(500).json({ error: "Failed to post shout" });
+  }
+});
+
+app.get("/artist/:artistId/shouts", async (req, res) => {
+  const { artistId } = req.params;
+
+  try {
+    // Alle Shouts für diesen Artist inkl. Usernamen, Profilbilder, Likes
+    const [shouts] = await pool.query(
+      `
+      SELECT 
+        s.id,
+        s.artist_id,
+        s.user_id,
+        u.username,
+        u.imageType,
+        u.imageData,
+        s.parent_id,
+        s.message,
+        s.created_at,
+        COALESCE(SUM(sl.user_id IS NOT NULL),0) AS likes
+      FROM shouts s
+      JOIN users u ON u.id = s.user_id
+      LEFT JOIN shout_likes sl ON sl.shout_id = s.id
+      WHERE s.artist_id = ?
+      GROUP BY s.id
+      ORDER BY s.created_at ASC
+      `,
+      [artistId]
+    );
+
+    // Profilbilder als Data-URLs konvertieren
+    const formattedShouts = shouts.map((s) => {
+      let profileImage = null;
+      if (s.imageType && s.imageData) {
+        profileImage = `data:${s.imageType};base64,${s.imageData.toString("base64")}`;
+      }
+      return {
+        ...s,
+        profileImage,
+      };
+    });
+
+    res.json(formattedShouts);
+  } catch (err) {
+    console.error("Failed to fetch shouts:", err);
+    res.status(500).json({ error: "Failed to fetch shouts" });
+  }
+});
+
+app.post("/shouts/:shoutId/like", async (req, res) => {
+  const { shoutId } = req.params;
+
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Unauthenticated" });
+  }
+
+  let user;
+  try {
+    user = await getUserFromToken(authHeader.split(" ")[1]);
+  } catch {
+    return res.status(401).json({ error: "Invalid token" });
+  }
+
+  try {
+    // Prüfen, ob Shout existiert
+    const [[shout]] = await pool.query("SELECT id FROM shouts WHERE id = ?", [shoutId]);
+    if (!shout) {
+      return res.status(404).json({ error: "Shout not found" });
+    }
+
+    // Prüfen, ob Like bereits existiert
+    const [existingLike] = await pool.query(
+      "SELECT id FROM shout_likes WHERE shout_id = ? AND user_id = ?",
+      [shoutId, user.id]
+    );
+
+    if (existingLike.length) {
+      // Like existiert → entfernen (Unlike)
+      await pool.query("DELETE FROM shout_likes WHERE id = ?", [existingLike[0].id]);
+      return res.json({ success: true, liked: false });
+    }
+
+    // Like hinzufügen
+    await pool.query(
+      "INSERT INTO shout_likes (shout_id, user_id, created_at) VALUES (?, ?, NOW())",
+      [shoutId, user.id]
+    );
+
+    res.json({ success: true, liked: true });
+  } catch (err) {
+    console.error("Failed to toggle like:", err);
+    res.status(500).json({ error: "Failed to toggle like" });
+  }
+});
+
+app.delete("/shouts/:shoutId", async (req, res) => {
+  const { shoutId } = req.params;
+
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Unauthenticated" });
+  }
+
+  let user;
+  try {
+    user = await getUserFromToken(authHeader.split(" ")[1]);
+  } catch {
+    return res.status(401).json({ error: "Invalid token" });
+  }
+
+  try {
+    const [[shout]] = await pool.query("SELECT * FROM shouts WHERE id = ?", [shoutId]);
+    if (!shout) return res.status(404).json({ error: "Shout not found" });
+    if (shout.user_id !== user.id) return res.status(403).json({ error: "Not allowed" });
+
+    const now = new Date();
+    const createdAt = new Date(shout.created_at);
+    const deleteWindowMinutes = 30; // z.B. 30 Minuten Zeitfenster
+    const diffMinutes = (now - createdAt) / (1000 * 60);
+
+    if (diffMinutes <= deleteWindowMinutes) {
+      // Vollständig löschen inkl. Likes & Unterkommentare (Cascade)
+      await pool.query("DELETE FROM shout_likes WHERE shout_id = ?", [shoutId]);
+      await pool.query("DELETE FROM shouts WHERE id = ? OR parent_id = ?", [shoutId, shoutId]);
+    } else {
+      // Soft Delete: Text ersetzen, Likes löschen, Unterkommentare bleiben
+      await pool.query(
+        "UPDATE shouts SET message = '[Kommentar gelöscht]', is_deleted = 1, deleted_at = NOW() WHERE id = ?",
+        [shoutId]
+      );
+      await pool.query("DELETE FROM shout_likes WHERE shout_id = ?", [shoutId]);
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Failed to delete shout:", err);
+    res.status(500).json({ error: "Failed to delete shout" });
   }
 });
 

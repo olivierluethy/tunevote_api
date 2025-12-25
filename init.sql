@@ -328,3 +328,37 @@ INSERT INTO badges (key_name, title, description, category, icon) VALUES
 ('voter', 'Voter', '10 Votes abgegeben', 'social', '👍'),
 ('trendsetter', 'Trendsetter', 'Eigener Song 5× gehört', 'social', '🔥'),
 ('collaborator', 'Collaborator', '5 gemeinsame Sessions', 'social', '🤝');
+
+CREATE TABLE shouts (
+    id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    artist_id INT NOT NULL,
+    user_id INT NOT NULL,
+    parent_id INT DEFAULT NULL, -- für Antworten
+    message TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    
+    -- Optional: um Löschungen/Moderation zu unterstützen
+    is_deleted TINYINT(1) DEFAULT 0,
+    deleted_at DATETIME DEFAULT NULL,
+
+    FOREIGN KEY (artist_id) REFERENCES artists(id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    FOREIGN KEY (parent_id) REFERENCES shouts(id) ON DELETE CASCADE,
+    
+    INDEX idx_artist (artist_id),
+    INDEX idx_parent (parent_id),
+    INDEX idx_user (user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE shout_likes (
+    id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    shout_id INT NOT NULL,
+    user_id INT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    UNIQUE KEY unique_like (shout_id, user_id),
+
+    FOREIGN KEY (shout_id) REFERENCES shouts(id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
