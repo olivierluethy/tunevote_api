@@ -4375,6 +4375,152 @@ app.get("/user/:userId", async (req, res) => {
       [userId]
     );
 
+    /* Has joined so many sessions */
+    const [sessionCount] = await pool.query(
+      `
+      SELECT COUNT(DISTINCT session_id) AS session_count
+      FROM session_song_listens
+      WHERE user_id = ?
+      `,
+      [userId]
+    );
+
+    /* Sessions ohne Vote */
+    const [sessionsWithoutVote] = await pool.query(
+      `
+      SELECT COUNT(DISTINCT s.id) AS session_count
+      FROM sessions s
+      LEFT JOIN votes v ON v.user_id = ? AND v.queue_item_id IN (
+        SELECT id FROM queue_items WHERE session_id = s.id
+      )
+      WHERE s.user_id = ? AND v.id IS NULL
+      `,
+      [userId, userId]
+    );
+
+    /* Votes auf eigene empfohlene Songs in queue_items */
+    const [votesOnOwnSuggestions] = await pool.query(
+      `
+      SELECT COUNT(DISTINCT v.queue_item_id) AS count
+      FROM votes v
+      JOIN queue_items qi ON v.queue_item_id = qi.id
+      WHERE qi.added_by = ?
+      `,
+      [userId]
+    );
+
+    /* Sessions die gerade auf is_live = 1 sind */
+    const [liveSessions] = await pool.query(
+      `
+      SELECT COUNT(*) AS count
+      FROM sessions
+      WHERE user_id = ? AND is_live = 1
+      `,
+      [userId]
+    );
+
+    if (liveSessions[0]?.count > 0) {
+      user.is_live = true;
+    } else {
+      user.is_live = false;
+    }
+
+    /* User is currently listening in this session */
+    const [activeSession] = await pool.query(
+      `
+  SELECT 
+  s.id,
+  s.title,
+  s.is_private,
+  COUNT(sp2.id) AS participant_count
+FROM session_participants sp
+JOIN sessions s ON s.id = sp.session_id
+LEFT JOIN session_participants sp2
+  ON sp2.session_id = s.id
+ AND sp2.is_live = 1
+WHERE sp.user_id = ?
+  AND sp.is_live = 1
+  AND s.is_active = 1
+GROUP BY s.id
+LIMIT 1
+
+      `,
+      [userId]
+    );
+
+   if (activeSession.length > 0) {
+  const s = activeSession[0];
+
+  user.active_session = {
+    live: true,
+    id: s.id,
+    is_private: !!s.is_private,
+    name: s.is_private ? null : s.title,
+    participant_count: s.is_private ? null : s.participant_count,
+    join_url: s.is_private ? null : `/session/${s.id}`
+  };
+} else {
+  user.active_session = null;
+}
+
+/* Votes on other Users Suggestions */
+const [votesOnOthersSuggestions] = await pool.query(
+  `
+  SELECT COUNT(DISTINCT v.queue_item_id) AS count
+  FROM votes v
+  JOIN queue_items qi ON v.queue_item_id = qi.id
+  WHERE qi.added_by != ?
+    AND qi.added_by IS NOT NULL
+    AND v.user_id = ?
+  `,
+  [userId, userId]
+);
+
+
+/* Votes on his recommended songs in queue_items from other users and not from his own votes for his own suggestions */
+const [votesOnHisSuggestionsByOthers] = await pool.query(
+  `
+  SELECT COUNT(DISTINCT v.queue_item_id) AS count
+  FROM votes v
+  JOIN queue_items qi ON v.queue_item_id = qi.id
+  WHERE qi.added_by = ?
+    AND v.user_id != qi.added_by
+  `,
+  [userId]
+);
+
+
+/* How often the suggested song from the user has been selected and won against others for being "queued" or "playing", or "played" inside of "queue_items" */
+const [winsOfHisSuggestions] = await pool.query(
+  `
+  SELECT COUNT(*) AS count
+  FROM voting_rounds vr
+  JOIN queue_items qi ON vr.winner_queue_item_id = qi.id
+  WHERE qi.added_by = ?
+    AND qi.status IN ('queued', 'playing', 'played')
+  `,
+  [userId]
+);
+
+/* Songs gehört */
+const [songsHeard] = await pool.query(
+  `
+  SELECT COUNT(DISTINCT queue_item_id) AS count
+  FROM session_song_listens
+  WHERE user_id = ?
+  `,
+  [userId]
+);
+
+user.votes_on_others_suggestions = votesOnOthersSuggestions[0]?.count || 0;
+user.votes_on_his_suggestions_by_others = votesOnHisSuggestionsByOthers[0]?.count || 0;
+user.wins_of_his_suggestions = winsOfHisSuggestions[0]?.count || 0;
+user.songs_heard = songsHeard[0]?.count || 0;
+
+    /* =========================
+       4. Antwort an Frontend
+    ========================= */
+
     res.json({
       user: {
         id: user.id,
@@ -4385,7 +4531,12 @@ app.get("/user/:userId", async (req, res) => {
         total_seconds: user.total_seconds || 0
       },
       topSongs,
-      topUsers
+      topUsers,
+      sessionCount: sessionCount[0]?.session_count || 0,
+      sessionsWithoutVote,
+      votesOnOwnSuggestions,
+      liveSessions,
+      activeSession
     });
   } catch (err) {
     console.error(err);
