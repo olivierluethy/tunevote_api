@@ -1186,7 +1186,7 @@ app.get("/join", async (req, res) => {
     }
 
     const sessionId = sessions[0].id;
-    const joinUrl = `http://localhost:5173/session/${sessionId}`;
+    const joinUrl = `https://app.tunevote.com/session/${sessionId}`;
 
     // JSON mit Weiterleitungs-URL zurückgeben
     res.json({ redirect: joinUrl });
