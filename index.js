@@ -109,7 +109,7 @@ const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret_here";
 const YOUTUBE_KEY = process.env.YOUTUBE_KEY;
 
 const httpServer = app.listen(4000, () =>
-  console.log("Server läuft auf http://localhost:4000"),
+  console.log("Server läuft auf https://api.tunevote.com"),
 );
 const io = new Server(httpServer, { cors: { origin: "*" } });
 
@@ -1186,7 +1186,7 @@ app.get("/join", async (req, res) => {
     }
 
     const sessionId = sessions[0].id;
-    const joinUrl = `http://localhost:5173/session/${sessionId}`;
+    const joinUrl = `https://app.tunevote.com/session/${sessionId}`;
 
     // JSON mit Weiterleitungs-URL zurückgeben
     res.json({ redirect: joinUrl });
@@ -3020,7 +3020,7 @@ app.post("/forgot-password", async (req, res) => {
     );
 
     // Korrekter Reset-Link
-    const baseUrl = process.env.FRONTEND_URL || "http://localhost:5173 ";
+    const baseUrl = process.env.FRONTEND_URL || "https://app.tunevote.com ";
     const resetLink = `${baseUrl}/reset-password/${resetToken}`;
 
     const primaryColor = "#4f46e5";
@@ -3464,7 +3464,7 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
     await conn.commit();
 
     // === 4. E-Mail-Inhalte je nach Registrierungsstatus unterscheiden ===
-    const baseUrl = process.env.FRONTEND_URL || "http://localhost:5173 ";
+    const baseUrl = process.env.FRONTEND_URL || "https://app.tunevote.com ";
     const dashboardLink = `${baseUrl}/dashboard`;
     const primaryColor = "#4f46e5";
 
