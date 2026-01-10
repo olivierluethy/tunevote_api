@@ -135,7 +135,7 @@ const phaseTimers = {}; // { sessionId: timeout }
 async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
   if (phaseTimers[sessionId]) clearTimeout(phaseTimers[sessionId]);
 
-  const nextPhase = currentPhase === "suggesting" ? "voting" : "suggesting";
+  const nextPhase = currentPhase === "suggestion" ? "voting" : "suggestion";
 
   phaseTimers[sessionId] = setTimeout(async () => {
     try {
@@ -159,7 +159,7 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
         });
 
         startPhaseTimer(sessionId, roundId, "voting", 60);
-      } else if (nextPhase === "suggesting") {
+      } else if (nextPhase === "suggestion") {
         // ==================== VOTING BEENDET → GEWINNER BESTIMMEN ====================
         let winnerId = null;
 
@@ -368,13 +368,13 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
           });
 
           io.to(sessionId).emit("voting_phase_changed", {
-            phase: "suggesting",
+            phase: "suggestion",
             endsAt: newEnds.getTime(),
             roundId: newRoundId,
             duration: 90,
           });
 
-          startPhaseTimer(sessionId, newRoundId, "suggesting", 90);
+          startPhaseTimer(sessionId, newRoundId, "suggestion", 90);
         }, 3000);
       }
     } catch (err) {
@@ -1186,7 +1186,7 @@ app.get("/join", async (req, res) => {
     }
 
     const sessionId = sessions[0].id;
-    const joinUrl = `https://app.tunevote.com/session/${sessionId}`;
+    const joinUrl = `http://localhost:5173/session/${sessionId}`;
 
     // JSON mit Weiterleitungs-URL zurückgeben
     res.json({ redirect: joinUrl });
@@ -1730,7 +1730,7 @@ Instructions:
 // 5. NEW ENDPOINT – ADD RECOMMENDED SONG (click → queue)
 // ---------------------------------------------------------------
 app.post("/sessions/:id/recommendations/add", async (req, res) => {
-  const { id } = req.params;
+  const { id: sessionId } = req.params;
   const { youtubeId } = req.body; // nur youtubeId vom Client nötig
 
   const token = req.headers.authorization?.split(" ")[1];
@@ -1740,7 +1740,55 @@ app.post("/sessions/:id/recommendations/add", async (req, res) => {
   if (!user && !guest) return res.status(401).json({ error: "Unauthorized" });
 
   try {
-    // --- Hole Video-Infos aus youtube_video_cache ---
+    // =================================================
+    // Session-Status holen (wie in /proposals)
+    // =================================================
+    const [[sessionRow]] = await pool.query(
+      "SELECT user_id, is_live FROM sessions WHERE id = ?",
+      [sessionId]
+    );
+    if (!sessionRow) return res.status(404).json({ error: "Session not found" });
+
+    const isSessionLive = sessionRow.is_live === 1;
+
+    let votingRoundId = null;
+    let status = "suggested"; // Default für Empfehlungen: immer suggested
+
+    // =================================================
+    // STRIKTE Phase-Prüfung – genau wie in /proposals
+    // =================================================
+    if (isSessionLive) {
+      const [[round]] = await pool.query(
+        `SELECT id, phase 
+         FROM voting_rounds 
+         WHERE session_id = ? 
+           AND status = 'open' 
+         ORDER BY id DESC LIMIT 1`,
+        [sessionId]
+      );
+
+      if (!round) {
+        console.log(`[RECOMMENDATIONS/ADD] Session ${sessionId} live, aber KEINE offene Runde → 403`);
+        return res.status(403).json({ 
+          error: "Keine aktive Voting-Runde – Empfehlungen momentan nicht möglich" 
+        });
+      }
+
+      if (round.phase !== "suggestion") {
+        console.log(`[RECOMMENDATIONS/ADD] Session ${sessionId} live, aber falsche Phase (${round.phase}) → 403`);
+        return res.status(403).json({ 
+          error: `Nur in der Vorschlagsphase möglich (aktuell: ${round.phase})` 
+        });
+      }
+
+      // Alles korrekt → verknüpfen
+      votingRoundId = round.id;
+      status = "suggested";
+    }
+
+    // =================================================
+    // Video-Infos aus Cache holen
+    // =================================================
     const [rows] = await pool.query(
       `SELECT title, thumbnail, duration FROM youtube_video_cache WHERE youtube_id = ? LIMIT 1`,
       [youtubeId],
@@ -1752,23 +1800,62 @@ app.post("/sessions/:id/recommendations/add", async (req, res) => {
 
     const { title, thumbnail, duration } = rows[0];
 
+    // =================================================
+    // Doppelte-Prüfung (optional – nur bei suggested)
+    // =================================================
+    if (status === "suggested" && votingRoundId) {
+      const [existing] = await pool.query(
+        `SELECT id FROM queue_items 
+         WHERE session_id = ? 
+           AND voting_round_id = ? 
+           AND video_id = ? 
+           AND status = 'suggested' 
+         LIMIT 1`,
+        [sessionId, votingRoundId, youtubeId]
+      );
+      if (existing.length > 0) {
+        return res.status(409).json({
+          error: "Dieser Song wurde in dieser Runde bereits vorgeschlagen"
+        });
+      }
+    }
+
+    // =================================================
+    // Insert – jetzt MIT voting_round_id
+    // =================================================
     await pool.query(
       `INSERT INTO queue_items 
-       (session_id, item_type, video_id, title, thumbnail, added_by, guest_id, status, played, duration)
-       VALUES (?, 'music', ?, ?, ?, ?, ?, 'suggested', 0, ?)`,
+       (session_id, item_type, video_id, title, thumbnail, added_by, guest_id, 
+        status, played, duration, voting_round_id, item_source)
+       VALUES (?, 'music', ?, ?, ?, ?, ?, ?, 0, ?, ?, 'ai')`,
       [
-        id,
+        sessionId,
         youtubeId,
         title,
         thumbnail,
         user?.id || null,
         guest?.id || null,
+        status,
         duration || 0,
-      ],
+        votingRoundId
+      ]
     );
 
-    io.to(id).emit("queue_updated");
-    res.json({ success: true, youtubeId, title, thumbnail, duration });
+    // Broadcast
+    io.to(sessionId).emit("proposals_updated", {}); // da suggested
+
+    console.log(`[RECOMMENDATIONS/ADD] Erfolgreich hinzugefügt: ${title} (Round ${votingRoundId || 'none'})`);
+
+    res.json({ 
+      success: true, 
+      youtubeId, 
+      title, 
+      thumbnail, 
+      duration,
+      status,
+      votingRoundId 
+    });
+
   } catch (err) {
     console.error("Add recommendation error:", err);
     res.status(500).json({ error: "Failed to add song" });
@@ -1914,15 +2001,75 @@ app.post("/sessions/:id/proposals", async (req, res) => {
   }
 
   try {
-    // === FALL: PAUSE (unverändert) ===
+    // 1. Session-Status holen
+    const [[sessionRow]] = await pool.query(
+      "SELECT user_id, is_live FROM sessions WHERE id = ?",
+      [sessionId]
+    );
+    if (!sessionRow) return res.status(404).json({ error: "Session not found" });
+
+    const isHost = user && sessionRow.user_id === user.id;
+    const isSessionLive = sessionRow.is_live === 1;
+
+    let votingRoundId = null;
+    let status = "queued";
+
+    // 2. Wenn Session live ist → STRIKTE Phase-Prüfung
+    if (isSessionLive) {
+      const [[round]] = await pool.query(
+        `SELECT id, phase 
+         FROM voting_rounds 
+         WHERE session_id = ? 
+           AND status = 'open' 
+         ORDER BY id DESC LIMIT 1`,
+        [sessionId]
+      );
+
+      // Keine offene Runde → komplett verbieten
+      if (!round) {
+        return res.status(403).json({ 
+          error: "Keine aktive Voting-Runde – Vorschläge/Pausen momentan nicht möglich" 
+        });
+      }
+
+      // Runde existiert, aber nicht suggesting → verbieten
+      if (round.phase !== "suggestion") {
+        return res.status(403).json({ 
+          error: "Aktuell läuft die Abstimmung – Vorschläge/Pausen erst in der nächsten Vorschlagsphase möglich" 
+        });
+      }
+
+      // Alles korrekt → suggested + round verknüpfen
+      votingRoundId = round.id;
+      status = "suggested";
+    } else {
+      // Session nicht live → nur Host darf direkt queued einfügen
+      if (!isHost) {
+        return res.status(403).json({ 
+          error: "Nur der Host darf Vorschläge machen, solange die Session nicht live ist" 
+        });
+      }
+      // status bleibt "queued" (wie vorher)
+    }
+
+    // =================================================
+    // Pause-Handling
+    // =================================================
     if (item_type === "pause") {
-      const duration = pauseDuration || 30;
-      const desc = description || "Kurze Pause";
+      const duration = Number(pauseDuration) || 30;
+      if (duration < 5 || duration > 600) {
+        return res.status(400).json({ 
+          error: "Pausendauer muss zwischen 5 und 600 Sekunden liegen" 
+        });
+      }
+
+      const desc = (description || "Kurze Pause").trim().slice(0, 100);
 
       await pool.query(
         `INSERT INTO queue_items 
-         (session_id, item_type, title, description, duration, added_by, guest_id, status, played, item_source)
-         VALUES (?, 'pause', ?, ?, ?, ?, ?, 'suggested', 0, ?)`,
+         (session_id, item_type, title, description, duration, 
+          added_by, guest_id, status, played, item_source, voting_round_id)
+         VALUES (?, 'pause', ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
         [
           sessionId,
           desc,
@@ -1930,34 +2077,47 @@ app.post("/sessions/:id/proposals", async (req, res) => {
           duration,
           user?.id || null,
           guest?.id || null,
+          status,
           user ? "user" : "guest",
-        ],
+          votingRoundId   // ← jetzt immer gesetzt, wenn suggesting läuft
+        ]
       );
 
-      io.to(sessionId).emit("queue_updated", {});
-      return res.status(201).json({ success: true, type: "pause" });
+      // Broadcast
+      if (status === "suggested") {
+        io.to(sessionId).emit("proposals_updated", {});
+      } else {
+        io.to(sessionId).emit("queue_updated", {});
+      }
+
+      return res.status(201).json({ 
+        success: true, 
+        type: "pause", 
+        status,
+        votingRoundId 
+      });
     }
 
-    // === FALL: MUSIK ===
+    // =================================================
+    // Musik-Handling
+    // =================================================
     if (!videoId) {
       return res.status(400).json({ error: "Missing videoId" });
     }
 
     let title, thumbnail, duration;
 
-    // 1. Cache oder ytdl (unverändert)
+    // Cache oder ytdl
     const [cachedRows] = await pool.query(
       "SELECT title, thumbnail, duration FROM youtube_video_cache WHERE youtube_id = ?",
-      [videoId],
+      [videoId]
     );
 
     if (cachedRows.length > 0) {
       ({ title, thumbnail, duration } = cachedRows[0]);
     } else {
       try {
-        const info = await ytdl.getBasicInfo(
-          `https://www.youtube.com/watch?v=${videoId}`,
-        );
+        const info = await ytdl.getBasicInfo(`https://www.youtube.com/watch?v=${videoId}`);
         const videoDetails = info.videoDetails;
 
         title = videoDetails.title || clientTitle || "Unbekannter Titel";
@@ -1970,7 +2130,7 @@ app.post("/sessions/:id/proposals", async (req, res) => {
         await pool.query(
           `INSERT INTO youtube_video_cache (youtube_id, title, title_norm, thumbnail, duration)
            VALUES (?, ?, ?, ?, ?)`,
-          [videoId, title, normalize(title), thumbnail, duration],
+          [videoId, title, normalize(title), thumbnail, duration]
         );
       } catch (ytdlErr) {
         console.error("ytdl failed:", ytdlErr);
@@ -1978,45 +2138,7 @@ app.post("/sessions/:id/proposals", async (req, res) => {
       }
     }
 
-    // === Session & Phase-Check (unverändert) ===
-    const [[sessionRow]] = await pool.query(
-      "SELECT user_id, is_live FROM sessions WHERE id = ?",
-      [sessionId],
-    );
-    if (!sessionRow)
-      return res.status(404).json({ error: "Session not found" });
-
-    const isHost = user && sessionRow.user_id === user.id;
-    const isSessionLive = sessionRow.is_live === 1;
-
-    let currentPhase = null;
-    let votingRoundId = null;
-    let status = "queued";
-
-    if (isSessionLive) {
-      const [[round]] = await pool.query(
-        `SELECT id, phase FROM voting_rounds WHERE session_id = ? AND status = 'open' ORDER BY id DESC LIMIT 1`,
-        [sessionId],
-      );
-
-      if (!round)
-        return res.status(403).json({ error: "Keine aktive Voting-Runde" });
-      if (round.phase !== "suggesting") {
-        return res
-          .status(403)
-          .json({ error: "Nur in der Vorschlagsphase erlaubt" });
-      }
-
-      currentPhase = round.phase;
-      votingRoundId = round.id;
-      status = "suggested";
-    } else {
-      status = isHost ? "queued" : "suggested";
-    }
-
-    // =================================================
-    // NEU: Doppelte video_id in aktueller Voting-Runde verbieten
-    // =================================================
+    // Doppelte-Prüfung nur wenn suggested
     if (status === "suggested" && votingRoundId) {
       const [existing] = await pool.query(
         `SELECT id FROM queue_items 
@@ -2025,21 +2147,19 @@ app.post("/sessions/:id/proposals", async (req, res) => {
            AND video_id = ? 
            AND status = 'suggested' 
          LIMIT 1`,
-        [sessionId, votingRoundId, videoId],
+        [sessionId, votingRoundId, videoId]
       );
-
       if (existing.length > 0) {
         return res.status(409).json({
-          error: "Dieser Song wurde in dieser Runde bereits vorgeschlagen",
-          details: "Doppelte Vorschläge sind nicht erlaubt",
+          error: "Dieser Song wurde in dieser Runde bereits vorgeschlagen"
         });
       }
     }
 
-    // === Vorschlag speichern ===
     await pool.query(
       `INSERT INTO queue_items 
-       (session_id, item_type, video_id, title, thumbnail, added_by, guest_id, status, played, duration, voting_round_id, item_source)
+       (session_id, item_type, video_id, title, thumbnail, added_by, guest_id, 
+        status, played, duration, voting_round_id, item_source)
        VALUES (?, 'music', ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
       [
         sessionId,
@@ -2050,12 +2170,12 @@ app.post("/sessions/:id/proposals", async (req, res) => {
         guest?.id || null,
         status,
         duration,
-        votingRoundId,
-        user ? "user" : "guest",
-      ],
+        votingRoundId,          // ← jetzt garantiert korrekt gesetzt
+        user ? "user" : "guest"
+      ]
     );
 
-    // === Broadcast ===
+    // Broadcast
     if (status === "suggested") {
       io.to(sessionId).emit("proposals_updated", {});
     } else {
@@ -2066,8 +2186,9 @@ app.post("/sessions/:id/proposals", async (req, res) => {
       success: true,
       type: "music",
       status,
-      votingRoundId,
+      votingRoundId
     });
+
   } catch (err) {
     console.error("Proposal error:", err);
     res.status(500).json({ error: "Interner Fehler" });
@@ -2385,7 +2506,7 @@ app.delete("/sessions/:sessionId/proposals/:proposalId", async (req, res) => {
 
     const currentPhase = phaseRows[0]?.phase || null;
 
-    if (currentPhase !== "suggesting") {
+    if (currentPhase !== "suggestion") {
       return res.status(403).json({
         message: "Löschen nur in der Vorschlagsphase möglich",
       });
@@ -2614,11 +2735,11 @@ app.post("/sessions/:id/start", async (req, res) => {
   const votingRoundId = roundResult.insertId;
 
   // Timer für den Phasenwechsel starten (globale Funktion von vorher)
-  startPhaseTimer(id, votingRoundId, "suggesting", suggestionDuration);
+  startPhaseTimer(id, votingRoundId, "suggestion", suggestionDuration);
 
   // Frontend informieren: Vorschlagsphase läuft!
   io.to(id).emit("voting_phase_changed", {
-    phase: "suggesting",
+    phase: "suggestion",
     endsAt: suggestionEndsAt.getTime(),
     roundId: votingRoundId,
     duration: suggestionDuration,
