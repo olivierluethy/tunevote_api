@@ -109,7 +109,7 @@ const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret_here";
 const YOUTUBE_KEY = process.env.YOUTUBE_KEY;
 
 const httpServer = app.listen(4000, () =>
-  console.log("Server läuft auf https://api.tunevote.com"),
+  console.log("Server läuft auf http://localhost:4000"),
 );
 const io = new Server(httpServer, { cors: { origin: "*" } });
 
@@ -1161,38 +1161,215 @@ app.post("/sessions", async (req, res) => {
   }
 });
 
+
 // Wenn Benutzer ohne guest user & ohne account -> hier soll nach einer Session gesucht werden die Live ist, und danach sollte diese URL bereitgestellt und über das JSON verschickt werden wodurch man sich in der Live Session befindet.
 // === Auto-Join für nicht eingeloggte Benutzer ===
 app.get("/join", async (req, res) => {
   try {
-    // Prüfen, ob der Benutzer eingeloggt ist (JWT oder Gast)
+    // 1. Authentifizierung prüfen – nur komplett unauthentifizierte erlauben
     const token = req.headers.authorization?.split(" ")[1];
     const guestToken = req.headers["x-guest-token"];
     const user = await getUserFromToken(token);
     const guest = await getGuestFromToken(guestToken);
 
-    // Nur fortfahren, wenn KEIN Account & KEIN Gast vorhanden ist
     if (user || guest) {
-      return res.status(400).json({ error: "Already authenticated" });
+      return res.status(400).json({
+        error: "Already authenticated – bitte /sessions verwenden",
+      });
     }
 
-    // Live-Session suchen (erste mit is_live = 1)
-    const [sessions] = await pool.query(
-      "SELECT id FROM sessions WHERE is_live = 1 ORDER BY created_at ASC LIMIT 1",
-    );
+    // ─────────────────────────────────────────────
+    // Wichtigster Teil: Name aus Query-Parameter
+    // ─────────────────────────────────────────────
+    const requestedTitle = req.query.name || req.query.title; // z. B. ?name=Midnight Neon Drive 🌌
+    const useCustomName = !!requestedTitle && requestedTitle.trim().length > 0;
 
-    if (sessions.length === 0) {
-      return res.status(404).json({ error: "No live session available" });
+    const DEFAULT_TITLE = "TuneVote Radio – Live for everyone";
+
+    let sessionId;
+    let autoStarted = false;
+
+    // Fall 1: Expliziter Name → immer neue Session erstellen
+    if (useCustomName) {
+      sessionId = await createNewPublicSession(requestedTitle.trim());
+      autoStarted = true;
+    }
+    // Fall 2: Kein Name → wie bisher: älteste live Session nehmen oder Standard-Session erstellen
+    else {
+      // Älteste öffentliche live Session suchen
+      const [existing] = await pool.query(`
+        SELECT id
+        FROM sessions
+        WHERE is_private = 0 AND is_live = 1
+        ORDER BY created_at ASC
+        LIMIT 1
+      `);
+
+      if (existing.length > 0) {
+        sessionId = existing[0].id;
+      } else {
+        sessionId = await createNewPublicSession(DEFAULT_TITLE);
+        autoStarted = true;
+      }
     }
 
-    const sessionId = sessions[0].id;
-    const joinUrl = `https://app.tunevote.com/session/${sessionId}`;
+    // 3. Redirect zum Frontend
+    res.json({
+      redirect: `http://localhost:5173/session/${sessionId}`,
+    });
 
-    // JSON mit Weiterleitungs-URL zurückgeben
-    res.json({ redirect: joinUrl });
+    // ─────────────────────────────────────────────
+    // Auto-Start nur bei neu erstellter Session
+    // ─────────────────────────────────────────────
+    if (autoStarted) {
+      setTimeout(async () => {
+        try {
+          await axios.post(`http://localhost:4000/sessions/${sessionId}/start`);
+          console.log(`[AUTO] Session ${sessionId} gestartet (Titel: ${requestedTitle || DEFAULT_TITLE})`);
+        } catch (err) {
+          console.error("[AUTO] Start fehlgeschlagen:", err.response?.data || err.message);
+        }
+      }, 800);
+    }
+
   } catch (err) {
-    console.error("Error in /join:", err);
-    res.status(500).json({ error: "Internal server error" });
+    console.error("Fehler in /join:", err);
+    res.status(500).json({ error: "Interner Serverfehler" });
+  }
+});
+
+// Hilfsfunktion – erstellt immer eine neue öffentliche Session + Voting-Round + Initial-Queue
+async function createNewPublicSession(title) {
+  const connection = await pool.getConnection();
+  await connection.beginTransaction();
+
+  try {
+    // Session erstellen
+    const [sessionResult] = await connection.query(`
+      INSERT INTO sessions
+        (user_id, title, is_private, is_live, created_at)
+      VALUES
+        (1, ?, 0, 0, NOW())
+    `, [title]);
+
+    const sessionId = sessionResult.insertId;
+
+    // Voting-Round
+    const [roundResult] = await connection.query(`
+      INSERT INTO voting_rounds
+        (session_id, status, phase, phase_ends_at,
+         suggestion_duration, voting_duration, created_at)
+      VALUES
+        (?, 'open', 'suggestion', DATE_ADD(NOW(), INTERVAL 90 SECOND),
+         90, 60, NOW())
+    `, [sessionId]);
+
+    const votingRoundId = roundResult.insertId;
+
+    // Zufällige Songs holen (Fallback-Queue)
+const [songs] = await connection.query(`
+  SELECT DISTINCT
+    yvc.youtube_id AS video_id,
+    yvc.title,
+    yvc.duration,
+    yvc.thumbnail
+  FROM youtube_video_cache yvc
+  JOIN queue_items qi ON qi.video_id = yvc.youtube_id
+  ORDER BY RAND()
+  LIMIT 7
+`);
+
+if (songs.length < 2) {
+  throw new Error("Nicht genügend Songs für Auto-Queue");
+}
+
+    // Erste 2 = bereits gespielt
+    for (const song of songs.slice(0, 2)) {
+      await connection.query(`
+        INSERT INTO queue_items
+          (session_id, video_id, title, duration, thumbnail,
+           status, played, playedAt,
+           item_type, item_source, voting_round_id, created_at)
+        VALUES
+          (?, ?, ?, ?, ?,
+           'played', 1, NOW(),
+           'music', 'user', ?, NOW())
+      `, [
+        sessionId,
+        song.video_id,
+        song.title,
+        song.duration,
+        song.thumbnail,
+        votingRoundId,
+      ]);
+    }
+
+    // Rest = in der Queue
+    for (const song of songs.slice(2)) {
+      await connection.query(`
+        INSERT INTO queue_items
+          (session_id, video_id, title, duration, thumbnail, added_by,
+           status, played,
+           item_type, item_source, voting_round_id, created_at)
+        VALUES
+          (?, ?, ?, ?, ?, 1,
+           'queued', 0,
+           'music', 'user', ?, NOW())
+      `, [
+        sessionId,
+        song.video_id,
+        song.title,
+        song.duration,
+        song.thumbnail,
+        votingRoundId,
+      ]);
+    }
+
+    await connection.commit();
+    return sessionId;
+  } catch (err) {
+    await connection.rollback();
+    throw err;
+  } finally {
+    connection.release();
+  }
+}
+
+// GET /sessions/:id/current-voting-phase
+app.get("/sessions/:id/current-voting-phase", async (req, res) => {
+  const sessionId = parseInt(req.params.id);
+
+  try {
+    const [[round]] = await pool.query(`
+      SELECT 
+        id AS roundId,
+        phase,
+        UNIX_TIMESTAMP(phase_ends_at) * 1000 AS endsAtMs,
+        CASE 
+          WHEN phase = 'suggestion' THEN suggestion_duration 
+          WHEN phase = 'voting' THEN voting_duration 
+          ELSE 90 
+        END AS durationSeconds
+      FROM voting_rounds
+      WHERE session_id = ?
+        AND status = 'open'
+      ORDER BY id DESC
+      LIMIT 1
+    `, [sessionId]);
+
+    if (!round) {
+      return res.json({ phase: null, endsAt: null, duration: 0, roundId: null });
+    }
+
+    res.json({
+      phase: round.phase,
+      endsAt: round.endsAtMs,
+      duration: round.durationSeconds,
+      roundId: round.roundId
+    });
+  } catch (err) {
+    console.error("Current phase fetch error:", err);
+    res.status(500).json({ error: "Failed to get current phase" });
   }
 });
 
@@ -2629,25 +2806,20 @@ app.delete("/sessions/:id", async (req, res) => {
 // === Start session (host) ===
 app.post("/sessions/:id/start", async (req, res) => {
   const { id } = req.params;
-  const token = req.headers.authorization?.split(" ")[1];
-  const user = await getUserFromToken(token);
-  if (!user) return res.status(401).json({ error: "Unauthorized" });
 
   const [[sess]] = await pool.query(
-    "SELECT is_live, user_id FROM sessions WHERE id = ?",
+    "SELECT is_live FROM sessions WHERE id = ?",
     [id],
   );
   if (!sess) return res.status(404).json({ error: "Session not found" });
-  if (sess.user_id !== user.id)
-    return res.status(403).json({ error: "Nur Host" });
   if (sess.is_live) {
     return res.status(400).json({ error: "Session already live" });
   }
 
-  // 🧹 Reset playback_sync – bleibt erhalten
+  // 🧹 Reset playback_sync
   await pool.query(`DELETE FROM playback_sync WHERE session_id = ?`, [id]);
 
-  // Alle bisherigen "suggested" Vorschläge (aus Vorbereitung) werden direkt in die Queue übernommen
+  // Alle bisherigen "suggested" Vorschläge in die Queue übernehmen
   await pool.query(
     `
     UPDATE queue_items 
@@ -2657,10 +2829,10 @@ app.post("/sessions/:id/start", async (req, res) => {
     [id],
   );
 
-  // 🚀 Session geht live
+  // 🚀 Session live setzen
   await pool.query("UPDATE sessions SET is_live = 1 WHERE id = ?", [id]);
 
-  // 🎵 Prüfen, ob bereits Songs in der Queue sind → sofort abspielen (wie bisher)
+  // 🎵 Prüfen, ob Songs in der Queue sind → sofort abspielen
   const [first] = await pool.query(
     "SELECT id, video_id, duration, title FROM queue_items WHERE session_id = ? AND played = 0 AND status = 'queued' ORDER BY id ASC LIMIT 1",
     [id],
@@ -2673,7 +2845,7 @@ app.post("/sessions/:id/start", async (req, res) => {
     const duration = first[0].duration || 180;
     const startTime = Date.now();
 
-    // 🕒 Markiere ersten Song als playing
+    // 🕒 Ersten Song auf "playing" setzen
     await pool.query(
       `UPDATE queue_items SET status = 'playing', startedAt = NOW() WHERE id = ?`,
       [firstId],
@@ -2694,7 +2866,6 @@ app.post("/sessions/:id/start", async (req, res) => {
       `[Playback] Session ${id} STARTED with first song: videoId=${firstVideoId} – "${first[0].title}"`,
     );
 
-    // 📡 Broadcast: Radio geht live + erster Song
     io.to(id).emit("session_started", {
       autoStarted: true,
       firstVideoId,
@@ -2708,7 +2879,6 @@ app.post("/sessions/:id/start", async (req, res) => {
       is_playing: true,
     });
 
-    // Timer für Song-Ende (wie bisher)
     if (sessionTimers[id]) clearTimeout(sessionTimers[id]);
     sessionTimers[id] = setTimeout(() => advanceToNext(id), duration * 1000);
 
@@ -2719,7 +2889,7 @@ app.post("/sessions/:id/start", async (req, res) => {
   }
 
   // ===============================================
-  // NEU: Erste Voting-Runde mit Phasen starten
+  // Erste Voting-Runde mit Phasen starten
   // ===============================================
   const suggestionDuration = 90; // Sekunden
   const votingDuration = 60; // Sekunden
@@ -2734,10 +2904,8 @@ app.post("/sessions/:id/start", async (req, res) => {
 
   const votingRoundId = roundResult.insertId;
 
-  // Timer für den Phasenwechsel starten (globale Funktion von vorher)
   startPhaseTimer(id, votingRoundId, "suggestion", suggestionDuration);
 
-  // Frontend informieren: Vorschlagsphase läuft!
   io.to(id).emit("voting_phase_changed", {
     phase: "suggestion",
     endsAt: suggestionEndsAt.getTime(),
@@ -2745,7 +2913,7 @@ app.post("/sessions/:id/start", async (req, res) => {
     duration: suggestionDuration,
   });
 
-  io.to(id).emit("proposals_updated"); // leere Liste oder bestehende anzeigen
+  io.to(id).emit("proposals_updated");
   io.to(id).emit("queue_updated");
 
   console.log(
@@ -2760,7 +2928,6 @@ app.post("/sessions/:id/start", async (req, res) => {
   });
 });
 
-// === Join Live ===
 // === Join Live ===
 app.post("/sessions/:id/join-live", async (req, res) => {
   try {
