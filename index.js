@@ -139,6 +139,11 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
 
   phaseTimers[sessionId] = setTimeout(async () => {
     try {
+      console.log(
+        `[PhaseTimer] Timer abgelaufen für Session ${sessionId}, Runde ${roundId}, ` +
+        `Phase: ${currentPhase} → nächste Phase: ${nextPhase}`
+      );
+
       if (nextPhase === "voting") {
         // --- Wechsel zu Voting-Phase (unverändert)
         const votingEnds = new Date(Date.now() + 60 * 1000);
@@ -151,6 +156,8 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
           [votingEnds, roundId, sessionId],
         );
 
+        console.log(`[Voting] Wechsel zu Voting-Phase → ends at ${votingEnds.toISOString()}`);
+
         io.to(sessionId).emit("voting_phase_changed", {
           phase: "voting",
           endsAt: votingEnds.getTime(),
@@ -161,6 +168,8 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
         startPhaseTimer(sessionId, roundId, "voting", 60);
       } else if (nextPhase === "suggestion") {
         // ==================== VOTING BEENDET → GEWINNER BESTIMMEN ====================
+        console.log(`[Voting] Voting-Runde ${roundId} beendet – starte Gewinnerermittlung`);
+
         let winnerId = null;
 
         // 1. Prüfen: Gab es überhaupt Votes?
@@ -187,7 +196,7 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
           );
           console.log(`[Voting] Gewinner durch Votes: #${winnerId}`);
         } else {
-          // → KEINE Votes → Fallback-Regeln
+          console.log(`[Voting] Keine Votes abgegeben → Fallback-Regeln prüfen`);
 
           // 1. Gibt es User/Guest-Vorschläge?
           const [userProposal] = await pool.query(
@@ -210,17 +219,31 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
               [winnerId],
             );
             console.log(
-              `[Voting] Keine Votes → Ältester User-Vorschlag gewinnt: #${winnerId}`,
+              `[Voting] Keine Votes → Ältester User-/Guest-Vorschlag gewinnt: #${winnerId}`
             );
           } else {
-            // 2. Nur AI-Vorschläge → prüfen: live User + mindestens 3 AI-Songs mit 0 Votes?
+            console.log(`[Voting] Kein User-/Guest-Vorschlag → prüfe AI-Fallback`);
+
+            // ──────────────────────────────────────────────────────
+            // NEU: Live-Check über Socket.IO (robuster als DB)
+            const liveSockets = await io.in(String(sessionId)).fetchSockets();
+            const liveCountSockets = liveSockets.length;
+
+            // Zum Vergleich / Debug: was sagt die DB noch?
             const [liveRows] = await pool.query(
               "SELECT COUNT(*) AS cnt FROM session_participants WHERE session_id = ? AND is_live = 1",
               [sessionId],
             );
-            const liveCount = liveRows[0].cnt;
+            const liveCountDb = liveRows[0].cnt;
 
-            if (liveCount > 0) {
+            console.log(
+              `[Voting LIVE-CHECK] ` +
+              `Sockets: ${liveCountSockets} verbunden | ` +
+              `DB (session_participants.is_live=1): ${liveCountDb} | ` +
+              `Runde: ${roundId} | Session: ${sessionId}`
+            );
+
+            if (liveCountSockets > 0) {
               const [aiCountRows] = await pool.query(
                 `
           SELECT COUNT(*) AS cnt
@@ -233,6 +256,10 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
                 [roundId],
               );
               const aiCount = aiCountRows[0].cnt;
+
+              console.log(
+                `[Voting] AI-Fallback-Prüfung: ${aiCount} AI-Songs ohne Votes vorhanden`
+              );
 
               if (aiCount >= 3) {
                 const [aiRows] = await pool.query(
@@ -256,58 +283,70 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
                     [winnerId],
                   );
                   console.log(
-                    `[Voting] Fallback: Zufälliger AI-Song gewählt (#${winnerId}) – ${aiCount} AI-Songs, ${liveCount} live`,
+                    `[Voting] Fallback: Zufälliger AI-Song gewählt (#${winnerId}) – ` +
+                    `${aiCount} AI-Songs, ${liveCountSockets} live (Sockets)`
                   );
+                } else {
+                  console.log(`[Voting] Kein AI-Song gefunden trotz aiCount >= 3`);
                 }
               } else {
                 console.log(
-                  `[Voting] Fallback nicht möglich: Nur ${aiCount}/3 AI-Songs (0 Votes), ${liveCount} live`,
+                  `[Voting] Fallback nicht möglich: Nur ${aiCount}/3 AI-Songs (0 Votes), ` +
+                  `${liveCountSockets} live (Sockets)`
                 );
               }
             } else {
-              // === KEIN LIVE-TEILNEHMER → Session leer und inaktiv ===
+              // === WIRKLICH KEIN LIVE-TEILNEHMER ===
               console.log(
-                `[Voting] Kein Gewinner → niemand live (${liveCount} Teilnehmer) → Session wird beendet`,
+                `[Voting] KEIN GEWINNER & KEINE LIVE-TEILNEHMER ` +
+                `(Sockets: ${liveCountSockets}, DB: ${liveCountDb}) → Session wird beendet`
               );
 
-              // Alle vorgeschlagenen Songs archivieren (sauberer Zustand)
+              // Alle vorgeschlagenen Songs archivieren
               await pool.query(
                 "UPDATE queue_items SET status = 'archived' WHERE voting_round_id = ? AND status = 'suggested'",
                 [roundId],
               );
+              console.log(`[Voting] Alle suggested Songs archiviert`);
 
-              // Aktuelle Runde schließen (ohne Gewinner)
+              // Runde schließen
               await pool.query(
                 `UPDATE voting_rounds 
-           SET status = 'closed', phase = 'closed', winner_queue_item_id = NULL 
-           WHERE id = ?`,
+                 SET status = 'closed', phase = 'closed', winner_queue_item_id = NULL 
+                 WHERE id = ?`,
                 [roundId],
               );
+              console.log(`[Voting] Runde ${roundId} geschlossen (kein Gewinner)`);
 
-              // Session als beendet markieren + Broadcast
+              // Session beenden
               await pool.query(
                 `UPDATE sessions 
-           SET is_live = 0, ended_at = NOW() 
-           WHERE id = ? AND is_live = 1`,
+                 SET is_live = 0, ended_at = NOW() 
+                 WHERE id = ? AND is_live = 1`,
                 [sessionId],
               );
+              console.log(`[Session] Session ${sessionId} als beendet markiert`);
+
+              // Queue Items zurücksetzen
+              await pool.query('UPDATE queue_items SET status = "queued", played = 0, startedAt = NULL, voting_round_id = NULL');
+              console.log(`[Session] Alle Queue Items zurückgesetzt`);
 
               io.to(sessionId).emit("session_ended", {
                 reason: "no_active_participants",
-                message:
-                  "Die Session wurde beendet, da niemand mehr aktiv war.",
+                message: "Die Session wurde beendet, da niemand mehr aktiv war.",
               });
+              console.log(`[Broadcast] session_ended gesendet`);
 
-              io.in(sessionId).socketsLeave(sessionId); // Alle Clients aus dem Room kicken
+              io.in(sessionId).socketsLeave(sessionId);
+              console.log(`[Socket] Alle Clients aus Raum ${sessionId} entfernt`);
 
-              // Optional: Timer aufräumen
               if (phaseTimers[sessionId]) {
                 clearTimeout(phaseTimers[sessionId]);
                 delete phaseTimers[sessionId];
+                console.log(`[Timer] Phase-Timer für ${sessionId} aufgeräumt`);
               }
 
-              // WICHTIG: KEINE neue Runde starten → return oder einfach nichts weiter machen
-              return; // Verhindert die neue Runde nach 3 Sekunden
+              return; // ← verhindert Neustart der Runde
             }
           }
         }
@@ -322,11 +361,13 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
       `,
             [roundId, winnerId],
           );
+          console.log(`[Voting] Alle nicht-gewählten Vorschläge archiviert (Gewinner: ${winnerId})`);
         } else {
           await pool.query(
             "UPDATE queue_items SET status = 'archived' WHERE voting_round_id = ? AND status = 'suggested'",
             [roundId],
           );
+          console.log(`[Voting] Alle Vorschläge archiviert (kein Gewinner)`);
         }
 
         // === Runde schließen ===
@@ -338,14 +379,17 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
     `,
           [winnerId || null, roundId],
         );
+        console.log(`[Voting] Runde ${roundId} geschlossen`);
 
-        // 🔥 NEU: Top-Charts aktualisieren, weil ein Song jetzt aktiv ist!
+        // Top-Charts aktualisieren
         await broadcastTodayTopArtists(io);
+        console.log(`[Broadcast] Top Artists aktualisiert`);
 
-        // === Broadcast ===
+        // Broadcasts
         io.to(sessionId).emit("voting_round_completed", { winnerId, roundId });
         io.to(sessionId).emit("queue_updated");
         io.to(sessionId).emit("proposals_updated");
+        console.log(`[Broadcast] voting_round_completed, queue_updated, proposals_updated gesendet`);
 
         // === Neue Runde in 3 Sekunden ===
         setTimeout(async () => {
@@ -360,6 +404,8 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
           );
 
           const newRoundId = newRound.insertId;
+
+          console.log(`[Voting] Neue Suggestion-Runde gestartet: ${newRoundId}`);
 
           io.to(sessionId).emit("suggesting_phase_started", {
             roundId: newRoundId,
@@ -378,20 +424,33 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
         }, 3000);
       }
     } catch (err) {
-      console.error("Phase timer error:", err);
+      console.error("[PhaseTimer] Schwerwiegender Fehler:", err);
     }
   }, seconds * 1000);
 }
 
 const getGuestFromToken = async (guestToken) => {
   if (!guestToken) return null;
+
+  const cleanToken = guestToken.trim().replace(/^["']|["']$/g, '');
+  console.log(
+    "[getGuestFromToken] Eingehender Token (raw):", JSON.stringify(guestToken),
+    "| cleaned:", cleanToken,
+    "| Länge:", cleanToken.length
+  );
+
   try {
     const [rows] = await pool.query(
       "SELECT id, nickname FROM guest_users WHERE guest_token = ?",
-      [guestToken],
+      [cleanToken]
+    );
+    console.log(
+      "[getGuestFromToken] Ergebnis für '" + cleanToken + "':",
+      rows.length, "Zeilen", rows[0] || "keine"
     );
     return rows[0] || null;
-  } catch {
+  } catch (err) {
+    console.error("[getGuestFromToken] DB-Fehler:", err);
     return null;
   }
 };
@@ -1487,8 +1546,29 @@ app.get("/sessions/:id/recommendations", async (req, res) => {
   // ---- Auth ----
   const token = req.headers.authorization?.split(" ")[1];
   const guestToken = req.headers["x-guest-token"];
-  const user = token ? await getUserFromToken(token) : null;
-  const guest = guestToken ? await getUserFromToken(guestToken) : null;
+
+  console.log("[Recommendations AUTH DEBUG] Eingehender guestToken:", guestToken);
+
+  let user = null;
+  let guest = null;
+
+  if (token) {
+    user = await getUserFromToken(token);
+    console.log("[Recommendations AUTH] User-Token erkannt → user:", user ? user.id : "null");
+  } else if (guestToken) {
+    guest = await getGuestFromToken(guestToken);
+    console.log("[Recommendations AUTH] Guest-Token erkannt → guest:", guest ? guest.id : "null");
+  }
+
+  if (!user && !guest) {
+    console.warn("[Recommendations AUTH] Unauthorized – weder User noch Guest gefunden");
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  console.log("[Recommendations AUTH] Headers:", req.headers);
+  console.log("[Recommendations AUTH] x-guest-token raw:", req.headers["x-guest-token"]);
+  console.log("[Recommendations AUTH] Nach trim:", req.headers["x-guest-token"]?.trim());
+  console.log("[Recommendations BLUFF AUTH] x-guest-token raw:", guestToken);
   if (!user && !guest) return res.status(401).json({ error: "Unauthorized" });
 
   // ---- Session check ----
@@ -1516,7 +1596,7 @@ app.get("/sessions/:id/recommendations", async (req, res) => {
 
   const titles = queueRows.map((r) => r.title);
 
-  // ---- NEW: Voting-Round & AI Suggestion Check ----
+  // ---- Voting-Round & AI Suggestion Check ----
   const [votingRoundRows] = await pool.query(
     `SELECT id FROM voting_rounds 
      WHERE session_id = ? AND status = 'open'
@@ -1550,7 +1630,11 @@ app.get("/sessions/:id/recommendations", async (req, res) => {
      ORDER BY id ASC`,
     [id, currentRoundId],
   );
-  existingAi = existingAi[0]; // weil pool.query immer [[rows], fields] zurückgibt
+  existingAi = existingAi[0]; // [[rows], fields] → nur rows
+
+  console.log(
+    `[AI] Runde ${currentRoundId}: Gefunden ${existingAi.length} bestehende AI-Vorschläge`
+  );
 
   // === 2. Falls mehr als 3 KI-Vorschläge existieren → überschüssige löschen ===
   if (existingAi.length > 3) {
@@ -1560,10 +1644,10 @@ app.get("/sessions/:id/recommendations", async (req, res) => {
       [toDelete],
     );
     console.log(
-      `[AI] Cleaned up ${toDelete.length} excess AI suggestions → keeping only the oldest 3`,
+      `[AI] Cleaned up ${toDelete.length} excess AI suggestions → keeping only the oldest 3`
     );
 
-    // Nach dem Löschen neu laden (nur die verbleibenden 3)
+    // Nach dem Löschen neu laden
     const [cleaned] = await pool.query(
       `SELECT id, title, video_id AS youtubeId, thumbnail
        FROM queue_items
@@ -1574,36 +1658,33 @@ app.get("/sessions/:id/recommendations", async (req, res) => {
     existingAi = cleaned;
   }
 
-  // === 3. Genau auf 3 KI-Vorschläge auffüllen ===
-  const needed = 3 - existingAi.length;
+  // === 3. Genau auf 3 KI-Vorschläge bringen ===
+  const currentCount = existingAi.length;
+  const needed = 3 - currentCount;
 
-  if (needed <= 0) {
-    console.log(
-      `[AI] Already exactly ${existingAi.length} AI suggestions → returning them`,
-    );
-    return res.json(existingAi);
-  }
+  let finalAiSuggestions = [...existingAi];
 
-  console.log(
-    `[AI] ${numItems} total suggested items. Generating ${needed} new AI suggestion(s)...`,
-  );
+  try {
+    if (needed > 0) {
+      console.log(
+        `[AI] ${numItems} total suggested items. Generating ${needed} new AI suggestion(s) to reach exactly 3...`
+      );
 
-  // ---- Get suggested titles to avoid duplicates ----
+      // ---- Get suggested titles to avoid duplicates ----
+      const [suggestedTitleRows] = await pool.query(
+        `
+        SELECT yvc.title
+        FROM queue_items qi
+        JOIN youtube_video_cache yvc ON qi.video_id = yvc.youtube_id
+        WHERE qi.voting_round_id = ? AND qi.status = 'suggested'
+        `,
+        [currentRoundId],
+      );
 
-  const [suggestedTitleRows] = await pool.query(
-    `
-    SELECT yvc.title
-    FROM queue_items qi
-    JOIN youtube_video_cache yvc ON qi.video_id = yvc.youtube_id
-    WHERE qi.voting_round_id = ? AND qi.status = 'suggested'
-    `,
-    [currentRoundId],
-  );
+      const allTitles = [...titles, ...suggestedTitleRows.map((r) => r.title)];
 
-  const allTitles = [...titles, ...suggestedTitleRows.map((r) => r.title)];
-
-  // ---- Prompt für AI ----
-  const prompt = `
+      // ---- Prompt für AI ----
+      const prompt = `
 You are a music recommendation engine. Your job is to suggest popular songs that likely exist on YouTube.
 
 RULES (MUST FOLLOW EXACTLY):
@@ -1631,113 +1712,192 @@ Instructions:
 [{"title": "Artist - Song Title"}]
 `;
 
-  // ---- Helper: normalize ----
-  const normalize = (str) =>
-    str
-      .toLowerCase()
-      .replace(/\(.*\)|\[.*\]/g, "")
-      .replace(/\b(ft\.?|feat\.?|featuring)\b.*$/gi, "")
-      .replace(
-        /official|video|audio|lyric|visualizer|live|remix|explicit|clean|mv|music video/gi,
-        "",
-      )
-      .replace(/[^\w\s]/g, " ")
-      .replace(/\s+/g, " ")
-      .trim();
+      // ---- Helper: normalize ----
+      const normalize = (str) =>
+        str
+          .toLowerCase()
+          .replace(/\(.*\)|\[.*\]/g, "")
+          .replace(/\b(ft\.?|feat\.?|featuring)\b.*$/gi, "")
+          .replace(
+            /official|video|audio|lyric|visualizer|live|remix|explicit|clean|mv|music video/gi,
+            "",
+          )
+          .replace(/[^\w\s]/g, " ")
+          .replace(/\s+/g, " ")
+          .trim();
 
-  // ---- Helper: Levenshtein ----
-  const levenshteinDistance = (s1, s2) => {
-    const track = Array(s2.length + 1)
-      .fill(null)
-      .map(() => Array(s1.length + 1).fill(null));
-    for (let i = 0; i <= s1.length; i++) track[0][i] = i;
-    for (let j = 0; j <= s2.length; j++) track[j][0] = j;
-    for (let j = 1; j <= s2.length; j++) {
-      for (let i = 1; i <= s1.length; i++) {
-        const indicator = s1[i - 1] === s2[j - 1] ? 0 : 1;
-        track[j][i] = Math.min(
-          track[j][i - 1] + 1,
-          track[j - 1][i] + 1,
-          track[j - 1][i - 1] + indicator,
-        );
-      }
-    }
-    return track[s2.length][s1.length];
-  };
-
-  const levenshteinRatio = (s1, s2) => {
-    const longer = s1.length > s2.length ? s1 : s2;
-    const shorter = s1.length > s2.length ? s2 : s1;
-    if (longer.length === 0) return 100;
-    return Math.round(
-      ((longer.length - levenshteinDistance(longer, shorter)) / longer.length) *
-        100,
-    );
-  };
-
-  try {
-    console.log("[OpenAI] Requesting recommendations for session:", id);
-    const completion = await openai.chat.completions.create({
-      model: "gpt-3.5-turbo",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.7,
-      max_tokens: 400,
-    });
-
-    const raw = completion.choices?.[0]?.message?.content || "";
-
-    let aiSuggestions = [];
-    try {
-      const cleaned = raw.replace(/```json|```/g, "").trim();
-      aiSuggestions = JSON.parse(cleaned);
-    } catch (e) {
-      console.warn("[OpenAI] Failed to parse JSON:", raw);
-    }
-    if (!Array.isArray(aiSuggestions)) aiSuggestions = [];
-    aiSuggestions = aiSuggestions.filter(
-      (s) => s?.title && typeof s.title === "string",
-    );
-
-    const normalizedQueue = allTitles.map((t) => normalize(t));
-
-    aiSuggestions = aiSuggestions.filter((s) => {
-      const norm = normalize(s.title);
-      const isDuplicate = normalizedQueue.some(
-        (q) => levenshteinRatio(q, norm) > 90,
-      );
-      if (isDuplicate)
-        console.log(`[Duplicate skipped] "${s.title}" already in queue`);
-      return !isDuplicate;
-    });
-
-    const results = [];
-
-    for (const s of aiSuggestions) {
-      const normalizedAI = normalize(s.title);
-
-      const [rows] = await pool.query(`SELECT * FROM youtube_video_cache`);
-      let bestMatch = null;
-      let bestScore = 0;
-
-      for (const row of rows) {
-        const normalizedCache = normalize(row.title_norm); // jetzt wirklich genutzt!
-        const score = levenshteinRatio(normalizedAI, normalizedCache);
-        if (score > bestScore) {
-          bestScore = score;
-          bestMatch = row;
+      // ---- Helper: Levenshtein ----
+      const levenshteinDistance = (s1, s2) => {
+        const track = Array(s2.length + 1)
+          .fill(null)
+          .map(() => Array(s1.length + 1).fill(null));
+        for (let i = 0; i <= s1.length; i++) track[0][i] = i;
+        for (let j = 0; j <= s2.length; j++) track[j][0] = j;
+        for (let j = 1; j <= s2.length; j++) {
+          for (let i = 1; i <= s1.length; i++) {
+            const indicator = s1[i - 1] === s2[j - 1] ? 0 : 1;
+            track[j][i] = Math.min(
+              track[j][i - 1] + 1,
+              track[j - 1][i] + 1,
+              track[j - 1][i - 1] + indicator,
+            );
+          }
         }
-      }
+        return track[s2.length][s1.length];
+      };
 
-      if (bestMatch && bestScore > 80) {
-        let durationSeconds = bestMatch.duration;
-        if (durationSeconds === null) {
+      const levenshteinRatio = (s1, s2) => {
+        const longer = s1.length > s2.length ? s1 : s2;
+        const shorter = s1.length > s2.length ? s2 : s1;
+        if (longer.length === 0) return 100;
+        return Math.round(
+          ((longer.length - levenshteinDistance(longer, shorter)) / longer.length) *
+            100,
+        );
+      };
+
+      console.log("[OpenAI] Requesting recommendations for session:", id);
+      const completion = await openai.chat.completions.create({
+        model: "gpt-3.5-turbo",
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0.7,
+        max_tokens: 400,
+      });
+
+      const raw = completion.choices?.[0]?.message?.content || "";
+
+      let aiSuggestions = [];
+      try {
+        const cleaned = raw.replace(/```json|```/g, "").trim();
+        aiSuggestions = JSON.parse(cleaned);
+      } catch (e) {
+        console.warn("[OpenAI] Failed to parse JSON:", raw);
+      }
+      if (!Array.isArray(aiSuggestions)) aiSuggestions = [];
+      aiSuggestions = aiSuggestions.filter(
+        (s) => s?.title && typeof s.title === "string",
+      );
+
+      const normalizedQueue = allTitles.map((t) => normalize(t));
+
+      aiSuggestions = aiSuggestions.filter((s) => {
+        const norm = normalize(s.title);
+        const isDuplicate = normalizedQueue.some(
+          (q) => levenshteinRatio(q, norm) > 90,
+        );
+        if (isDuplicate)
+          console.log(`[Duplicate skipped] "${s.title}" already in queue`);
+        return !isDuplicate;
+      });
+
+      const results = [];
+
+      for (const s of aiSuggestions) {
+        const normalizedAI = normalize(s.title);
+
+        const [rows] = await pool.query(`SELECT * FROM youtube_video_cache`);
+        let bestMatch = null;
+        let bestScore = 0;
+
+        for (const row of rows) {
+          const normalizedCache = normalize(row.title_norm);
+          const score = levenshteinRatio(normalizedAI, normalizedCache);
+          if (score > bestScore) {
+            bestScore = score;
+            bestMatch = row;
+          }
+        }
+
+        if (bestMatch && bestScore > 80) {
+          let durationSeconds = bestMatch.duration;
+          if (durationSeconds === null) {
+            try {
+              const ytDetails = await axios.get(
+                "https://www.googleapis.com/youtube/v3/videos",
+                {
+                  params: {
+                    part: "contentDetails",
+                    id: bestMatch.youtube_id,
+                    key: YOUTUBE_KEY,
+                  },
+                },
+              );
+
+              const durIso = ytDetails.data.items?.[0]?.contentDetails?.duration;
+              if (durIso) {
+                const match = durIso.match(/PT(?:(\d+)M)?(?:(\d+)S)?/);
+                const mins = parseInt(match?.[1] ?? 0, 10);
+                const secs = parseInt(match?.[2] ?? 0, 10);
+                durationSeconds = mins * 60 + secs;
+                await pool.query(
+                  `UPDATE youtube_video_cache SET duration = ? WHERE youtube_id = ?`,
+                  [durationSeconds, bestMatch.youtube_id],
+                );
+              }
+            } catch (err) {
+              console.warn(
+                "[YouTube] Failed to fetch duration from cache match:",
+                err.message,
+              );
+            }
+          }
+          results.push({
+            title: bestMatch.title,
+            youtubeId: bestMatch.youtube_id,
+            thumbnail: bestMatch.thumbnail || "",
+            duration: durationSeconds,
+          });
+          if (results.length >= needed) break;
+          continue;
+        }
+
+        try {
+          const searchQuery = `${s.title
+            .replace(/\(feat.*\)/gi, "")
+            .replace(/\[feat.*\]/gi, "")
+            .trim()} official music video`;
+          const ytRes = await axios.get(
+            "https://www.googleapis.com/youtube/v3/search",
+            {
+              params: {
+                part: "snippet",
+                q: searchQuery,
+                type: "video",
+                maxResults: 5,
+                key: YOUTUBE_KEY,
+              },
+            },
+          );
+
+          const items = ytRes.data.items || [];
+          if (items.length === 0) continue;
+
+          let bestYtMatch = null;
+          let bestYtScore = 0;
+          for (const item of items) {
+            const titleNorm = normalize(item.snippet.title);
+            const score = levenshteinRatio(normalizedAI, titleNorm);
+            if (score > bestYtScore) {
+              bestYtScore = score;
+              bestYtMatch = item;
+            }
+          }
+
+          if (!bestYtMatch || bestYtScore < 80) continue;
+
+          const videoId = bestYtMatch.id.videoId;
+          const title = bestYtMatch.snippet.title;
+          const thumbnail = bestYtMatch.snippet.thumbnails.medium?.url || "";
+          const titleNorm = normalize(title);
+
+          let durationSeconds = null;
           try {
             const ytDetails = await axios.get(
               "https://www.googleapis.com/youtube/v3/videos",
               {
                 params: {
                   part: "contentDetails",
-                  id: bestMatch.youtube_id,
+                  id: videoId,
                   key: YOUTUBE_KEY,
                 },
               },
@@ -1749,157 +1909,89 @@ Instructions:
               const mins = parseInt(match?.[1] ?? 0, 10);
               const secs = parseInt(match?.[2] ?? 0, 10);
               durationSeconds = mins * 60 + secs;
-              await pool.query(
-                `UPDATE youtube_video_cache SET duration = ? WHERE youtube_id = ?`,
-                [durationSeconds, bestMatch.youtube_id],
-              );
             }
           } catch (err) {
-            console.warn(
-              "[YouTube] Failed to fetch duration from cache match:",
-              err.message,
-            );
+            console.warn("[YouTube] Failed to fetch duration:", err.message);
           }
-        }
-        results.push({
-          title: bestMatch.title,
-          youtubeId: bestMatch.youtube_id,
-          thumbnail: bestMatch.thumbnail || "",
-          duration: durationSeconds,
-        });
-        if (results.length >= needed) break;
-        continue;
-      }
 
-      try {
-        const searchQuery = `${s.title
-          .replace(/\(feat.*\)/gi, "")
-          .replace(/\[feat.*\]/gi, "")
-          .trim()} official music video`;
-        const ytRes = await axios.get(
-          "https://www.googleapis.com/youtube/v3/search",
-          {
-            params: {
-              part: "snippet",
-              q: searchQuery,
-              type: "video",
-              maxResults: 5,
-              key: YOUTUBE_KEY,
-            },
-          },
-        );
-
-        const items = ytRes.data.items || [];
-        if (items.length === 0) continue;
-
-        let bestYtMatch = null;
-        let bestYtScore = 0;
-        for (const item of items) {
-          const titleNorm = normalize(item.snippet.title);
-          const score = levenshteinRatio(normalizedAI, titleNorm);
-          if (score > bestYtScore) {
-            bestYtScore = score;
-            bestYtMatch = item;
-          }
-        }
-
-        if (!bestYtMatch || bestYtScore < 80) continue;
-
-        const videoId = bestYtMatch.id.videoId;
-        const title = bestYtMatch.snippet.title;
-        const thumbnail = bestYtMatch.snippet.thumbnails.medium?.url || "";
-        const titleNorm = normalize(title);
-
-        // ---- NEW: Fetch video duration ----
-        let durationSeconds = null;
-        try {
-          const ytDetails = await axios.get(
-            "https://www.googleapis.com/youtube/v3/videos",
-            {
-              params: {
-                part: "contentDetails",
-                id: videoId,
-                key: YOUTUBE_KEY,
-              },
-            },
+          await pool.query(
+            `INSERT INTO youtube_video_cache (youtube_id, title, title_norm, thumbnail, duration)
+             VALUES (?, ?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE 
+               title = VALUES(title),
+               title_norm = VALUES(title_norm),
+               thumbnail = VALUES(thumbnail),
+               duration = VALUES(duration)`,
+            [videoId, title, titleNorm, thumbnail, durationSeconds],
           );
 
-          const durIso = ytDetails.data.items?.[0]?.contentDetails?.duration;
-          if (durIso) {
-            const match = durIso.match(/PT(?:(\d+)M)?(?:(\d+)S)?/);
-            const mins = parseInt(match?.[1] ?? 0, 10);
-            const secs = parseInt(match?.[2] ?? 0, 10);
-            durationSeconds = mins * 60 + secs;
-          }
+          results.push({
+            title,
+            youtubeId: videoId,
+            thumbnail,
+            duration: durationSeconds,
+          });
+
+          if (results.length >= needed) break;
         } catch (err) {
-          console.warn("[YouTube] Failed to fetch duration:", err.message);
-        }
-
-        // ---- UPDATED: Cache includes duration ----
-        await pool.query(
-          `INSERT INTO youtube_video_cache (youtube_id, title, title_norm, thumbnail, duration)
-           VALUES (?, ?, ?, ?, ?)
-           ON DUPLICATE KEY UPDATE 
-             title = VALUES(title),
-             title_norm = VALUES(title_norm),
-             thumbnail = VALUES(thumbnail),
-             duration = VALUES(duration)`,
-          [videoId, title, titleNorm, thumbnail, durationSeconds],
-        );
-
-        // ---- UPDATED: push duration into results ----
-        results.push({
-          title,
-          youtubeId: videoId,
-          thumbnail,
-          duration: durationSeconds,
-        });
-
-        if (results.length >= needed) break;
-      } catch (err) {
-        console.warn(
-          `[YouTube] Search failed for "${s.title}":`,
-          err.message,
-          err.response?.data,
-        );
-        if (err.response?.status === 403) {
-          console.error("[YouTube 403] Check API-Key Restrictions/Quota!");
+          console.warn(
+            `[YouTube] Search failed for "${s.title}":`,
+            err.message,
+            err.response?.data,
+          );
+          if (err.response?.status === 403) {
+            console.error("[YouTube 403] Check API-Key Restrictions/Quota!");
+          }
         }
       }
-    }
 
-    const created = [];
+      const created = [];
 
-    for (const item of results) {
-      const [insert] = await pool.query(
-        `INSERT INTO queue_items 
-          (session_id, video_id, title, thumbnail, duration, status, item_source, item_type, voting_round_id)
-         VALUES (?, ?, ?, ?, ?, 'suggested', 'ai', 'music', ?)`,
-        [
-          id,
-          item.youtubeId,
-          item.title,
-          item.thumbnail,
-          item.duration,
-          currentRoundId,
-        ],
+      for (const item of results) {
+        const [insert] = await pool.query(
+          `INSERT INTO queue_items 
+            (session_id, video_id, title, thumbnail, duration, status, item_source, item_type, voting_round_id)
+           VALUES (?, ?, ?, ?, ?, 'suggested', 'ai', 'music', ?)`,
+          [
+            id,
+            item.youtubeId,
+            item.title,
+            item.thumbnail,
+            item.duration,
+            currentRoundId,
+          ],
+        );
+
+        created.push({
+          id: insert.insertId,
+          title: item.title,
+          youtubeId: item.youtubeId,
+          thumbnail: item.thumbnail,
+          status: "suggested",
+          item_source: "ai",
+        });
+      }
+
+      finalAiSuggestions = [...finalAiSuggestions, ...created];
+
+      console.log(
+        `[AI] Erfolgreich ${created.length} neue Vorschläge hinzugefügt → jetzt insgesamt ${finalAiSuggestions.length}`
       );
-
-      created.push({
-        id: insert.insertId,
-        title: item.title,
-        youtubeId: item.youtubeId,
-        thumbnail: item.thumbnail,
-        status: "suggested",
-        item_source: "ai",
-      });
+    } else {
+      console.log(
+        `[AI] Bereits ${currentCount} AI-Vorschläge vorhanden → keine Neugenerierung nötig`
+      );
     }
 
-    const allAi = [...existingAi, ...created];
-    return res.json(allAi);
+    // === Finale Rückgabe ===
+    return res.json(finalAiSuggestions);
   } catch (err) {
     console.error("[Recommendation Error]", err);
-    res.status(500).json({ error: "Recommendation failed" });
+    // Fallback: trotzdem die bestehenden zurückgeben
+    console.warn(
+      `[AI] Generierung fehlgeschlagen – gebe trotzdem die ${finalAiSuggestions.length} vorhandenen zurück`
+    );
+    return res.json(finalAiSuggestions);
   }
 });
 
@@ -3127,11 +3219,11 @@ app.post("/sessions/:id/leave-live", async (req, res) => {
 
     const [[{ count }]] = await pool.query(
       "SELECT COUNT(*) AS count FROM session_participants WHERE session_id = ? AND is_live = 1",
-      [parseInt(id, 10)],
+      [sessionIdInt],
     );
 
     io.emit("participant_count_update", {
-      sessionId: parseInt(id, 10),
+      sessionId: sessionIdInt,
       count: count || 0,
     });
     res.json({ success: true });
