@@ -109,7 +109,7 @@ const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret_here";
 const YOUTUBE_KEY = process.env.YOUTUBE_KEY;
 
 const httpServer = app.listen(4000, () =>
-  console.log("Server läuft auf http://localhost:4000"),
+  console.log("Server läuft auf https://api.tunevote.com"),
 );
 const io = new Server(httpServer, { cors: { origin: "*" } });
 
@@ -1318,7 +1318,7 @@ app.get("/join", async (req, res) => {
 
     // 3. Redirect zum Frontend
     res.json({
-      redirect: `http://localhost:5173/session/${sessionId}`,
+      redirect: `https://app.tunevote.com/session/${sessionId}`,
     });
 
     // ─────────────────────────────────────────────
@@ -1327,7 +1327,7 @@ app.get("/join", async (req, res) => {
     if (autoStarted) {
       setTimeout(async () => {
         try {
-          await axios.post(`http://localhost:4000/sessions/${sessionId}/start`);
+          await axios.post(`https://api.tunevote.com/sessions/${sessionId}/start`);
           console.log(`[AUTO] Session ${sessionId} gestartet (Titel: ${requestedTitle || DEFAULT_TITLE})`);
         } catch (err) {
           console.error("[AUTO] Start fehlgeschlagen:", err.response?.data || err.message);
