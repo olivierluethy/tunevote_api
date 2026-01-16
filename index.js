@@ -141,7 +141,7 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
     try {
       console.log(
         `[PhaseTimer] Timer abgelaufen für Session ${sessionId}, Runde ${roundId}, ` +
-        `Phase: ${currentPhase} → nächste Phase: ${nextPhase}`
+          `Phase: ${currentPhase} → nächste Phase: ${nextPhase}`,
       );
 
       if (nextPhase === "voting") {
@@ -156,7 +156,9 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
           [votingEnds, roundId, sessionId],
         );
 
-        console.log(`[Voting] Wechsel zu Voting-Phase → ends at ${votingEnds.toISOString()}`);
+        console.log(
+          `[Voting] Wechsel zu Voting-Phase → ends at ${votingEnds.toISOString()}`,
+        );
 
         io.to(sessionId).emit("voting_phase_changed", {
           phase: "voting",
@@ -168,7 +170,9 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
         startPhaseTimer(sessionId, roundId, "voting", 60);
       } else if (nextPhase === "suggestion") {
         // ==================== VOTING BEENDET → GEWINNER BESTIMMEN ====================
-        console.log(`[Voting] Voting-Runde ${roundId} beendet – starte Gewinnerermittlung`);
+        console.log(
+          `[Voting] Voting-Runde ${roundId} beendet – starte Gewinnerermittlung`,
+        );
 
         let winnerId = null;
 
@@ -196,7 +200,9 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
           );
           console.log(`[Voting] Gewinner durch Votes: #${winnerId}`);
         } else {
-          console.log(`[Voting] Keine Votes abgegeben → Fallback-Regeln prüfen`);
+          console.log(
+            `[Voting] Keine Votes abgegeben → Fallback-Regeln prüfen`,
+          );
 
           // 1. Gibt es User/Guest-Vorschläge?
           const [userProposal] = await pool.query(
@@ -219,60 +225,65 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
               [winnerId],
             );
             console.log(
-              `[Voting] Keine Votes → Ältester User-/Guest-Vorschlag gewinnt: #${winnerId}`
+              `[Voting] Keine Votes → Ältester User-/Guest-Vorschlag gewinnt: #${winnerId}`,
             );
           } else {
-            console.log(`[Voting] Kein User-/Guest-Vorschlag → prüfe AI-Fallback`);
+            console.log(
+              `[Voting] Kein User-/Guest-Vorschlag → prüfe AI-Fallback`,
+            );
 
             // ──────────────────────────────────────────────────────
-            // NEU: Live-Check über Socket.IO (robuster als DB)
-            const liveSockets = await io.in(String(sessionId)).fetchSockets();
-            const liveCountSockets = liveSockets.length;
-
-            // Zum Vergleich / Debug: was sagt die DB noch?
+            // Live-Check NUR über session_participants.is_live (wie gewünscht)
             const [liveRows] = await pool.query(
               "SELECT COUNT(*) AS cnt FROM session_participants WHERE session_id = ? AND is_live = 1",
               [sessionId],
             );
-            const liveCountDb = liveRows[0].cnt;
+            const liveCount = liveRows[0]?.cnt ?? 0;
+
+            // Optional: Socket-Anzahl nur noch zum Debuggen loggen (kann später entfernt werden)
+            const liveSocketsDebug = await io
+              .in(String(sessionId))
+              .fetchSockets();
+            const socketCountDebug = liveSocketsDebug.length;
 
             console.log(
               `[Voting LIVE-CHECK] ` +
-              `Sockets: ${liveCountSockets} verbunden | ` +
-              `DB (session_participants.is_live=1): ${liveCountDb} | ` +
-              `Runde: ${roundId} | Session: ${sessionId}`
+                `DB live participants (is_live=1): ${liveCount} | ` +
+                `Socket.IO Verbindungen (nur Debug): ${socketCountDebug} | ` +
+                `Runde: ${roundId} | Session: ${sessionId}`,
             );
 
-            if (liveCountSockets > 0) {
+            if (liveCount > 0) {
+              // AI-Fallback versuchen – nur wenn laut DB noch jemand live ist
               const [aiCountRows] = await pool.query(
                 `
-          SELECT COUNT(*) AS cnt
-          FROM queue_items
-          WHERE voting_round_id = ?
-            AND status = 'suggested'
-            AND item_source = 'ai'
-            AND NOT EXISTS (SELECT 1 FROM votes v WHERE v.queue_item_id = queue_items.id)
-          `,
+      SELECT COUNT(*) AS cnt
+      FROM queue_items
+      WHERE voting_round_id = ?
+        AND status = 'suggested'
+        AND item_source = 'ai'
+        AND NOT EXISTS (SELECT 1 FROM votes v WHERE v.queue_item_id = queue_items.id)
+      `,
                 [roundId],
               );
-              const aiCount = aiCountRows[0].cnt;
+              const aiCount = aiCountRows[0]?.cnt ?? 0;
 
               console.log(
-                `[Voting] AI-Fallback-Prüfung: ${aiCount} AI-Songs ohne Votes vorhanden`
+                `[Voting] AI-Fallback-Prüfung: ${aiCount} AI-Songs ohne Votes vorhanden`,
               );
 
               if (aiCount >= 3) {
                 const [aiRows] = await pool.query(
                   `
-            SELECT id
-            FROM queue_items
-            WHERE voting_round_id = ?
-              AND status = 'suggested'
-              AND item_source = 'ai'
-              AND NOT EXISTS (SELECT 1 FROM votes v WHERE v.queue_item_id = queue_items.id)
-            ORDER BY RAND()
-            LIMIT 1
-            `,
+        SELECT id
+        FROM queue_items
+        WHERE voting_round_id = ?
+          AND status = 'suggested'
+          AND item_source = 'ai'
+          AND NOT EXISTS (SELECT 1 FROM votes v WHERE v.queue_item_id = queue_items.id)
+        ORDER BY RAND()
+        LIMIT 1
+        `,
                   [roundId],
                 );
 
@@ -284,22 +295,24 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
                   );
                   console.log(
                     `[Voting] Fallback: Zufälliger AI-Song gewählt (#${winnerId}) – ` +
-                    `${aiCount} AI-Songs, ${liveCountSockets} live (Sockets)`
+                      `${aiCount} AI-Songs, ${liveCount} live (DB)`,
                   );
                 } else {
-                  console.log(`[Voting] Kein AI-Song gefunden trotz aiCount >= 3`);
+                  console.log(
+                    `[Voting] Kein AI-Song gefunden trotz aiCount >= 3`,
+                  );
                 }
               } else {
                 console.log(
                   `[Voting] Fallback nicht möglich: Nur ${aiCount}/3 AI-Songs (0 Votes), ` +
-                  `${liveCountSockets} live (Sockets)`
+                    `${liveCount} live (DB)`,
                 );
               }
             } else {
-              // === WIRKLICH KEIN LIVE-TEILNEHMER ===
+              // === WIRKLICH KEIN LIVE-TEILNEHMER laut Datenbank ===
               console.log(
                 `[Voting] KEIN GEWINNER & KEINE LIVE-TEILNEHMER ` +
-                `(Sockets: ${liveCountSockets}, DB: ${liveCountDb}) → Session wird beendet`
+                  `(DB live count: ${liveCount}, Sockets nur Debug: ${socketCountDebug}) → Session wird beendet`,
               );
 
               // Alle vorgeschlagenen Songs archivieren
@@ -312,34 +325,59 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
               // Runde schließen
               await pool.query(
                 `UPDATE voting_rounds 
-                 SET status = 'closed', phase = 'closed', winner_queue_item_id = NULL 
-                 WHERE id = ?`,
+       SET status = 'closed', phase = 'closed', winner_queue_item_id = NULL 
+       WHERE id = ?`,
                 [roundId],
               );
-              console.log(`[Voting] Runde ${roundId} geschlossen (kein Gewinner)`);
+              console.log(
+                `[Voting] Runde ${roundId} geschlossen (kein Gewinner)`,
+              );
 
               // Session beenden
               await pool.query(
                 `UPDATE sessions 
-                 SET is_live = 0, ended_at = NOW() 
-                 WHERE id = ? AND is_live = 1`,
+       SET is_live = 0, ended_at = NOW() 
+       WHERE id = ? AND is_live = 1`,
                 [sessionId],
               );
-              console.log(`[Session] Session ${sessionId} als beendet markiert`);
+              console.log(
+                `[Session] Session ${sessionId} als beendet markiert`,
+              );
 
-              // Queue Items zurücksetzen
-              await pool.query('UPDATE queue_items SET status = "queued", played = 0, startedAt = NULL, voting_round_id = NULL');
-              console.log(`[Session] Alle Queue Items zurückgesetzt`);
+              // Nur die wirklich gespielten Items zurücksetzen (dein aktueller Ansatz)
+              await pool.query(
+                `
+                            UPDATE queue_items
+            SET 
+              status = 'queued',
+              played = 0,
+              playedAt = NULL,
+              startedAt = NULL,
+              voting_round_id = NULL
+            WHERE session_id = ?
+              AND status IN ('played', 'playing', 'suggested');
+                `,
+                [sessionId],
+              );
+              console.log(
+                `[Session] Gespielte Queue Items wurden zurückgesetzt`,
+              );
 
+              // Broadcast
               io.to(sessionId).emit("session_ended", {
                 reason: "no_active_participants",
-                message: "Die Session wurde beendet, da niemand mehr aktiv war.",
+                message:
+                  "The session was terminated because no one was active anymore.",
               });
               console.log(`[Broadcast] session_ended gesendet`);
 
+              // Raum räumen
               io.in(sessionId).socketsLeave(sessionId);
-              console.log(`[Socket] Alle Clients aus Raum ${sessionId} entfernt`);
+              console.log(
+                `[Socket] Alle Clients aus Raum ${sessionId} entfernt`,
+              );
 
+              // Timer aufräumen
               if (phaseTimers[sessionId]) {
                 clearTimeout(phaseTimers[sessionId]);
                 delete phaseTimers[sessionId];
@@ -361,7 +399,9 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
       `,
             [roundId, winnerId],
           );
-          console.log(`[Voting] Alle nicht-gewählten Vorschläge archiviert (Gewinner: ${winnerId})`);
+          console.log(
+            `[Voting] Alle nicht-gewählten Vorschläge archiviert (Gewinner: ${winnerId})`,
+          );
         } else {
           await pool.query(
             "UPDATE queue_items SET status = 'archived' WHERE voting_round_id = ? AND status = 'suggested'",
@@ -389,7 +429,9 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
         io.to(sessionId).emit("voting_round_completed", { winnerId, roundId });
         io.to(sessionId).emit("queue_updated");
         io.to(sessionId).emit("proposals_updated");
-        console.log(`[Broadcast] voting_round_completed, queue_updated, proposals_updated gesendet`);
+        console.log(
+          `[Broadcast] voting_round_completed, queue_updated, proposals_updated gesendet`,
+        );
 
         // === Neue Runde in 3 Sekunden ===
         setTimeout(async () => {
@@ -405,7 +447,9 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
 
           const newRoundId = newRound.insertId;
 
-          console.log(`[Voting] Neue Suggestion-Runde gestartet: ${newRoundId}`);
+          console.log(
+            `[Voting] Neue Suggestion-Runde gestartet: ${newRoundId}`,
+          );
 
           io.to(sessionId).emit("suggesting_phase_started", {
             roundId: newRoundId,
