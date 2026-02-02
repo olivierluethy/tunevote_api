@@ -8,9 +8,12 @@ const { Server } = require("socket.io");
 const { v4: uuidv4 } = require("uuid");
 const axios = require("axios");
 const crypto = require("crypto");
-const ytdl = require("ytdl-core");
+const ytdl = require("@distube/ytdl-core");
 const nodemailer = require("nodemailer");
 const multer = require("multer");
+
+const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
+const GOOGLE_USERINFO_URL = 'https://www.googleapis.com/oauth2/v3/userinfo';
 
 const transporter = nodemailer.createTransport({
   service: "gmail",
@@ -109,7 +112,7 @@ const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret_here";
 const YOUTUBE_KEY = process.env.YOUTUBE_KEY;
 
 const httpServer = app.listen(4000, () =>
-  console.log("Server läuft auf https://api.tunevote.com"),
+  console.log("Server läuft auf http://localhost:4000"),
 );
 const io = new Server(httpServer, { cors: { origin: "*" } });
 
@@ -1318,7 +1321,7 @@ app.get("/join", async (req, res) => {
 
     // 3. Redirect zum Frontend
     res.json({
-      redirect: `https://app.tunevote.com/session/${sessionId}`,
+      redirect: `http://localhost:5173/session/${sessionId}`,
     });
 
     // ─────────────────────────────────────────────
@@ -1327,7 +1330,7 @@ app.get("/join", async (req, res) => {
     if (autoStarted) {
       setTimeout(async () => {
         try {
-          await axios.post(`https://api.tunevote.com/sessions/${sessionId}/start`);
+          await axios.post(`http://localhost:4000/sessions/${sessionId}/start`);
           console.log(`[AUTO] Session ${sessionId} gestartet (Titel: ${requestedTitle || DEFAULT_TITLE})`);
         } catch (err) {
           console.error("[AUTO] Start fehlgeschlagen:", err.response?.data || err.message);
@@ -3323,7 +3326,7 @@ app.post("/forgot-password", async (req, res) => {
     );
 
     // Korrekter Reset-Link
-    const baseUrl = process.env.FRONTEND_URL || "https://app.tunevote.com ";
+    const baseUrl = process.env.FRONTEND_URL || "http://localhost:5173 ";
     const resetLink = `${baseUrl}/reset-password/${resetToken}`;
 
     const primaryColor = "#4f46e5";
@@ -3767,7 +3770,7 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
     await conn.commit();
 
     // === 4. E-Mail-Inhalte je nach Registrierungsstatus unterscheiden ===
-    const baseUrl = process.env.FRONTEND_URL || "https://app.tunevote.com ";
+    const baseUrl = process.env.FRONTEND_URL || "http://localhost:5173 ";
     const dashboardLink = `${baseUrl}/dashboard`;
     const primaryColor = "#4f46e5";
 
@@ -5816,3 +5819,76 @@ async function broadcastTodayTopArtists(io) {
     }
   }, 1500); // 1,5 Sekunden warten → sammelt mehrere Änderungen
 }
+
+// ─── Google Login URL generieren ───
+app.get('/auth/google', (req, res) => {
+  const rootUrl = 'https://accounts.google.com/o/oauth2/v2/auth';
+  const options = {
+    redirect_uri: process.env.GOOGLE_CALLBACK_URL,
+    client_id: process.env.GOOGLE_CLIENT_ID,
+    access_type: 'offline',
+    response_type: 'code',
+    prompt: 'consent',
+    scope: [
+      'https://www.googleapis.com/auth/userinfo.profile',
+      'https://www.googleapis.com/auth/userinfo.email',
+    ].join(' '),
+  };
+
+  const qs = new URLSearchParams(options).toString();
+  res.redirect(`${rootUrl}?${qs}`);
+});
+
+// ─── Callback ───
+app.get('/auth/google/callback', async (req, res) => {
+  const { code } = req.query;
+
+  if (!code) {
+    return res.redirect('http://localhost:4000/login?error=no_code');
+  }
+
+  try {
+    // 1. Code gegen Tokens tauschen
+    const { data } = await axios.post(GOOGLE_TOKEN_URL, {
+      code,
+      client_id: process.env.GOOGLE_CLIENT_ID,
+      client_secret: process.env.GOOGLE_CLIENT_SECRET,
+      redirect_uri: process.env.GOOGLE_CALLBACK_URL,
+      grant_type: 'authorization_code',
+    });
+
+    const { access_token } = data;
+
+    // 2. User-Info holen
+    const { data: userInfo } = await axios.get(GOOGLE_USERINFO_URL, {
+      headers: { Authorization: `Bearer ${access_token}` },
+    });
+
+    const { sub: googleId, email, name, picture } = userInfo;
+
+    // 3. User in DB suchen oder erstellen
+    let [rows] = await pool.query('SELECT * FROM users WHERE google_id = ?', [googleId]);
+    let user = rows[0];
+
+    if (!user) {
+      const [result] = await pool.query(
+        'INSERT INTO users (google_id, email, username, imageUrl) VALUES (?, ?, ?, ?)',
+        [googleId, email, name || email.split('@')[0], picture]
+      );
+      user = { id: result.insertId, googleId, email, username: name || email.split('@')[0], imageUrl: picture };
+    }
+
+    // 4. JWT erstellen (wie bei deinem normalen Login)
+    const token = jwt.sign({ id: user.id }, process.env.JWT_SECRET, { expiresIn: '7d' });
+
+    // 5. Redirect zum Frontend
+    // 5. Redirect zum Frontend – JETZT mit /google-callback
+res.redirect(
+  `http://localhost:5173/google-callback?token=${token}&username=${encodeURIComponent(user.username)}&userId=${user.id}`
+);
+  } catch (err) {
+    console.error(err);
+    res.redirect('http://localhost:5173/login?error=google_auth_failed');
+  }
+});
+
