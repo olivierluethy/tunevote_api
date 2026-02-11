@@ -112,7 +112,7 @@ const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret_here";
 const YOUTUBE_KEY = process.env.YOUTUBE_KEY;
 
 const httpServer = app.listen(4000, () =>
-  console.log("Server läuft auf https://api.tunevote.com"),
+  console.log("Server läuft auf http://localhost:4000"),
 );
 const io = new Server(httpServer, { cors: { origin: "*" } });
 
@@ -1008,74 +1008,143 @@ app.get("/sessions/:id/playback-sync", async (req, res) => {
 // === Auth: Register / Login ===
 app.post("/register", async (req, res) => {
   const { username, email, password } = req.body;
-  if (!username || !email || !password)
-    return res.status(400).json({ error: "Missing fields" });
+  
+  if (!username || !email || !password) {
+    return res.status(400).json({ error: "Bitte fülle alle Felder aus." });
+  }
 
   try {
-    // Prüfen ob es den User schon gibt
-    const [exists] = await pool.query(
-      "SELECT 1 FROM users WHERE email = ? OR username = ?",
-      [email, username],
+    // 1. Prüfen, ob E-Mail oder Username bereits existieren (Passwort-Hash mit abfragen!)
+    const [rows] = await pool.query(
+      "SELECT id, google_id, facebook_id, email, username, password_hash FROM users WHERE LOWER(email) = LOWER(?) OR username = ?",
+      [email, username]
     );
-    if (exists.length > 0)
-      return res.status(409).json({ error: "User exists" });
 
-    // Benutzer anlegen
+    if (rows.length > 0) {
+      const existingUser = rows[0];
+
+      // FALL A: E-Mail existiert bereits
+      if (existingUser.email.toLowerCase() === email.toLowerCase()) {
+        
+        // Hat der User KEIN Passwort, aber eine Social-ID? -> Direkt-Leitung
+        if (!existingUser.password_hash) {
+          if (existingUser.google_id) {
+            return res.status(200).json({ 
+              success: false,
+              redirect: "google",
+              message: "Konto existiert bereits via Google. Leite weiter..." 
+            });
+          }
+          if (existingUser.facebook_id) {
+            return res.status(200).json({ 
+              success: false,
+              redirect: "facebook",
+              message: "Konto existiert bereits via Facebook. Leite weiter..." 
+            });
+          }
+        }
+        
+        // Wenn er ein Passwort hat (normaler Account)
+        return res.status(409).json({ error: "Diese E-Mail-Adresse wird bereits verwendet." });
+      }
+
+      // FALL B: Username existiert bereits
+      if (existingUser.username === username) {
+        return res.status(409).json({ error: "Dieser Benutzername ist bereits vergeben." });
+      }
+    }
+
+    // 2. Neuer Benutzer anlegen (da keine Konflikte gefunden wurden)
     const password_hash = await bcrypt.hash(password, 10);
     const [result] = await pool.query(
       "INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)",
-      [username, email, password_hash],
+      [username, email, password_hash]
     );
 
     const newUserId = result.insertId;
 
-    // ⭐ NACHREGISTRIERTER BENUTZER: INVITES VERKNÜPFEN
-    // Alle offenen Einladungen anhand der E-Mail nachträglich verbinden
+    // 3. Invites verknüpfen
     await pool.query(
-      `UPDATE session_invites
-       SET invited_user_id = ?
-       WHERE invited_user_id IS NULL
-         AND LOWER(email) = LOWER(?)`,
-      [newUserId, email],
+      `UPDATE session_invites SET invited_user_id = ? WHERE invited_user_id IS NULL AND LOWER(email) = LOWER(?)`,
+      [newUserId, email]
     );
 
-    // JWT erstellen
-    const token = jwt.sign({ id: newUserId, username }, JWT_SECRET, {
-      expiresIn: "7d",
-    });
+    // 4. JWT erstellen
+    const token = jwt.sign({ id: newUserId, username }, process.env.JWT_SECRET, { expiresIn: "7d" });
 
     res.json({
       success: true,
-      message: "Registration successful! Redirecting...",
+      message: "Registrierung erfolgreich!",
+      token,
       username,
+      userId: newUserId
     });
+
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Server error" });
+    console.error("Registrierungs-Fehler:", err);
+    res.status(500).json({ error: "Server-Fehler bei der Registrierung." });
   }
 });
 
 app.post("/login", async (req, res) => {
   const { email, password } = req.body;
-  if (!email || !password)
-    return res.status(400).json({ error: "Missing credentials" });
+
+  if (!email || !password) {
+    return res.status(400).json({ error: "Bitte gib E-Mail und Passwort an." });
+  }
 
   try {
-    const [rows] = await pool.query("SELECT * FROM users WHERE email = ?", [
-      email,
-    ]);
-    if (!rows[0] || !(await bcrypt.compare(password, rows[0].password_hash))) {
-      return res.status(401).json({ error: "Invalid credentials" });
-    }
+    // 1. User anhand der E-Mail suchen
+    const [rows] = await pool.query("SELECT * FROM users WHERE LOWER(email) = LOWER(?)", [email]);
     const user = rows[0];
+
+    // 2. Prüfen, ob der User überhaupt existiert
+    if (!user) {
+      return res.status(401).json({ error: "Ungültige Anmeldedaten." });
+    }
+
+    // 3. SPECIAL CASE: Social-Login Check
+    // Wenn kein Passwort-Hash vorhanden ist, wurde der Account via Google oder Facebook erstellt
+    if (!user.password_hash) {
+      if (user.google_id) {
+        return res.status(403).json({ 
+          error: "Social_Login_Required", 
+          message: "Dieser Account ist mit Google verknüpft. Bitte nutze 'Login mit Google'.",
+          method: "google"
+        });
+      }
+      if (user.facebook_id) {
+        return res.status(403).json({ 
+          error: "Social_Login_Required", 
+          message: "Dieser Account ist mit Facebook verknüpft. Bitte nutze 'Login mit Facebook'.",
+          method: "facebook"
+        });
+      }
+    }
+
+    // 4. Standard Passwort-Check
+    const isPasswordCorrect = await bcrypt.compare(password, user.password_hash);
+    if (!isPasswordCorrect) {
+      return res.status(401).json({ error: "Ungültige Anmeldedaten." });
+    }
+
+    // 5. JWT erstellen (Payload konsistent zu Google/Facebook halten)
     const token = jwt.sign(
-      { id: user.id, username: user.username },
-      JWT_SECRET,
-      { expiresIn: "7d" },
+      { id: user.id, username: user.username }, 
+      process.env.JWT_SECRET, 
+      { expiresIn: "7d" }
     );
-    res.json({ token, username: user.username });
+
+    // 6. Erfolg
+    res.json({ 
+      token, 
+      username: user.username,
+      userId: user.id 
+    });
+
   } catch (err) {
-    res.status(500).json({ error: "Server error" });
+    console.error("Login Fehler:", err);
+    res.status(500).json({ error: "Ein interner Serverfehler ist aufgetreten." });
   }
 });
 
@@ -1321,7 +1390,7 @@ app.get("/join", async (req, res) => {
 
     // 3. Redirect zum Frontend
     res.json({
-      redirect: `https://app.tunevote.com/session/${sessionId}`,
+      redirect: `http://localhost:5173/session/${sessionId}`,
     });
 
     // ─────────────────────────────────────────────
@@ -1330,7 +1399,7 @@ app.get("/join", async (req, res) => {
     if (autoStarted) {
       setTimeout(async () => {
         try {
-          await axios.post(`https://api.tunevote.com/sessions/${sessionId}/start`);
+          await axios.post(`http://localhost:4000/sessions/${sessionId}/start`);
           console.log(`[AUTO] Session ${sessionId} gestartet (Titel: ${requestedTitle || DEFAULT_TITLE})`);
         } catch (err) {
           console.error("[AUTO] Start fehlgeschlagen:", err.response?.data || err.message);
@@ -3326,7 +3395,7 @@ app.post("/forgot-password", async (req, res) => {
     );
 
     // Korrekter Reset-Link
-    const baseUrl = process.env.FRONTEND_URL || "https://app.tunevote.com ";
+    const baseUrl = process.env.FRONTEND_URL || "http://localhost:5173 ";
     const resetLink = `${baseUrl}/reset-password/${resetToken}`;
 
     const primaryColor = "#4f46e5";
@@ -3770,7 +3839,7 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
     await conn.commit();
 
     // === 4. E-Mail-Inhalte je nach Registrierungsstatus unterscheiden ===
-    const baseUrl = process.env.FRONTEND_URL || "https://app.tunevote.com ";
+    const baseUrl = process.env.FRONTEND_URL || "http://localhost:5173 ";
     const dashboardLink = `${baseUrl}/dashboard`;
     const primaryColor = "#4f46e5";
 
@@ -5844,7 +5913,7 @@ app.get("/auth/google/callback", async (req, res) => {
   const { code } = req.query;
 
   if (!code) {
-    return res.redirect("https://app.tunevote.com/login?error=no_code");
+    return res.redirect("http://localhost:5173/login?error=no_code");
   }
 
   try {
@@ -5874,14 +5943,24 @@ app.get("/auth/google/callback", async (req, res) => {
     );
 
     const { sub: googleId, email, name, picture } = userInfo;
-
-    // Fallback für den Anzeigenamen, falls name fehlt
     const newUsername = name || email.split("@")[0];
-    const newImageUrl = picture || null; // Google liefert manchmal null
+    const newImageUrl = picture || null;
 
-    // 3. User in DB suchen
+    // 3. User in DB suchen (Zweistufige Suche zur Verknüpfung)
     let [rows] = await pool.query("SELECT * FROM users WHERE google_id = ?", [googleId]);
     let user = rows[0];
+
+    if (!user && email) {
+      // Falls Google-ID unbekannt: Suche nach E-Mail (z.B. von Facebook-Account)
+      let [emailRows] = await pool.query("SELECT * FROM users WHERE email = ?", [email]);
+      user = emailRows[0];
+
+      if (user) {
+        // Verknüpfung: Google-ID beim bestehenden User nachtragen
+        await pool.query("UPDATE users SET google_id = ? WHERE id = ?", [googleId, user.id]);
+        user.google_id = googleId;
+      }
+    }
 
     if (!user) {
       // ─── Neuer User ───
@@ -5892,28 +5971,25 @@ app.get("/auth/google/callback", async (req, res) => {
 
       user = {
         id: result.insertId,
-        googleId,
+        google_id: googleId,
         email,
         username: newUsername,
         imageUrl: newImageUrl,
       };
     } else {
-      // ─── Bestehender User → nur updaten, wenn sich etwas geändert hat ───
-      const shouldUpdate =
-        user.username !== newUsername ||
-        user.imageUrl !== newImageUrl ||
-        (user.imageUrl === null && newImageUrl !== null) ||
-        (user.imageUrl !== null && newImageUrl === null);
+      // ─── Bestehender User → Daten bei Bedarf aktualisieren ───
+      // COALESCE sorgt dafür, dass ein vorhandenes Bild nicht durch NULL überschrieben wird
+      const shouldUpdate = 
+        user.username !== newUsername || 
+        (user.imageUrl === null && newImageUrl !== null);
 
       if (shouldUpdate) {
         await pool.query(
-          "UPDATE users SET username = ?, imageUrl = ? WHERE id = ?",
+          "UPDATE users SET username = ?, imageUrl = COALESCE(imageUrl, ?) WHERE id = ?",
           [newUsername, newImageUrl, user.id]
         );
-
-        // User-Objekt für den Token aktualisieren
         user.username = newUsername;
-        user.imageUrl = newImageUrl;
+        user.imageUrl = user.imageUrl || newImageUrl;
       }
     }
 
@@ -5924,19 +6000,132 @@ app.get("/auth/google/callback", async (req, res) => {
       { expiresIn: "7d" }
     );
 
-    // 5. Redirect zum Frontend – mit /google-callback
-    const redirectUrl = `https://app.tunevote.com/google-callback?token=${token}&username=${encodeURIComponent(
+    // 5. Redirect zum Frontend
+    const redirectUrl = `http://localhost:5173/google-callback?token=${token}&username=${encodeURIComponent(
       user.username
     )}&userId=${user.id}`;
-
-    // Optional: Bild-URL mitgeben (wird im Frontend oft direkt genutzt)
-    // const finalRedirect = user.imageUrl
-    //   ? `${redirectUrl}&imageUrl=${encodeURIComponent(user.imageUrl)}`
-    //   : redirectUrl;
 
     res.redirect(redirectUrl);
   } catch (err) {
     console.error("Google Callback Fehler:", err.response?.data || err.message);
-    res.redirect("https://app.tunevote.com/login?error=google_auth_failed");
+    res.redirect("http://localhost:5173/login?error=google_auth_failed");
+  }
+});
+
+// ─── Facebook Login URL generieren ───
+app.get('/auth/facebook', (req, res) => {
+  const rootUrl = 'https://www.facebook.com/v18.0/dialog/oauth';
+  const options = {
+    client_id: process.env.FACEBOOK_CLIENT_ID,
+    redirect_uri: process.env.FACEBOOK_CALLBACK_URL,
+    scope: ['email', 'public_profile'].join(','),
+  };
+
+  const qs = new URLSearchParams(options).toString();
+  res.redirect(`${rootUrl}?${qs}`);
+});
+
+// ─── Facebook Callback ───
+app.get("/auth/facebook/callback", async (req, res) => {
+  const { code } = req.query;
+
+  if (!code) {
+    return res.redirect("http://localhost:5173/login?error=no_code");
+  }
+
+  try {
+    // 1. Code gegen Access Token tauschen
+    const tokenResponse = await axios.get(
+      "https://graph.facebook.com/v18.0/oauth/access_token",
+      {
+        params: {
+          client_id: process.env.FACEBOOK_CLIENT_ID,
+          client_secret: process.env.FACEBOOK_CLIENT_SECRET,
+          redirect_uri: process.env.FACEBOOK_CALLBACK_URL,
+          code,
+        },
+      }
+    );
+
+    const { access_token } = tokenResponse.data;
+
+    // 2. User-Info holen
+    const userInfoResponse = await axios.get(
+      "https://graph.facebook.com/me",
+      {
+        params: {
+          fields: "id,name,email,picture",
+          access_token,
+        },
+      }
+    );
+
+    const { id: facebookId, name, email, picture } = userInfoResponse.data;
+    const newUsername = name || (email ? email.split("@")[0] : `user_${facebookId}`);
+    const newImageUrl = picture?.data?.url || null;
+
+    // 3. Strategische Suche in der DB
+    // Zuerst prüfen: Gibt es jemanden mit dieser Facebook-ID?
+    let [rows] = await pool.query("SELECT * FROM users WHERE facebook_id = ?", [facebookId]);
+    let user = rows[0];
+
+    if (!user && email) {
+      // Wenn nicht: Gibt es jemanden mit dieser E-Mail (z.B. via Google registriert)?
+      let [emailRows] = await pool.query("SELECT * FROM users WHERE email = ?", [email]);
+      user = emailRows[0];
+      
+      if (user) {
+        // Verknüpfung: Facebook-ID beim bestehenden User nachtragen
+        await pool.query("UPDATE users SET facebook_id = ? WHERE id = ?", [facebookId, user.id]);
+        user.facebook_id = facebookId;
+      }
+    }
+
+    if (!user) {
+      // ─── Neuer User (weder Facebook-ID noch E-Mail bekannt) ───
+      const [result] = await pool.query(
+        "INSERT INTO users (facebook_id, email, username, imageUrl) VALUES (?, ?, ?, ?)",
+        [facebookId, email, newUsername, newImageUrl]
+      );
+
+      user = {
+        id: result.insertId,
+        facebook_id: facebookId,
+        email,
+        username: newUsername,
+        imageUrl: newImageUrl,
+      };
+    } else {
+      // ─── Bestehender User → Daten bei Bedarf aktualisieren ───
+      // Wir aktualisieren das Bild nur, wenn der User noch kein lokales Bild hat
+      const shouldUpdate = user.username !== newUsername || (user.imageUrl === null && newImageUrl !== null);
+
+      if (shouldUpdate) {
+        await pool.query(
+          "UPDATE users SET username = ?, imageUrl = COALESCE(imageUrl, ?) WHERE id = ?",
+          [newUsername, newImageUrl, user.id]
+        );
+        user.username = newUsername;
+        user.imageUrl = user.imageUrl || newImageUrl;
+      }
+    }
+
+    // 4. JWT erstellen
+    const token = jwt.sign(
+      { id: user.id },
+      process.env.JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+
+    // 5. Redirect zum Frontend
+    const redirectUrl = `http://localhost:5173/facebook-callback?token=${token}&username=${encodeURIComponent(
+      user.username
+    )}&userId=${user.id}`;
+
+    res.redirect(redirectUrl);
+
+  } catch (err) {
+    console.error("Facebook Callback Fehler:", err.response?.data || err.message);
+    res.redirect("http://localhost:5173/login?error=facebook_auth_failed");
   }
 });
