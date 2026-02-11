@@ -1007,76 +1007,84 @@ app.get("/sessions/:id/playback-sync", async (req, res) => {
 
 // === Auth: Register / Login ===
 app.post("/register", async (req, res) => {
-  const { username, email, password } = req.body;
+  // Wir erwarten jetzt nur noch email und password vom Frontend
+  const { email, password } = req.body;
   
-  if (!username || !email || !password) {
+  if (!email || !password) {
     return res.status(400).json({ error: "Bitte fülle alle Felder aus." });
   }
 
   try {
-    // 1. Prüfen, ob E-Mail oder Username bereits existieren (Passwort-Hash mit abfragen!)
-    const [rows] = await pool.query(
-      "SELECT id, google_id, facebook_id, email, username, password_hash FROM users WHERE LOWER(email) = LOWER(?) OR username = ?",
-      [email, username]
+    // 1. Prüfen, ob die E-Mail bereits existiert
+    const [emailRows] = await pool.query(
+      "SELECT id, google_id, facebook_id, email, username, password_hash FROM users WHERE LOWER(email) = LOWER(?)",
+      [email]
     );
 
-    if (rows.length > 0) {
-      const existingUser = rows[0];
+    if (emailRows.length > 0) {
+      const existingUser = emailRows[0];
 
-      // FALL A: E-Mail existiert bereits
-      if (existingUser.email.toLowerCase() === email.toLowerCase()) {
-        
-        // Hat der User KEIN Passwort, aber eine Social-ID? -> Direkt-Leitung
-        if (!existingUser.password_hash) {
-          if (existingUser.google_id) {
-            return res.status(200).json({ 
-              success: false,
-              redirect: "google",
-              message: "Konto existiert bereits via Google. Leite weiter..." 
-            });
-          }
-          if (existingUser.facebook_id) {
-            return res.status(200).json({ 
-              success: false,
-              redirect: "facebook",
-              message: "Konto existiert bereits via Facebook. Leite weiter..." 
-            });
-          }
+      // FALL: E-Mail existiert bereits als Social-Login -> Weiterleitung
+      if (!existingUser.password_hash) {
+        if (existingUser.google_id) {
+          return res.status(200).json({ 
+            success: false,
+            redirect: "google",
+            message: "Konto existiert bereits via Google. Leite weiter..." 
+          });
         }
-        
-        // Wenn er ein Passwort hat (normaler Account)
-        return res.status(409).json({ error: "Diese E-Mail-Adresse wird bereits verwendet." });
+        if (existingUser.facebook_id) {
+          return res.status(200).json({ 
+            success: false,
+            redirect: "facebook",
+            message: "Konto existiert bereits via Facebook. Leite weiter..." 
+          });
+        }
       }
-
-      // FALL B: Username existiert bereits
-      if (existingUser.username === username) {
-        return res.status(409).json({ error: "Dieser Benutzername ist bereits vergeben." });
-      }
+      
+      // FALL: E-Mail existiert bereits als normaler Account
+      return res.status(409).json({ error: "Diese E-Mail-Adresse wird bereits verwendet." });
     }
 
-    // 2. Neuer Benutzer anlegen (da keine Konflikte gefunden wurden)
+    // 2. Benutzernamen automatisch generieren (Teil vor dem @)
+    let baseUsername = email.split('@')[0];
+    
+    // Sicherstellen, dass der Username eindeutig ist
+    let finalUsername = baseUsername;
+    const [userRows] = await pool.query("SELECT id FROM users WHERE username = ?", [finalUsername]);
+    
+    if (userRows.length > 0) {
+      // Wenn der Name vergeben ist, hängen wir eine kurze Zufallszahl an
+      finalUsername = `${baseUsername}_${Math.floor(100 + Math.random() * 899)}`;
+    }
+
+    // 3. Neuer Benutzer anlegen
     const password_hash = await bcrypt.hash(password, 10);
     const [result] = await pool.query(
       "INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)",
-      [username, email, password_hash]
+      [finalUsername, email, password_hash]
     );
 
     const newUserId = result.insertId;
 
-    // 3. Invites verknüpfen
+    // 4. Invites verknüpfen
     await pool.query(
       `UPDATE session_invites SET invited_user_id = ? WHERE invited_user_id IS NULL AND LOWER(email) = LOWER(?)`,
       [newUserId, email]
     );
 
-    // 4. JWT erstellen
-    const token = jwt.sign({ id: newUserId, username }, process.env.JWT_SECRET, { expiresIn: "7d" });
+    // 5. JWT erstellen (mit dem neuen finalUsername)
+    const token = jwt.sign(
+      { id: newUserId, username: finalUsername }, 
+      process.env.JWT_SECRET, 
+      { expiresIn: "7d" }
+    );
 
     res.json({
       success: true,
       message: "Registrierung erfolgreich!",
       token,
-      username,
+      username: finalUsername,
       userId: newUserId
     });
 
