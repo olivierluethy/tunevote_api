@@ -112,7 +112,7 @@ const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret_here";
 const YOUTUBE_KEY = process.env.YOUTUBE_KEY;
 
 const httpServer = app.listen(4000, () =>
-  console.log("Server läuft auf http://localhost:4000"),
+  console.log("Server läuft auf https://api.tunevote.com"),
 );
 const io = new Server(httpServer, { cors: { origin: "*" } });
 
@@ -1398,7 +1398,7 @@ app.get("/join", async (req, res) => {
 
     // 3. Redirect zum Frontend
     res.json({
-      redirect: `http://localhost:5173/session/${sessionId}`,
+      redirect: `https://app.tunevote.com/session/${sessionId}`,
     });
 
     // ─────────────────────────────────────────────
@@ -1407,7 +1407,7 @@ app.get("/join", async (req, res) => {
     if (autoStarted) {
       setTimeout(async () => {
         try {
-          await axios.post(`http://localhost:4000/sessions/${sessionId}/start`);
+          await axios.post(`https://api.tunevote.com/sessions/${sessionId}/start`);
           console.log(`[AUTO] Session ${sessionId} gestartet (Titel: ${requestedTitle || DEFAULT_TITLE})`);
         } catch (err) {
           console.error("[AUTO] Start fehlgeschlagen:", err.response?.data || err.message);
@@ -3403,7 +3403,7 @@ app.post("/forgot-password", async (req, res) => {
     );
 
     // Korrekter Reset-Link
-    const baseUrl = process.env.FRONTEND_URL || "http://localhost:5173 ";
+    const baseUrl = process.env.FRONTEND_URL || "https://app.tunevote.com ";
     const resetLink = `${baseUrl}/reset-password/${resetToken}`;
 
     const primaryColor = "#4f46e5";
@@ -3847,7 +3847,7 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
     await conn.commit();
 
     // === 4. E-Mail-Inhalte je nach Registrierungsstatus unterscheiden ===
-    const baseUrl = process.env.FRONTEND_URL || "http://localhost:5173 ";
+    const baseUrl = process.env.FRONTEND_URL || "https://app.tunevote.com ";
     const dashboardLink = `${baseUrl}/dashboard`;
     const primaryColor = "#4f46e5";
 
@@ -5921,7 +5921,7 @@ app.get("/auth/google/callback", async (req, res) => {
   const { code } = req.query;
 
   if (!code) {
-    return res.redirect("http://localhost:5173/login?error=no_code");
+    return res.redirect("https://app.tunevote.com/login?error=no_code");
   }
 
   try {
@@ -6009,14 +6009,14 @@ app.get("/auth/google/callback", async (req, res) => {
     );
 
     // 5. Redirect zum Frontend
-    const redirectUrl = `http://localhost:5173/google-callback?token=${token}&username=${encodeURIComponent(
+    const redirectUrl = `https://app.tunevote.com/google-callback?token=${token}&username=${encodeURIComponent(
       user.username
     )}&userId=${user.id}`;
 
     res.redirect(redirectUrl);
   } catch (err) {
     console.error("Google Callback Fehler:", err.response?.data || err.message);
-    res.redirect("http://localhost:5173/login?error=google_auth_failed");
+    res.redirect("https://app.tunevote.com/login?error=google_auth_failed");
   }
 });
 
@@ -6038,7 +6038,7 @@ app.get("/auth/facebook/callback", async (req, res) => {
   const { code } = req.query;
 
   if (!code) {
-    return res.redirect("http://localhost:5173/login?error=no_code");
+    return res.redirect("https://app.tunevote.com/login?error=no_code");
   }
 
   try {
@@ -6126,7 +6126,7 @@ app.get("/auth/facebook/callback", async (req, res) => {
     );
 
     // 5. Redirect zum Frontend
-    const redirectUrl = `http://localhost:5173/facebook-callback?token=${token}&username=${encodeURIComponent(
+    const redirectUrl = `https://app.tunevote.com/facebook-callback?token=${token}&username=${encodeURIComponent(
       user.username
     )}&userId=${user.id}`;
 
@@ -6134,6 +6134,6 @@ app.get("/auth/facebook/callback", async (req, res) => {
 
   } catch (err) {
     console.error("Facebook Callback Fehler:", err.response?.data || err.message);
-    res.redirect("http://localhost:5173/login?error=facebook_auth_failed");
+    res.redirect("https://app.tunevote.com/login?error=facebook_auth_failed");
   }
 });
