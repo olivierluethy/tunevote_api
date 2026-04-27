@@ -112,7 +112,7 @@ const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret_here";
 const YOUTUBE_KEY = process.env.YOUTUBE_KEY;
 
 const httpServer = app.listen(4000, () =>
-  console.log("Server läuft auf https://api.tunevote.com"),
+  console.log("Server läuft auf https://app.tunevote.com"),
 );
 const io = new Server(httpServer, { cors: { origin: "*" } });
 
