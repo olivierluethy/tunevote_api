@@ -1,3 +1,42 @@
+-- =============================================================================
+-- TuneVote — Canonical Database Schema (Phase 1)
+-- =============================================================================
+-- This file is the SINGLE SOURCE OF TRUTH for the TuneVote database schema.
+-- Historical phpMyAdmin dumps live in archive/ and are NOT authoritative.
+--
+-- Phase 1 reconciliation decisions (do not change without a migration):
+--   * youtube_id is VARCHAR(11) everywhere it appears
+--     (youtube_video_cache.youtube_id, queue_items.video_id,
+--      playback_sync.current_video_id, playback_history.youtube_id).
+--     Real YouTube video IDs are exactly 11 base64url characters.
+--   * voting_rounds.phase ENUM uses 'suggestion' (NOT 'suggesting').
+--     The application code at index.js lines 444 and 3117 writes 'suggestion'.
+--   * youtube_video_cache.title_norm is NOT UNIQUE. Two different videos can
+--     share a normalized title (covers, re-uploads, regional variants); the
+--     production dump's UNIQUE on title_norm is a bug and is not present here.
+--   * session_participants.left_at exists (production dump is missing it;
+--     index.js line 3322 writes to it).
+--   * artists, playback_history, session_song_listens, badges, user_badges,
+--     user_badge_progress, shouts, shout_likes are part of the canonical
+--     schema even though they were absent from the prod dump.
+--
+-- Phase 2 reconciliation decisions (applied here):
+--   * queue_items no longer carries title, thumbnail, or duration for music
+--     rows. Music metadata is read by JOIN-ing youtube_video_cache via
+--     queue_items.video_id (now a real FK, ON DELETE RESTRICT).
+--   * The queue_items.duration column is renamed pause_duration_seconds and
+--     populated only for item_type='pause' rows.
+--   * The queue_items.played boolean is dropped — status='played' is the
+--     single source of truth.
+--   * A CHECK constraint enforces that music rows have video_id and no
+--     pause_duration_seconds, and pause rows have pause_duration_seconds
+--     and no video_id.
+--
+-- Later audit phases (CHECK constraints on user_id/guest_id, sessions
+-- lifecycle collapse, users.imageData extraction, etc.) are NOT applied
+-- here. They will be introduced via separate Knex migrations.
+-- =============================================================================
+
 CREATE TABLE users (
   id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
   username VARCHAR(50) NOT NULL,
@@ -128,17 +167,14 @@ CREATE TABLE session_participants (
 CREATE TABLE `queue_items` (
   `id` INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
   `session_id` INT NOT NULL,
-  `video_id` VARCHAR(11),
-  `title` VARCHAR(150) NOT NULL,
-  `thumbnail` VARCHAR(255) DEFAULT NULL,
+  `video_id` VARCHAR(11) DEFAULT NULL,
   `added_by` INT DEFAULT NULL,
   `guest_id` INT DEFAULT NULL,
   `status` ENUM('queued','playing','played','skipped','archived','suggested') DEFAULT 'queued',
   `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
-  `played` TINYINT(1) DEFAULT '0',
   `playedAt` DATETIME DEFAULT NULL,
   `startedAt` DATETIME DEFAULT NULL,
-  `duration` INT DEFAULT NULL,
+  `pause_duration_seconds` INT DEFAULT NULL,
   `description` VARCHAR(255) DEFAULT NULL,
   `item_type` ENUM('music','pause') NOT NULL DEFAULT 'music',
   `item_source` ENUM('user','guest','ai') DEFAULT 'user',
@@ -147,15 +183,31 @@ CREATE TABLE `queue_items` (
   KEY `session_video` (`session_id`,`video_id`),
   KEY `added_by` (`added_by`),
   KEY `guest_id` (`guest_id`),
+  KEY `idx_session_status` (`session_id`,`status`),
+  KEY `idx_round_status` (`voting_round_id`,`status`),
+  KEY `idx_status` (`status`),
 
-  CONSTRAINT `queue_items_ibfk_1` 
+  CONSTRAINT `queue_items_ibfk_1`
     FOREIGN KEY (`session_id`) REFERENCES `sessions` (`id`) ON DELETE CASCADE,
 
-  CONSTRAINT `queue_items_ibfk_2` 
+  CONSTRAINT `queue_items_ibfk_2`
     FOREIGN KEY (`added_by`) REFERENCES `users` (`id`) ON DELETE SET NULL,
 
-  CONSTRAINT `queue_items_ibfk_3` 
-    FOREIGN KEY (`guest_id`) REFERENCES `guest_users` (`id`) ON DELETE SET NULL
+  CONSTRAINT `queue_items_ibfk_3`
+    FOREIGN KEY (`guest_id`) REFERENCES `guest_users` (`id`) ON DELETE SET NULL,
+
+  CONSTRAINT `queue_items_ibfk_4`
+    FOREIGN KEY (`video_id`) REFERENCES `youtube_video_cache` (`youtube_id`) ON DELETE RESTRICT,
+
+  CONSTRAINT `ck_queue_items_kind` CHECK (
+    (`item_type` = 'music'
+       AND `video_id` IS NOT NULL
+       AND `pause_duration_seconds` IS NULL)
+    OR
+    (`item_type` = 'pause'
+       AND `video_id` IS NULL
+       AND `pause_duration_seconds` IS NOT NULL)
+  )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 
@@ -196,7 +248,7 @@ CREATE TABLE voting_rounds (
   started_by_guest_id INT NULL,
   started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   ends_at TIMESTAMP NULL,
-  phase ENUM('suggestion','voting','closed') NOT NULL,
+  phase ENUM('suggestion','voting','closed') NOT NULL DEFAULT 'suggestion',
   phase_ends_at DATETIME NULL,
   suggestion_duration INT DEFAULT 90,
   voting_duration INT DEFAULT 60,

@@ -112,7 +112,7 @@ const JWT_SECRET = process.env.JWT_SECRET || "your_jwt_secret_here";
 const YOUTUBE_KEY = process.env.YOUTUBE_KEY;
 
 const httpServer = app.listen(4000, () =>
-  console.log("Server läuft auf https://app.tunevote.com"),
+  console.log("Server läuft auf https://app.tunevote.com/"),
 );
 const io = new Server(httpServer, { cors: { origin: "*" } });
 
@@ -351,9 +351,8 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
               await pool.query(
                 `
                             UPDATE queue_items
-            SET 
+            SET
               status = 'queued',
-              played = 0,
               playedAt = NULL,
               startedAt = NULL,
               voting_round_id = NULL
@@ -538,9 +537,10 @@ async function finalizeListeningForCurrentSong(sessionId) {
   // 1. Aktuellen Song holen
   const [rows] = await pool.query(
     `
-    SELECT id, startedAt, duration
-    FROM queue_items
-    WHERE session_id = ? AND status = 'playing'
+    SELECT qi.id, qi.startedAt, yvc.duration
+    FROM queue_items qi
+    JOIN youtube_video_cache yvc ON yvc.youtube_id = qi.video_id
+    WHERE qi.session_id = ? AND qi.status = 'playing' AND qi.item_type = 'music'
     LIMIT 1
     `,
     [sessionId],
@@ -622,7 +622,7 @@ const advanceToNext = async (sessionId) => {
     if (playingRows.length > 0) {
       const currentId = playingRows[0].id;
       await pool.query(
-        `UPDATE queue_items SET status = 'played', played = 1, playedAt = NOW() WHERE id = ?`,
+        `UPDATE queue_items SET status = 'played', playedAt = NOW() WHERE id = ?`,
         [currentId],
       );
 
@@ -633,10 +633,13 @@ const advanceToNext = async (sessionId) => {
 
     // 2) Check if there are still queued items
     const [queuedRows] = await pool.query(
-      `SELECT id, video_id, item_type, duration, title
-       FROM queue_items
-       WHERE session_id = ? AND status = 'queued' AND played = 0
-       ORDER BY id ASC
+      `SELECT qi.id, qi.video_id, qi.item_type,
+              COALESCE(yvc.duration, qi.pause_duration_seconds) AS duration,
+              COALESCE(yvc.title, qi.description)               AS title
+       FROM queue_items qi
+       LEFT JOIN youtube_video_cache yvc ON yvc.youtube_id = qi.video_id
+       WHERE qi.session_id = ? AND qi.status = 'queued'
+       ORDER BY qi.id ASC
        LIMIT 1`,
       [sessionId],
     );
@@ -741,8 +744,12 @@ const advanceToNext = async (sessionId) => {
 
           // Now fetch the newly queued song
           const [emergencyNext] = await pool.query(
-            `SELECT id, video_id, item_type, duration, title
-             FROM queue_items WHERE id = ?`,
+            `SELECT qi.id, qi.video_id, qi.item_type,
+                    COALESCE(yvc.duration, qi.pause_duration_seconds) AS duration,
+                    COALESCE(yvc.title, qi.description)               AS title
+             FROM queue_items qi
+             LEFT JOIN youtube_video_cache yvc ON yvc.youtube_id = qi.video_id
+             WHERE qi.id = ?`,
             [winnerId],
           );
           next = emergencyNext[0];
@@ -1470,19 +1477,16 @@ if (songs.length < 2) {
     for (const song of songs.slice(0, 2)) {
       await connection.query(`
         INSERT INTO queue_items
-          (session_id, video_id, title, duration, thumbnail,
-           status, played, playedAt,
+          (session_id, video_id,
+           status, playedAt,
            item_type, item_source, voting_round_id, created_at)
         VALUES
-          (?, ?, ?, ?, ?,
-           'played', 1, NOW(),
+          (?, ?,
+           'played', NOW(),
            'music', 'user', ?, NOW())
       `, [
         sessionId,
         song.video_id,
-        song.title,
-        song.duration,
-        song.thumbnail,
         votingRoundId,
       ]);
     }
@@ -1491,19 +1495,16 @@ if (songs.length < 2) {
     for (const song of songs.slice(2)) {
       await connection.query(`
         INSERT INTO queue_items
-          (session_id, video_id, title, duration, thumbnail, added_by,
-           status, played,
+          (session_id, video_id, added_by,
+           status,
            item_type, item_source, voting_round_id, created_at)
         VALUES
-          (?, ?, ?, ?, ?, 1,
-           'queued', 0,
+          (?, ?, 1,
+           'queued',
            'music', 'user', ?, NOW())
       `, [
         sessionId,
         song.video_id,
-        song.title,
-        song.duration,
-        song.thumbnail,
         votingRoundId,
       ]);
     }
@@ -1644,11 +1645,28 @@ app.get("/sessions/:id/queue", async (req, res) => {
 
   const [queue] = await pool.query(
     `
-    SELECT 
-      qi.*, 
-      qi.item_type AS itemType,           -- <-- NEU: camelCase für Frontend
-      COALESCE(u.username, g.nickname, 'Gast') AS addedBy
+    SELECT
+      qi.id,
+      qi.session_id,
+      qi.video_id,
+      qi.added_by,
+      qi.guest_id,
+      qi.status,
+      qi.created_at,
+      qi.playedAt,
+      qi.startedAt,
+      qi.pause_duration_seconds,
+      qi.description,
+      qi.item_type,
+      qi.item_source,
+      qi.voting_round_id,
+      qi.item_type AS itemType,
+      COALESCE(yvc.title, qi.description)               AS title,
+      yvc.thumbnail                                     AS thumbnail,
+      COALESCE(yvc.duration, qi.pause_duration_seconds) AS duration,
+      COALESCE(u.username, g.nickname, 'Gast')          AS addedBy
     FROM queue_items qi
+    LEFT JOIN youtube_video_cache yvc ON yvc.youtube_id = qi.video_id
     LEFT JOIN users u ON qi.added_by = u.id
     LEFT JOIN guest_users g ON qi.guest_id = g.id
     WHERE qi.session_id = ?
@@ -1712,7 +1730,6 @@ app.get("/sessions/:id/recommendations", async (req, res) => {
     WHERE qi.session_id = ?
       AND qi.item_type = 'music'
       AND qi.status IN ('queued','playing')
-      AND qi.played = 0
     ORDER BY qi.id DESC
     `,
     [id],
@@ -1745,13 +1762,14 @@ app.get("/sessions/:id/recommendations", async (req, res) => {
 
   // === 1. Alle aktuellen KI-Vorschläge laden ===
   let existingAi = await pool.query(
-    `SELECT id, title, video_id AS youtubeId, thumbnail
-     FROM queue_items
-     WHERE session_id = ?
-       AND voting_round_id = ?
-       AND item_source = 'ai'
-       AND status = 'suggested'
-     ORDER BY id ASC`,
+    `SELECT qi.id, yvc.title, qi.video_id AS youtubeId, yvc.thumbnail
+     FROM queue_items qi
+     LEFT JOIN youtube_video_cache yvc ON yvc.youtube_id = qi.video_id
+     WHERE qi.session_id = ?
+       AND qi.voting_round_id = ?
+       AND qi.item_source = 'ai'
+       AND qi.status = 'suggested'
+     ORDER BY qi.id ASC`,
     [id, currentRoundId],
   );
   existingAi = existingAi[0]; // [[rows], fields] → nur rows
@@ -1773,10 +1791,11 @@ app.get("/sessions/:id/recommendations", async (req, res) => {
 
     // Nach dem Löschen neu laden
     const [cleaned] = await pool.query(
-      `SELECT id, title, video_id AS youtubeId, thumbnail
-       FROM queue_items
-       WHERE session_id = ? AND voting_round_id = ? AND item_source = 'ai' AND status = 'suggested'
-       ORDER BY id ASC`,
+      `SELECT qi.id, yvc.title, qi.video_id AS youtubeId, yvc.thumbnail
+       FROM queue_items qi
+       LEFT JOIN youtube_video_cache yvc ON yvc.youtube_id = qi.video_id
+       WHERE qi.session_id = ? AND qi.voting_round_id = ? AND qi.item_source = 'ai' AND qi.status = 'suggested'
+       ORDER BY qi.id ASC`,
       [id, currentRoundId],
     );
     existingAi = cleaned;
@@ -2073,15 +2092,12 @@ Instructions:
 
       for (const item of results) {
         const [insert] = await pool.query(
-          `INSERT INTO queue_items 
-            (session_id, video_id, title, thumbnail, duration, status, item_source, item_type, voting_round_id)
-           VALUES (?, ?, ?, ?, ?, 'suggested', 'ai', 'music', ?)`,
+          `INSERT INTO queue_items
+            (session_id, video_id, status, item_source, item_type, voting_round_id)
+           VALUES (?, ?, 'suggested', 'ai', 'music', ?)`,
           [
             id,
             item.youtubeId,
-            item.title,
-            item.thumbnail,
-            item.duration,
             currentRoundId,
           ],
         );
@@ -2217,19 +2233,16 @@ app.post("/sessions/:id/recommendations/add", async (req, res) => {
     // Insert – jetzt MIT voting_round_id
     // =================================================
     await pool.query(
-      `INSERT INTO queue_items 
-       (session_id, item_type, video_id, title, thumbnail, added_by, guest_id, 
-        status, played, duration, voting_round_id, item_source)
-       VALUES (?, 'music', ?, ?, ?, ?, ?, ?, 0, ?, ?, 'ai')`,
+      `INSERT INTO queue_items
+       (session_id, item_type, video_id, added_by, guest_id,
+        status, voting_round_id, item_source)
+       VALUES (?, 'music', ?, ?, ?, ?, ?, 'ai')`,
       [
         sessionId,
         youtubeId,
-        title,
-        thumbnail,
         user?.id || null,
         guest?.id || null,
         status,
-        duration || 0,
         votingRoundId
       ]
     );
@@ -2459,13 +2472,12 @@ app.post("/sessions/:id/proposals", async (req, res) => {
       const desc = (description || "Kurze Pause").trim().slice(0, 100);
 
       await pool.query(
-        `INSERT INTO queue_items 
-         (session_id, item_type, title, description, duration, 
-          added_by, guest_id, status, played, item_source, voting_round_id)
-         VALUES (?, 'pause', ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+        `INSERT INTO queue_items
+         (session_id, item_type, description, pause_duration_seconds,
+          added_by, guest_id, status, item_source, voting_round_id)
+         VALUES (?, 'pause', ?, ?, ?, ?, ?, ?, ?)`,
         [
           sessionId,
-          desc,
           desc,
           duration,
           user?.id || null,
@@ -2550,19 +2562,16 @@ app.post("/sessions/:id/proposals", async (req, res) => {
     }
 
     await pool.query(
-      `INSERT INTO queue_items 
-       (session_id, item_type, video_id, title, thumbnail, added_by, guest_id, 
-        status, played, duration, voting_round_id, item_source)
-       VALUES (?, 'music', ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
+      `INSERT INTO queue_items
+       (session_id, item_type, video_id, added_by, guest_id,
+        status, voting_round_id, item_source)
+       VALUES (?, 'music', ?, ?, ?, ?, ?, ?)`,
       [
         sessionId,
         videoId,
-        title,
-        thumbnail,
         user?.id || null,
         guest?.id || null,
         status,
-        duration,
         votingRoundId,          // ← jetzt garantiert korrekt gesetzt
         user ? "user" : "guest"
       ]
@@ -2603,21 +2612,22 @@ app.get("/sessions/:id/proposals", async (req, res) => {
   try {
     const [proposals] = await pool.query(
       `
-      SELECT 
+      SELECT
         q.id,
-        q.title,
-        q.thumbnail,
+        COALESCE(yvc.title, q.description)               AS title,
+        yvc.thumbnail                                    AS thumbnail,
         q.status,
         q.video_id,
         q.voting_round_id,
         q.item_type,        -- NEU
         q.item_source,      -- NEU
         q.description,      -- für Pausen
-        q.duration,
+        COALESCE(yvc.duration, q.pause_duration_seconds) AS duration,
         COALESCE(v.vote_count, 0) AS votes,
         u.username AS addedByUser,
         g.nickname AS addedByGuest
       FROM queue_items q
+      LEFT JOIN youtube_video_cache yvc ON yvc.youtube_id = q.video_id
       LEFT JOIN users u ON q.added_by = u.id
       LEFT JOIN guest_users g ON q.guest_id = g.id
 
@@ -2627,7 +2637,7 @@ app.get("/sessions/:id/proposals", async (req, res) => {
         GROUP BY queue_item_id
       ) v ON v.queue_item_id = q.id
 
-      WHERE q.session_id = ? 
+      WHERE q.session_id = ?
         AND q.status IN ('suggested', 'proposal')
 
       ORDER BY q.created_at ASC
@@ -2962,9 +2972,22 @@ app.post("/sessions/:id/queue/add", async (req, res) => {
     const durationIso = ytRes.data.items[0]?.contentDetails.duration;
     const duration = parseIsoDuration(durationIso);
 
+    // Ensure the cache row exists before inserting into queue_items —
+    // queue_items.video_id is now an FK to youtube_video_cache.youtube_id.
     await pool.query(
-      "INSERT INTO queue_items (session_id, video_id, title, thumbnail, added_by, status, played, duration) VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
-      [id, videoId, title, thumbnail, user.id, "queued", duration],
+      `INSERT INTO youtube_video_cache (youtube_id, title, title_norm, thumbnail, duration)
+       VALUES (?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE
+         title = VALUES(title),
+         title_norm = VALUES(title_norm),
+         thumbnail = COALESCE(VALUES(thumbnail), thumbnail),
+         duration = COALESCE(VALUES(duration), duration)`,
+      [videoId, title, normalize(title), thumbnail, duration],
+    );
+
+    await pool.query(
+      "INSERT INTO queue_items (session_id, video_id, added_by, status, item_type) VALUES (?, ?, ?, 'queued', 'music')",
+      [id, videoId, user.id],
     );
 
     io.to(id).emit("queue_updated", {});
@@ -3050,7 +3073,13 @@ app.post("/sessions/:id/start", async (req, res) => {
 
   // 🎵 Prüfen, ob Songs in der Queue sind → sofort abspielen
   const [first] = await pool.query(
-    "SELECT id, video_id, duration, title FROM queue_items WHERE session_id = ? AND played = 0 AND status = 'queued' ORDER BY id ASC LIMIT 1",
+    `SELECT qi.id, qi.video_id,
+            COALESCE(yvc.duration, qi.pause_duration_seconds) AS duration,
+            COALESCE(yvc.title, qi.description)               AS title
+       FROM queue_items qi
+       LEFT JOIN youtube_video_cache yvc ON yvc.youtube_id = qi.video_id
+      WHERE qi.session_id = ? AND qi.status = 'queued'
+      ORDER BY qi.id ASC LIMIT 1`,
     [id],
   );
 
@@ -3403,7 +3432,7 @@ app.post("/forgot-password", async (req, res) => {
     );
 
     // Korrekter Reset-Link
-    const baseUrl = process.env.FRONTEND_URL || "https://app.tunevote.com ";
+    const baseUrl = process.env.FRONTEND_URL || "https://app.tunevote.com/ ";
     const resetLink = `${baseUrl}/reset-password/${resetToken}`;
 
     const primaryColor = "#4f46e5";
@@ -3847,7 +3876,7 @@ app.post("/sessions/:sessionId/invite", async (req, res) => {
     await conn.commit();
 
     // === 4. E-Mail-Inhalte je nach Registrierungsstatus unterscheiden ===
-    const baseUrl = process.env.FRONTEND_URL || "https://app.tunevote.com ";
+    const baseUrl = process.env.FRONTEND_URL || "https://app.tunevote.com/ ";
     const dashboardLink = `${baseUrl}/dashboard`;
     const primaryColor = "#4f46e5";
 
@@ -4759,7 +4788,7 @@ app.get("/profile/listening-summary", async (req, res) => {
         ),
         pool.query(
           `SELECT
-           q.title,
+           y.title,
            y.thumbnail,
            SUM(s.listen_seconds) AS total_seconds,
            COUNT(*) AS listens
@@ -4767,7 +4796,7 @@ app.get("/profile/listening-summary", async (req, res) => {
          JOIN queue_items q ON q.id = s.queue_item_id
          LEFT JOIN youtube_video_cache y ON y.youtube_id = q.video_id
          WHERE s.user_id = ?
-         GROUP BY q.title, y.thumbnail
+         GROUP BY y.title, y.thumbnail
          ORDER BY total_seconds DESC
          LIMIT 10`,
           [userId],
@@ -4829,7 +4858,7 @@ app.get("/profile/recent-listens", async (req, res) => {
   try {
     const [recentListensRows] = await pool.query(
       `SELECT
-         q.title,
+         y.title,
          y.thumbnail,
          s.listened_from,
          s.listen_seconds,
@@ -4974,9 +5003,9 @@ async function fetchUserStats(userId) {
   ] = await Promise.all([
     // 1. Top 10 Songs (nach Hördauer)
     pool.query(
-      `SELECT 
+      `SELECT
          q.video_id,
-         MAX(q.title)          AS title,
+         MAX(y.title)          AS title,
          MAX(y.thumbnail)      AS thumbnail,
          SUM(l.listen_seconds) AS total_seconds,
          COUNT(*)              AS listen_count
@@ -5458,7 +5487,7 @@ app.get("/profile/artist/:artistId/insights", async (req, res) => {
       `
       SELECT
         q.video_id,
-        MAX(q.title)          AS title,
+        MAX(y.title)          AS title,
         MAX(y.thumbnail)      AS thumbnail,
         SUM(l.listen_seconds) AS total_seconds,
         COUNT(*)              AS listen_count
