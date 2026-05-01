@@ -1,0 +1,5 @@
+.env
+.env.local
+.env.*.local
+*.bak
+tunevote_backup_*.sql
