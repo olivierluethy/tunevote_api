@@ -126,7 +126,17 @@ app.post(
           const subscriptionId = sessionObj.subscription;
           if (userId && subscriptionId) {
             const sub = await stripe.subscriptions.retrieve(subscriptionId);
-            const periodEnd = new Date(sub.current_period_end * 1000);
+            // Newer Stripe API versions moved current_period_end off the
+            // subscription root and into items.data[].current_period_end.
+            // Fall back to the items-level field so we never store NULL
+            // on accounts pinned to the new API version.
+            const periodEndUnix =
+              sub.current_period_end ??
+              sub.items?.data?.[0]?.current_period_end ??
+              null;
+            const periodEnd = periodEndUnix
+              ? new Date(periodEndUnix * 1000)
+              : null;
             const status =
               sub.status === "active" || sub.status === "trialing"
                 ? "active"
@@ -149,8 +159,12 @@ app.post(
         case "customer.subscription.updated":
         case "customer.subscription.deleted": {
           const sub = event.data.object;
-          const periodEnd = sub.current_period_end
-            ? new Date(sub.current_period_end * 1000)
+          const periodEndUnix =
+            sub.current_period_end ??
+            sub.items?.data?.[0]?.current_period_end ??
+            null;
+          const periodEnd = periodEndUnix
+            ? new Date(periodEndUnix * 1000)
             : null;
           let status;
           if (event.type === "customer.subscription.deleted") {
