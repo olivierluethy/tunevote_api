@@ -74,6 +74,116 @@ const safeParseOpenAI = (text) => {
 
 const app = express();
 app.use(cors());
+
+// ---------------------------------------------------------------
+// Stripe billing — initialised before any body parser so the webhook
+// route below can claim the raw body. The Stripe SDK verifies webhook
+// signatures byte-for-byte against the request body, so the webhook
+// handler MUST be mounted before app.use(express.json()).
+// ---------------------------------------------------------------
+const Stripe = require("stripe");
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
+const STRIPE_PRICE_ID = process.env.STRIPE_PRICE_ID;
+const APP_PUBLIC_URL = process.env.APP_PUBLIC_URL || "https://app.tunevote.com";
+
+let stripe = null;
+if (STRIPE_SECRET_KEY) {
+  stripe = new Stripe(STRIPE_SECRET_KEY);
+  console.log("✅ Stripe initialised");
+} else {
+  console.warn("⚠️  STRIPE_SECRET_KEY missing — billing endpoints will 500");
+}
+
+app.post(
+  "/billing/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    if (!stripe || !STRIPE_WEBHOOK_SECRET) {
+      return res.status(500).send("billing not configured");
+    }
+    const sig = req.headers["stripe-signature"];
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        sig,
+        STRIPE_WEBHOOK_SECRET,
+      );
+    } catch (err) {
+      console.error("⚠️  Stripe webhook signature failed:", err.message);
+      return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    try {
+      switch (event.type) {
+        case "checkout.session.completed": {
+          const sessionObj = event.data.object;
+          const userId = sessionObj.client_reference_id
+            ? parseInt(sessionObj.client_reference_id, 10)
+            : null;
+          const customerId = sessionObj.customer;
+          const subscriptionId = sessionObj.subscription;
+          if (userId && subscriptionId) {
+            const sub = await stripe.subscriptions.retrieve(subscriptionId);
+            const periodEnd = new Date(sub.current_period_end * 1000);
+            const status =
+              sub.status === "active" || sub.status === "trialing"
+                ? "active"
+                : sub.status === "past_due" || sub.status === "unpaid"
+                  ? "past_due"
+                  : "canceled";
+            await pool.query(
+              `UPDATE users
+                  SET stripe_customer_id = ?,
+                      stripe_subscription_id = ?,
+                      subscription_status = ?,
+                      subscription_current_period_end = ?
+                WHERE id = ?`,
+              [customerId, subscriptionId, status, periodEnd, userId],
+            );
+            console.log(`💳 user ${userId} subscribed (sub ${subscriptionId})`);
+          }
+          break;
+        }
+        case "customer.subscription.updated":
+        case "customer.subscription.deleted": {
+          const sub = event.data.object;
+          const periodEnd = sub.current_period_end
+            ? new Date(sub.current_period_end * 1000)
+            : null;
+          let status;
+          if (event.type === "customer.subscription.deleted") {
+            status = "canceled";
+          } else if (sub.status === "active" || sub.status === "trialing") {
+            status = "active";
+          } else if (sub.status === "past_due" || sub.status === "unpaid") {
+            status = "past_due";
+          } else {
+            status = "canceled";
+          }
+          await pool.query(
+            `UPDATE users
+                SET stripe_subscription_id = ?,
+                    subscription_status = ?,
+                    subscription_current_period_end = ?
+              WHERE stripe_customer_id = ?`,
+            [sub.id, status, periodEnd, sub.customer],
+          );
+          console.log(
+            `💳 sub ${sub.id} → ${status} (customer ${sub.customer})`,
+          );
+          break;
+        }
+      }
+      res.json({ received: true });
+    } catch (err) {
+      console.error("❌ Stripe webhook handler error:", err);
+      res.status(500).send("handler error");
+    }
+  },
+);
+
 app.use(express.json());
 
 const pool = mysql.createPool({
@@ -132,6 +242,108 @@ const getUserFromToken = async (token) => {
     return null;
   }
 };
+
+// === Subscription entitlement ===
+// "active" status alone is not enough — Stripe keeps a sub in 'active' through
+// its paid window even after the user has clicked Cancel, with the actual
+// expiry sitting in current_period_end. Both must be checked.
+async function hasActiveSubscription(userId) {
+  const [rows] = await pool.query(
+    `SELECT subscription_status, subscription_current_period_end
+       FROM users WHERE id = ?`,
+    [userId],
+  );
+  const row = rows[0];
+  if (!row) return false;
+  if (row.subscription_status !== "active") return false;
+  if (!row.subscription_current_period_end) return false;
+  return new Date(row.subscription_current_period_end) > new Date();
+}
+
+// === Billing: status / checkout / portal ===
+app.get("/billing/status", async (req, res) => {
+  const token = req.headers.authorization?.split(" ")[1];
+  const user = await getUserFromToken(token);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+
+  const [rows] = await pool.query(
+    `SELECT subscription_status, subscription_current_period_end
+       FROM users WHERE id = ?`,
+    [user.id],
+  );
+  const row = rows[0] || {};
+  const active =
+    row.subscription_status === "active" &&
+    row.subscription_current_period_end &&
+    new Date(row.subscription_current_period_end) > new Date();
+  res.json({
+    active: !!active,
+    status: row.subscription_status || "none",
+    current_period_end: row.subscription_current_period_end || null,
+  });
+});
+
+app.post("/billing/checkout-session", async (req, res) => {
+  if (!stripe || !STRIPE_PRICE_ID) {
+    return res.status(500).json({ error: "billing not configured" });
+  }
+  const token = req.headers.authorization?.split(" ")[1];
+  const user = await getUserFromToken(token);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+
+  const [rows] = await pool.query(
+    `SELECT email, stripe_customer_id FROM users WHERE id = ?`,
+    [user.id],
+  );
+  const userRow = rows[0];
+  if (!userRow) return res.status(404).json({ error: "user not found" });
+
+  try {
+    const params = {
+      mode: "subscription",
+      line_items: [{ price: STRIPE_PRICE_ID, quantity: 1 }],
+      success_url: `${APP_PUBLIC_URL}/?checkout=success`,
+      cancel_url: `${APP_PUBLIC_URL}/?checkout=canceled`,
+      client_reference_id: String(user.id),
+      allow_promotion_codes: true,
+    };
+    if (userRow.stripe_customer_id) {
+      params.customer = userRow.stripe_customer_id;
+    } else {
+      params.customer_email = userRow.email;
+    }
+    const checkoutSession = await stripe.checkout.sessions.create(params);
+    res.json({ url: checkoutSession.url });
+  } catch (err) {
+    console.error("❌ Stripe checkout error:", err);
+    res.status(500).json({ error: "checkout failed" });
+  }
+});
+
+app.post("/billing/portal-session", async (req, res) => {
+  if (!stripe) return res.status(500).json({ error: "billing not configured" });
+  const token = req.headers.authorization?.split(" ")[1];
+  const user = await getUserFromToken(token);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+
+  const [rows] = await pool.query(
+    `SELECT stripe_customer_id FROM users WHERE id = ?`,
+    [user.id],
+  );
+  const customerId = rows[0]?.stripe_customer_id;
+  if (!customerId) return res.status(400).json({ error: "no subscription" });
+
+  try {
+    const portal = await stripe.billingPortal.sessions.create({
+      customer: customerId,
+      return_url: `${APP_PUBLIC_URL}/`,
+    });
+    res.json({ url: portal.url });
+  } catch (err) {
+    console.error("❌ Stripe portal error:", err);
+    res.status(500).json({ error: "portal failed" });
+  }
+});
 
 const phaseTimers = {}; // { sessionId: timeout }
 
@@ -1325,6 +1537,19 @@ app.post("/sessions", async (req, res) => {
   if (!title?.trim()) return res.status(400).json({ error: "Title required" });
 
   const privateFlag = is_private ? 1 : 0;
+
+  // Paywall: private sessions require an active $5/month subscription.
+  // Public sessions remain free.
+  if (privateFlag === 1) {
+    const entitled = await hasActiveSubscription(user.id);
+    if (!entitled) {
+      return res.status(402).json({
+        error: "subscription_required",
+        message:
+          "A $5/month subscription is required to create private sessions.",
+      });
+    }
+  }
 
   try {
     const [result] = await pool.query(
