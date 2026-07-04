@@ -716,6 +716,13 @@ const advanceToNext = async (sessionId, expectedCurrentItemId = null) => {
         );
       }
 
+      // Durable deadline so the reconciler can advance this session even if the
+      // in-memory timer is lost (crash/restart).
+      await connection.query(
+        `UPDATE sessions SET current_plays_until = DATE_ADD(NOW(), INTERVAL ? SECOND) WHERE id = ?`,
+        [Math.max(1, Math.floor(next.duration || 180)), sessionId],
+      );
+
       emits.push({ event: "queue_updated" });
     }
 
