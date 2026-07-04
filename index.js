@@ -154,6 +154,9 @@ const httpServer = app.listen(4000, () =>
 );
 initIO(httpServer);
 
+// Crash-safe playback reconciler (DB-authoritative; rebuilds work on boot).
+require("./services/scheduler").startReconciler();
+
 // === Route modules ===
 app.use(require("./routes/billing"));
 app.use(require("./routes/youtube"));
