@@ -230,8 +230,28 @@ router.post("/sessions", async (req, res) => {
 
     await ensureParticipant(sessionId, user, null, true);
 
+    // Return the SAME row shape as GET /sessions so the client can insert the
+    // new session optimistically with a complete object. Notably this includes
+    // `hostId` (s.user_id) — without it the dashboard's isHost check fails and
+    // the delete/host actions don't appear until a reload refetches the list.
     const [newSession] = await pool.query(
-      "SELECT s.id, s.title, s.is_private, s.created_at, u.username AS host FROM sessions s JOIN users u ON s.user_id = u.id WHERE s.id = ?",
+      `SELECT
+         s.id,
+         s.title,
+         s.created_at,
+         s.user_id AS hostId,
+         u.username AS host,
+         s.is_live,
+         s.status,
+         s.is_private,
+         (
+           SELECT COUNT(*)
+           FROM session_participants sp
+           WHERE sp.session_id = s.id AND sp.is_live = 1
+         ) AS participant_count
+       FROM sessions s
+       JOIN users u ON s.user_id = u.id
+       WHERE s.id = ?`,
       [sessionId],
     );
 
