@@ -1,7 +1,10 @@
 const { getIO } = require("./lib/io");
 const pool = require("./db");
 const { getUserFromToken, getGuestFromToken } = require("./services/auth");
-const { broadcastLiveParticipants } = require("./services/playback");
+const {
+  broadcastLiveParticipants,
+  broadcastParticipantCount,
+} = require("./services/playback");
 
 // Registers all Socket.IO connection/room/disconnect handlers. Called once
 // from index.js after the io server is initialised.
@@ -113,6 +116,9 @@ io.on("connection", (socket) => {
     );
 
     await broadcastLiveParticipants(sessionIdInt);
+    // Tab-close / clean disconnect: decrement the live count for everyone
+    // viewing the dashboard (participant_count_update is the only event it hears).
+    await broadcastParticipantCount(sessionIdInt);
 
     console.log("📝 [WS-DISCONNECT] Marked is_live=0 in DB");
 
