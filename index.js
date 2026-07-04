@@ -163,6 +163,8 @@ app.use(require("./routes/password"));
 app.use(require("./routes/profile"));
 app.use(require("./routes/artists"));
 app.use(require("./routes/sessions"));
+app.use(require("./routes/proposals"));
+app.use(require("./routes/invites"));
 
 // === Socket.IO ===
 require("./socket").registerSocketHandlers();
