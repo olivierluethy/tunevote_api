@@ -643,9 +643,9 @@ router.post("/sessions/:id/start", async (req, res) => {
   const suggestionEndsAt = new Date(Date.now() + suggestionDuration * 1000);
 
   const [roundResult] = await pool.query(
-    `INSERT INTO voting_rounds 
-      (session_id, status, phase, phase_ends_at, suggestion_duration, voting_duration)
-     VALUES (?, 'open', 'suggestion', ?, ?, ?)`,
+    `INSERT INTO voting_rounds
+      (session_id, state, phase_ends_at, suggestion_duration, voting_duration)
+     VALUES (?, 'suggesting', ?, ?, ?)`,
     [id, suggestionEndsAt, suggestionDuration, votingDuration],
   );
 

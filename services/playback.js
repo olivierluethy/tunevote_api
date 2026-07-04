@@ -33,7 +33,7 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
         await pool.query(
           `
           UPDATE voting_rounds 
-          SET phase = 'voting', phase_ends_at = ? 
+          SET state = 'voting', phase_ends_at = ?
           WHERE id = ? AND session_id = ?
         `,
           [votingEnds, roundId, sessionId],
@@ -206,7 +206,7 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
               // Runde schließen
               await pool.query(
                 `UPDATE voting_rounds 
-       SET status = 'closed', phase = 'closed', winner_queue_item_id = NULL 
+       SET state = 'closed', winner_queue_item_id = NULL
        WHERE id = ?`,
                 [roundId],
               );
@@ -294,7 +294,7 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
         await pool.query(
           `
     UPDATE voting_rounds
-    SET status = 'closed', phase = 'closed', winner_queue_item_id = ?
+    SET state = 'closed', winner_queue_item_id = ?
     WHERE id = ?
     `,
           [winnerId || null, roundId],
@@ -319,8 +319,8 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
           const [newRound] = await pool.query(
             `
       INSERT INTO voting_rounds
-        (session_id, status, phase, phase_ends_at, suggestion_duration, voting_duration)
-      VALUES (?, 'open', 'suggestion', ?, 90, 60)
+        (session_id, state, phase_ends_at, suggestion_duration, voting_duration)
+      VALUES (?, 'suggesting', ?, 90, 60)
       `,
             [sessionId, newEnds],
           );
@@ -491,7 +491,7 @@ const advanceToNext = async (sessionId, expectedCurrentItemId = null) => {
     // ========= EMERGENCY: NO QUEUED ITEM? → AUTO-PROMOTE FROM CURRENT VOTING ROUND =========
     if (!next) {
       const [openRound] = await connection.query(
-        `SELECT id FROM voting_rounds WHERE session_id = ? AND status = 'open' LIMIT 1`,
+        `SELECT id FROM voting_rounds WHERE session_id = ? AND state IN ('suggesting','voting') LIMIT 1`,
         [sessionId],
       );
 
@@ -569,7 +569,7 @@ const advanceToNext = async (sessionId, expectedCurrentItemId = null) => {
 
           // Close round early
           await connection.query(
-            `UPDATE voting_rounds SET status = 'closed', winner_queue_item_id = ? WHERE id = ?`,
+            `UPDATE voting_rounds SET state = 'closed', winner_queue_item_id = ? WHERE id = ?`,
             [winnerId, roundId],
           );
 
@@ -606,7 +606,7 @@ const advanceToNext = async (sessionId, expectedCurrentItemId = null) => {
         [sessionId],
       );
       const [openRounds] = await connection.query(
-        `SELECT COUNT(*) AS cnt FROM voting_rounds WHERE session_id = ? AND status = 'open'`,
+        `SELECT COUNT(*) AS cnt FROM voting_rounds WHERE session_id = ? AND state IN ('suggesting','voting')`,
         [sessionId],
       );
       const [currentlyPlaying] = await connection.query(
@@ -802,10 +802,10 @@ async function createNewPublicSession(title) {
     // Voting-Round
     const [roundResult] = await connection.query(`
       INSERT INTO voting_rounds
-        (session_id, status, phase, phase_ends_at,
+        (session_id, state, phase_ends_at,
          suggestion_duration, voting_duration, created_at)
       VALUES
-        (?, 'open', 'suggestion', DATE_ADD(NOW(), INTERVAL 90 SECOND),
+        (?, 'suggesting', DATE_ADD(NOW(), INTERVAL 90 SECOND),
          90, 60, NOW())
     `, [sessionId]);
 
@@ -900,7 +900,7 @@ async function checkQuorum(votingRoundId, sessionId) {
     if (v.votes >= votesNeeded) {
       // Voting Round schließen und Gewinner setzen
       await pool.query(
-        'UPDATE voting_rounds SET status = "computed", winner_queue_item_id = ? WHERE id = ?',
+        'UPDATE voting_rounds SET state = \'closed\', winner_queue_item_id = ? WHERE id = ?',
         [v.queue_item_id, votingRoundId],
       );
       getIO().to(sessionId).emit("voting_round_completed", {

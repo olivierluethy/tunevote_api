@@ -30,18 +30,18 @@ router.get("/sessions/:id/current-voting-phase", async (req, res) => {
 
   try {
     const [[round]] = await pool.query(`
-      SELECT 
+      SELECT
         id AS roundId,
-        phase,
+        state,
         UNIX_TIMESTAMP(phase_ends_at) * 1000 AS endsAtMs,
-        CASE 
-          WHEN phase = 'suggestion' THEN suggestion_duration 
-          WHEN phase = 'voting' THEN voting_duration 
-          ELSE 90 
+        CASE
+          WHEN state = 'suggesting' THEN suggestion_duration
+          WHEN state = 'voting' THEN voting_duration
+          ELSE 90
         END AS durationSeconds
       FROM voting_rounds
       WHERE session_id = ?
-        AND status = 'open'
+        AND state IN ('suggesting','voting')
       ORDER BY id DESC
       LIMIT 1
     `, [sessionId]);
@@ -51,7 +51,7 @@ router.get("/sessions/:id/current-voting-phase", async (req, res) => {
     }
 
     res.json({
-      phase: round.phase,
+      phase: round.state === "voting" ? "voting" : "suggestion",
       endsAt: round.endsAtMs,
       duration: round.durationSeconds,
       roundId: round.roundId
@@ -122,7 +122,7 @@ router.get("/sessions/:id/recommendations", async (req, res) => {
   // ---- Voting-Round & AI Suggestion Check ----
   const [votingRoundRows] = await pool.query(
     `SELECT id FROM voting_rounds 
-     WHERE session_id = ? AND status = 'open'
+     WHERE session_id = ? AND state IN ('suggesting','voting')
      ORDER BY id DESC LIMIT 1`,
     [id],
   );
@@ -551,10 +551,10 @@ router.post("/sessions/:id/recommendations/add", async (req, res) => {
     // =================================================
     if (isSessionLive) {
       const [[round]] = await pool.query(
-        `SELECT id, phase 
-         FROM voting_rounds 
+        `SELECT id, state
+         FROM voting_rounds
          WHERE session_id = ? 
-           AND status = 'open' 
+           AND state IN ('suggesting','voting') 
          ORDER BY id DESC LIMIT 1`,
         [sessionId]
       );
@@ -566,10 +566,10 @@ router.post("/sessions/:id/recommendations/add", async (req, res) => {
         });
       }
 
-      if (round.phase !== "suggestion") {
-        console.log(`[RECOMMENDATIONS/ADD] Session ${sessionId} live, aber falsche Phase (${round.phase}) → 403`);
+      if (round.state !== "suggesting") {
+        console.log(`[RECOMMENDATIONS/ADD] Session ${sessionId} live, aber falsche Phase (${round.state}) → 403`);
         return res.status(403).json({ 
-          error: `Nur in der Vorschlagsphase möglich (aktuell: ${round.phase})` 
+          error: `Nur in der Vorschlagsphase möglich (aktuell: ${round.state})` 
         });
       }
 
@@ -689,10 +689,10 @@ router.post("/sessions/:id/proposals", async (req, res) => {
     // 2. Wenn Session live ist → STRIKTE Phase-Prüfung
     if (isSessionLive) {
       const [[round]] = await pool.query(
-        `SELECT id, phase 
-         FROM voting_rounds 
+        `SELECT id, state
+         FROM voting_rounds
          WHERE session_id = ? 
-           AND status = 'open' 
+           AND state IN ('suggesting','voting') 
          ORDER BY id DESC LIMIT 1`,
         [sessionId]
       );
@@ -705,7 +705,7 @@ router.post("/sessions/:id/proposals", async (req, res) => {
       }
 
       // Runde existiert, aber nicht suggesting → verbieten
-      if (round.phase !== "suggestion") {
+      if (round.state !== "suggesting") {
         return res.status(403).json({ 
           error: "Aktuell läuft die Abstimmung – Vorschläge/Pausen erst in der nächsten Vorschlagsphase möglich" 
         });
@@ -949,7 +949,7 @@ router.post("/voting-rounds/:id/close", async (req, res) => {
     );
 
     if (winnerRows.length === 0) {
-      await pool.query("UPDATE voting_rounds SET status='closed' WHERE id=?", [
+      await pool.query("UPDATE voting_rounds SET state='closed' WHERE id=?", [
         id,
       ]);
       return res.json({ success: true, message: "Keine Vorschläge vorhanden" });
@@ -959,7 +959,7 @@ router.post("/voting-rounds/:id/close", async (req, res) => {
 
     // 2️⃣ Votingrunde updaten
     await pool.query(
-      "UPDATE voting_rounds SET status='computed', winner_queue_item_id=? WHERE id=?",
+      "UPDATE voting_rounds SET state='closed', winner_queue_item_id=? WHERE id=?",
       [winnerId, id],
     );
 
@@ -990,10 +990,10 @@ router.get("/sessions/:id/current-phase", async (req, res) => {
 
   try {
     const [[round]] = await pool.query(
-      `SELECT phase, phase_ends_at, 
+      `SELECT state, phase_ends_at,
               TIMESTAMPDIFF(SECOND, created_at, phase_ends_at) AS duration
        FROM voting_rounds 
-       WHERE session_id = ? AND status = 'open' 
+       WHERE session_id = ? AND state IN ('suggesting','voting') 
        ORDER BY id DESC LIMIT 1`,
       [id],
     );
@@ -1003,7 +1003,7 @@ router.get("/sessions/:id/current-phase", async (req, res) => {
     }
 
     res.json({
-      phase: round.phase,
+      phase: round.state === "voting" ? "voting" : "suggestion",
       endsAt: new Date(round.phase_ends_at).toISOString(),
       duration: round.duration || 90,
       roundId: round.id,
@@ -1036,14 +1036,14 @@ router.post("/sessions/:id/proposals/:propId/vote", async (req, res) => {
 
   // Nur in Voting-Phase erlaubt
   const [[currentRound]] = await pool.query(
-    `SELECT phase, id AS roundId 
-     FROM voting_rounds 
-     WHERE session_id = ? AND status = 'open' 
+    `SELECT state, id AS roundId
+     FROM voting_rounds
+     WHERE session_id = ? AND state IN ('suggesting','voting') 
      ORDER BY id DESC LIMIT 1`,
     [id],
   );
 
-  if (!currentRound || currentRound.phase !== "voting") {
+  if (!currentRound || currentRound.state !== "voting") {
     return res.status(403).json({ error: "Aktuell läuft keine Abstimmung" });
   }
 
@@ -1129,15 +1129,15 @@ router.delete("/sessions/:sessionId/proposals/:proposalId", async (req, res) => 
 
     // 2. Aktuelle Voting-Phase prüfen
     const [phaseRows] = await pool.query(
-      `SELECT phase FROM voting_rounds 
-       WHERE session_id = ? AND status = 'open' 
+      `SELECT state FROM voting_rounds
+       WHERE session_id = ? AND state IN ('suggesting','voting')
        ORDER BY created_at DESC LIMIT 1`,
       [sessionId],
     );
 
-    const currentPhase = phaseRows[0]?.phase || null;
+    const currentPhase = phaseRows[0]?.state || null;
 
-    if (currentPhase !== "suggestion") {
+    if (currentPhase !== "suggesting") {
       return res.status(403).json({
         message: "Löschen nur in der Vorschlagsphase möglich",
       });
