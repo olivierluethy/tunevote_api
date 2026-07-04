@@ -217,7 +217,7 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
               // Session beenden
               await pool.query(
                 `UPDATE sessions 
-       SET is_live = 0, ended_at = NOW() 
+       SET is_live = 0, status = 'ended', ended_at = NOW()
        WHERE id = ? AND is_live = 1`,
                 [sessionId],
               );
@@ -619,9 +619,10 @@ const advanceToNext = async (sessionId, expectedCurrentItemId = null) => {
       const nothingPlaying = currentlyPlaying[0].cnt === 0;
 
       if (noActiveUsers && noOpenVoting && nothingPlaying) {
-        await connection.query(`UPDATE sessions SET is_live = 0 WHERE id = ?`, [
-          sessionId,
-        ]);
+        await connection.query(
+          `UPDATE sessions SET is_live = 0, status = 'ended', ended_at = NOW() WHERE id = ?`,
+          [sessionId],
+        );
         await connection.query(
           `UPDATE session_participants SET is_live = 0 WHERE session_id = ?`,
           [sessionId],

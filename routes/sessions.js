@@ -103,6 +103,7 @@ router.get("/sessions", async (req, res) => {
           s.user_id AS hostId,
           u.username AS host,
           s.is_live,
+          s.status,
           s.is_private,
           (
             SELECT COUNT(*)
@@ -134,7 +135,7 @@ router.get("/sessions", async (req, res) => {
         `
         SELECT 
           s.id, s.title, s.created_at, s.user_id AS hostId, u.username AS host,
-          s.is_live, s.is_private,
+          s.is_live, s.status, s.is_private,
           (
             SELECT COUNT(*) FROM session_participants sp
             WHERE sp.session_id = s.id AND sp.is_live = 1
@@ -159,6 +160,7 @@ router.get("/sessions", async (req, res) => {
         s.user_id AS hostId,
         u.username AS host,
         s.is_live,
+        s.status,
         s.is_private,
         (
           SELECT COUNT(*)
@@ -573,7 +575,10 @@ router.post("/sessions/:id/start", async (req, res) => {
   );
 
   // 🚀 Session live setzen
-  await pool.query("UPDATE sessions SET is_live = 1 WHERE id = ?", [id]);
+  await pool.query(
+    "UPDATE sessions SET is_live = 1, status = 'live' WHERE id = ?",
+    [id],
+  );
 
   // 🎵 Prüfen, ob Songs in der Queue sind → sofort abspielen
   const [first] = await pool.query(
