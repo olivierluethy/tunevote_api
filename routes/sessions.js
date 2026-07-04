@@ -29,8 +29,16 @@ router.get("/sessions/:id/playback-sync", async (req, res) => {
   const { id } = req.params;
 
   try {
+    // Derived from the single source of truth: the queue_items row that is
+    // 'playing' (video_id + startedAt). No separate playback_sync table.
     const [rows] = await pool.query(
-      "SELECT current_video_id, video_start_time, is_playing FROM playback_sync WHERE session_id = ?",
+      `SELECT qi.video_id                          AS current_video_id,
+              UNIX_TIMESTAMP(qi.startedAt) * 1000  AS video_start_time,
+              (s.is_live = 1 AND qi.item_type = 'music') AS is_playing
+         FROM sessions s
+         JOIN queue_items qi
+           ON qi.session_id = s.id AND qi.status = 'playing'
+        WHERE s.id = ?`,
       [id],
     );
     res.json(rows[0] || {});
@@ -553,9 +561,6 @@ router.post("/sessions/:id/start", async (req, res) => {
     return res.status(400).json({ error: "Session already live" });
   }
 
-  // 🧹 Reset playback_sync
-  await pool.query(`DELETE FROM playback_sync WHERE session_id = ?`, [id]);
-
   // Alle bisherigen "suggested" Vorschläge in die Queue übernehmen
   await pool.query(
     `
@@ -588,21 +593,16 @@ router.post("/sessions/:id/start", async (req, res) => {
     const duration = first[0].duration || 180;
     const startTime = Date.now();
 
-    // 🕒 Ersten Song auf "playing" setzen
+    // 🕒 Ersten Song auf "playing" setzen (startedAt = single source of truth)
     await pool.query(
       `UPDATE queue_items SET status = 'playing', startedAt = NOW() WHERE id = ?`,
       [firstId],
     );
 
-    // 🧩 playback_sync setzen
+    // Durable deadline so the reconciler can advance/recover the first song too.
     await pool.query(
-      `INSERT INTO playback_sync (session_id, current_video_id, progress_seconds, is_playing, video_start_time)
-       VALUES (?, ?, 0, 1, ?)
-       ON DUPLICATE KEY UPDATE
-         current_video_id = VALUES(current_video_id),
-         video_start_time = VALUES(video_start_time),
-         is_playing = 1`,
-      [id, firstVideoId, startTime],
+      `UPDATE sessions SET current_plays_until = DATE_ADD(NOW(), INTERVAL ? SECOND) WHERE id = ?`,
+      [Math.max(1, Math.floor(duration)), id],
     );
 
     console.log(
@@ -623,7 +623,10 @@ router.post("/sessions/:id/start", async (req, res) => {
     });
 
     if (sessionTimers[id]) clearTimeout(sessionTimers[id]);
-    sessionTimers[id] = setTimeout(() => advanceToNext(id), duration * 1000);
+    sessionTimers[id] = setTimeout(
+      () => advanceToNext(id, firstId),
+      duration * 1000,
+    );
 
     firstSongStarted = true;
   } else {

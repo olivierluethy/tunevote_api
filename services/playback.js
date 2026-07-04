@@ -655,10 +655,6 @@ const advanceToNext = async (sessionId, expectedCurrentItemId = null) => {
           `UPDATE queue_items SET status = 'playing', startedAt = NOW() WHERE id = ?`,
           [nextId],
         );
-        await connection.query(
-          `UPDATE playback_sync SET current_video_id = NULL, is_playing = 0, video_start_time = ? WHERE session_id = ?`,
-          [startTime, sessionId],
-        );
         emits.push({
           event: "pause_started",
           payload: { queue_item_id: nextId, title, duration, startTime },
@@ -684,15 +680,6 @@ const advanceToNext = async (sessionId, expectedCurrentItemId = null) => {
         await connection.query(
           `UPDATE queue_items SET status = 'playing', startedAt = NOW() WHERE id = ?`,
           [nextId],
-        );
-        await connection.query(
-          `INSERT INTO playback_sync (session_id, current_video_id, video_start_time, is_playing)
-           VALUES (?, ?, ?, 1)
-           ON DUPLICATE KEY UPDATE
-             current_video_id = VALUES(current_video_id),
-             video_start_time = VALUES(video_start_time),
-             is_playing = 1`,
-          [sessionId, nextVideoId, startTime],
         );
         emits.push({
           event: "playback_sync",
