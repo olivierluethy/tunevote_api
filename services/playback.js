@@ -218,7 +218,7 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
               await pool.query(
                 `UPDATE sessions 
        SET is_live = 0, status = 'ended', ended_at = NOW()
-       WHERE id = ? AND is_live = 1`,
+       WHERE id = ? AND status = 'live'`,
                 [sessionId],
               );
               console.log(

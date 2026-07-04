@@ -22,8 +22,8 @@ async function seedLiveSession(pool_, { videos, startPlayingIndex = 0 }) {
   const [[u]] = await pool_.query(`SELECT id FROM users ORDER BY id LIMIT 1`);
   if (!u) throw new Error("seedLiveSession: no users exist in the DB to host a session");
   const [s] = await pool_.query(
-    `INSERT INTO sessions (user_id, title, is_live, is_private, created_at)
-     VALUES (?, 'TEST_SESSION', 1, 0, NOW())`,
+    `INSERT INTO sessions (user_id, title, is_live, status, is_private, created_at)
+     VALUES (?, 'TEST_SESSION', 1, 'live', 0, NOW())`,
     [u.id],
   );
   const sessionId = s.insertId;

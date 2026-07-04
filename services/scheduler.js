@@ -30,7 +30,7 @@ async function reconcileOnce({ graceSeconds = 30 } = {}) {
        FROM sessions s
        LEFT JOIN queue_items q
          ON q.session_id = s.id AND q.status = 'playing'
-      WHERE s.is_live = 1
+      WHERE s.status = 'live'
         AND s.current_plays_until IS NOT NULL
         AND s.current_plays_until < NOW()`,
   );
@@ -69,7 +69,7 @@ async function reconcileOnce({ graceSeconds = 30 } = {}) {
   const [dead] = await pool.query(
     `SELECT s.id
        FROM sessions s
-      WHERE s.is_live = 1
+      WHERE s.status = 'live'
         AND NOT EXISTS (
           SELECT 1 FROM queue_items q
            WHERE q.session_id = s.id

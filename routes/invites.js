@@ -51,9 +51,9 @@ router.get("/sessions/:id/invites/accepted", async (req, res) => {
   try {
     // === 2. Session direkt per SQL holen + Berechtigung prüfen ===
     const [sessionRows] = await pool.query(
-      `SELECT id, user_id, title, is_private, is_live 
-       FROM sessions 
-       WHERE id = ? 
+      `SELECT id, user_id, title, is_private
+       FROM sessions
+       WHERE id = ?
        LIMIT 1`,
       [sessionId],
     );
