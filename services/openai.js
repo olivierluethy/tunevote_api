@@ -11,6 +11,11 @@ if (OPENAI_API_KEY) {
   openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 }
 
+// Chat model for song recommendations. Configurable so it can be swapped or
+// rolled back without a code change. Defaults to gpt-4o-mini: far more diverse
+// and current than gpt-3.5-turbo, and cheap.
+const CHAT_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+
 // Safely parse a JSON array of song suggestions out of an OpenAI text response,
 // tolerating ```json fences and malformed output.
 const safeParseOpenAI = (text) => {
@@ -27,4 +32,4 @@ const safeParseOpenAI = (text) => {
   }
 };
 
-module.exports = { openai, safeParseOpenAI };
+module.exports = { openai, safeParseOpenAI, CHAT_MODEL };
