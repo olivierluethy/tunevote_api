@@ -8,92 +8,32 @@ const { v4: uuidv4 } = require("uuid");
 const axios = require("axios");
 const crypto = require("crypto");
 const ytdl = require("@distube/ytdl-core");
-const nodemailer = require("nodemailer");
 const multer = require("multer");
 
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const GOOGLE_USERINFO_URL = 'https://www.googleapis.com/oauth2/v3/userinfo';
 
-const transporter = nodemailer.createTransport({
-  service: "gmail",
-  auth: {
-    user: process.env.GMAIL_USER,
-    pass: process.env.GMAIL_APP_PASSWORD, // mit Leerzeichen aus App-Passwort!
-  },
-});
-
-// Teste beim Start einmal
-transporter
-  .verify()
-  .then(() => console.log("Gmail ready"))
-  .catch(console.error);
+const transporter = require("./services/mailer");
+const { openai, safeParseOpenAI } = require("./services/openai");
+const {
+  stripe,
+  STRIPE_WEBHOOK_SECRET,
+  STRIPE_PRICE_ID,
+  APP_PUBLIC_URL,
+} = require("./services/stripe");
 
 const generateResetToken = () => crypto.randomBytes(32).toString("hex");
 
 const hashPassword = (password) => bcrypt.hash(password, 10);
 
-// ---------------------------------------------------------------
-// 1. NEW DEPENDENCIES
-// ---------------------------------------------------------------
-const { Configuration, OpenAIApi } = require("openai");
-
-// ---------------------------------------------------------------
-// OPENAI v4+ (openai@6.8.1) – korrekte Initialisierung
-// ---------------------------------------------------------------
-const { OpenAI } = require("openai");
-
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-if (!OPENAI_API_KEY) {
-  console.warn("OPENAI_API_KEY missing – recommendations disabled");
-}
-
-let openai = null;
-if (OPENAI_API_KEY) {
-  openai = new OpenAI({
-    apiKey: OPENAI_API_KEY,
-  });
-}
-
-// ---------------------------------------------------------------
-// 3. HELPER: safe JSON parsing from OpenAI
-// ---------------------------------------------------------------
-const safeParseOpenAI = (text) => {
-  if (!text) return [];
-  try {
-    const cleaned = text.replace(/^```(?:json)?\s*|\s*```$/g, "").trim();
-    const parsed = JSON.parse(cleaned);
-    return Array.isArray(parsed)
-      ? parsed.filter((s) => s.title && s.youtubeId)
-      : [];
-  } catch (e) {
-    console.warn("OpenAI JSON parse failed:", e.message, "\nRaw:", text);
-    return [];
-  }
-};
-
 const app = express();
 app.use(cors());
 
 // ---------------------------------------------------------------
-// Stripe billing — initialised before any body parser so the webhook
-// route below can claim the raw body. The Stripe SDK verifies webhook
-// signatures byte-for-byte against the request body, so the webhook
-// handler MUST be mounted before app.use(express.json()).
+// Stripe billing webhook — mounted with a raw body parser BEFORE
+// app.use(express.json()) below, because the Stripe SDK verifies webhook
+// signatures byte-for-byte against the untouched request body.
 // ---------------------------------------------------------------
-const Stripe = require("stripe");
-const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
-const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
-const STRIPE_PRICE_ID = process.env.STRIPE_PRICE_ID;
-const APP_PUBLIC_URL = process.env.APP_PUBLIC_URL || "https://app.tunevote.com";
-
-let stripe = null;
-if (STRIPE_SECRET_KEY) {
-  stripe = new Stripe(STRIPE_SECRET_KEY);
-  console.log("✅ Stripe initialised");
-} else {
-  console.warn("⚠️  STRIPE_SECRET_KEY missing — billing endpoints will 500");
-}
-
 app.post(
   "/billing/webhook",
   express.raw({ type: "application/json" }),
