@@ -243,6 +243,11 @@ router.get("/sessions/:id/recommendations", async (req, res) => {
           )}\nRecommend songs a fan of those would enjoy, but branch out.`
         : `There is no strong taste signal yet, so recommend broadly appealing songs.`;
 
+      // Ask for MORE candidates than we need. Some titles won't map to a real
+      // YouTube video (mapping threshold), so a candidate pool means we still
+      // reliably fill `needed` instead of returning fewer.
+      const wanted = needed + 5;
+
       // ---- Prompt für AI ----
       const prompt = `
 You are a music recommendation engine for a live group listening session.
@@ -259,7 +264,7 @@ FORMAT RULES (MUST FOLLOW EXACTLY):
 
 HARD CONSTRAINTS:
 - Do NOT suggest anything in the "Already used" list below, nor any near-identical title.
-- Return ${needed} DIFFERENT song(s), each by a different artist where possible.
+- Return ${wanted} DIFFERENT songs, each by a different artist where possible.
 
 Already used (never repeat any of these): ${JSON.stringify(allTitles)}
 
@@ -352,16 +357,31 @@ Output ONLY a JSON array, nothing else:
         return !isDuplicate;
       });
 
+      // Load the cache ONCE (was re-queried per suggestion) and the set of
+      // videos already used anywhere in this session. We never map a suggestion
+      // onto an already-used video, nor onto one already chosen in this batch —
+      // that collision is why distinct AI titles sometimes became the same clip.
+      const [cacheRows] = await pool.query(
+        `SELECT youtube_id, title, title_norm, thumbnail, duration FROM youtube_video_cache`,
+      );
+      const [usedRows] = await pool.query(
+        `SELECT DISTINCT video_id FROM queue_items WHERE session_id = ? AND item_type = 'music'`,
+        [id],
+      );
+      const usedVideoIds = new Set(usedRows.map((r) => r.video_id));
+
       const results = [];
 
       for (const s of aiSuggestions) {
+        if (results.length >= needed) break;
         const normalizedAI = normalize(s.title);
+        const artist = normalize(s.title.split(" - ")[0] || "");
 
-        const [rows] = await pool.query(`SELECT * FROM youtube_video_cache`);
         let bestMatch = null;
         let bestScore = 0;
 
-        for (const row of rows) {
+        for (const row of cacheRows) {
+          if (usedVideoIds.has(row.youtube_id)) continue; // skip already-used videos
           const normalizedCache = normalize(row.title_norm);
           const score = levenshteinRatio(normalizedAI, normalizedCache);
           if (score > bestScore) {
@@ -403,6 +423,7 @@ Output ONLY a JSON array, nothing else:
               );
             }
           }
+          usedVideoIds.add(bestMatch.youtube_id);
           results.push({
             title: bestMatch.title,
             youtubeId: bestMatch.youtube_id,
@@ -437,15 +458,20 @@ Output ONLY a JSON array, nothing else:
           let bestYtMatch = null;
           let bestYtScore = 0;
           for (const item of items) {
+            if (usedVideoIds.has(item.id.videoId)) continue; // skip already-used videos
             const titleNorm = normalize(item.snippet.title);
-            const score = levenshteinRatio(normalizedAI, titleNorm);
+            let score = levenshteinRatio(normalizedAI, titleNorm);
+            // Accept a lower ratio when the artist name is clearly present:
+            // YouTube's official titles carry extra words that hurt the raw
+            // ratio, which used to drop valid (esp. international/deep-cut) hits.
+            if (artist && titleNorm.includes(artist)) score = Math.max(score, 74);
             if (score > bestYtScore) {
               bestYtScore = score;
               bestYtMatch = item;
             }
           }
 
-          if (!bestYtMatch || bestYtScore < 80) continue;
+          if (!bestYtMatch || bestYtScore < 70) continue;
 
           const videoId = bestYtMatch.id.videoId;
           const title = bestYtMatch.snippet.title;
@@ -487,6 +513,7 @@ Output ONLY a JSON array, nothing else:
             [videoId, title, titleNorm, thumbnail, durationSeconds],
           );
 
+          usedVideoIds.add(videoId);
           results.push({
             title,
             youtubeId: videoId,
