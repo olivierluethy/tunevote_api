@@ -371,6 +371,10 @@ Output ONLY a JSON array, nothing else:
       const usedVideoIds = new Set(usedRows.map((r) => r.video_id));
 
       const results = [];
+      // YouTube search costs ~100 quota units each; cache hits are free. Cap the
+      // number of live searches per call so a batch of obscure (cache-miss)
+      // suggestions can't blow the daily quota. Cache hits stay unlimited.
+      let searchBudget = needed + 1;
 
       for (const s of aiSuggestions) {
         if (results.length >= needed) break;
@@ -433,6 +437,9 @@ Output ONLY a JSON array, nothing else:
           if (results.length >= needed) break;
           continue;
         }
+
+        if (searchBudget <= 0) continue; // out of live-search budget for this call
+        searchBudget--;
 
         try {
           const searchQuery = `${s.title
