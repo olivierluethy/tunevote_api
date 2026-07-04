@@ -27,6 +27,46 @@ io.on("connection", (socket) => {
   socket.join(sessionId);
   console.log(`➡️ [WS-CONNECT] Socket ${socket.id} joined room ${sessionId}`);
 
+  // === Participant heartbeat ===
+  // Resolve identity once (the frontend passes tokens via socket.io `auth`,
+  // falling back to headers), then keep session_participants.last_seen fresh so
+  // the reconciler's reaper can drop participants who vanish uncleanly.
+  const auth = socket.handshake.auth || {};
+  const hbToken =
+    auth.token || socket.handshake.headers.authorization?.split(" ")[1];
+  const hbGuestToken =
+    auth.guestToken || socket.handshake.headers["x-guest-token"];
+  let hbCol = null;
+  let hbId = null;
+
+  const touchLastSeen = async () => {
+    if (!hbCol || !hbId) return;
+    try {
+      await pool.query(
+        `UPDATE session_participants SET last_seen = NOW()
+         WHERE session_id = ? AND ${hbCol} = ?`,
+        [sessionIdInt, hbId],
+      );
+    } catch (e) {
+      console.warn("[heartbeat] update failed:", e.message);
+    }
+  };
+
+  (async () => {
+    const u = hbToken ? await getUserFromToken(hbToken) : null;
+    const g = !u && hbGuestToken ? await getGuestFromToken(hbGuestToken) : null;
+    if (u) {
+      hbCol = "user_id";
+      hbId = u.id;
+    } else if (g) {
+      hbCol = "guest_id";
+      hbId = g.id;
+    }
+    touchLastSeen(); // initial mark on connect
+  })();
+
+  socket.on("heartbeat", touchLastSeen);
+
   socket.on("disconnect", async () => {
     console.log("📴 [WS-DISCONNECT] Triggered for socket:", socket.id);
 
