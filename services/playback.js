@@ -353,9 +353,9 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
   }, seconds * 1000);
 }
 
-async function finalizeListeningForCurrentSong(sessionId) {
+async function finalizeListeningForCurrentSong(sessionId, conn = pool) {
   // 1. Aktuellen Song holen
-  const [rows] = await pool.query(
+  const [rows] = await conn.query(
     `
     SELECT qi.id, qi.startedAt, yvc.duration
     FROM queue_items qi
@@ -375,7 +375,7 @@ async function finalizeListeningForCurrentSong(sessionId) {
   const songEnd = new Date(songStart.getTime() + song.duration * 1000);
 
   // 2. Teilnehmer mit Zeitüberschneidung holen
-  const [participants] = await pool.query(
+  const [participants] = await conn.query(
     `
     SELECT *
     FROM session_participants
@@ -406,7 +406,7 @@ async function finalizeListeningForCurrentSong(sessionId) {
 
     const completed = listenSeconds >= song.duration * 0.9 ? 1 : 0;
 
-    await pool.query(
+    await conn.query(
       `
       INSERT INTO session_song_listens
         (session_id, queue_item_id, user_id, guest_id,
@@ -429,30 +429,52 @@ async function finalizeListeningForCurrentSong(sessionId) {
 
 // Advance to next queue item — Identifikation ausschließlich über queue_items.id / status
 // Advance to next queue item — NOW WITH EMERGENCY AUTO-PROMOTION FROM VOTING
-const advanceToNext = async (sessionId) => {
+const advanceToNext = async (sessionId, expectedCurrentItemId = null) => {
+  // Everything that mutates state runs inside ONE locked transaction so two
+  // concurrent advances (two timers, timer + reconciler, timer + manual) can
+  // never double-skip or leave two rows 'playing'. Socket emits, the debounced
+  // broadcast, and the next-song timer are deferred until AFTER commit.
+  const connection = await pool.getConnection();
+  const emits = [];
+  let armTimer = null;
+  let doBroadcast = false;
+  let committed = false;
   try {
-    // 🔥 NEU: Listening für aktuellen Song abschließen
-    await finalizeListeningForCurrentSong(sessionId);
+    await connection.beginTransaction();
 
-    // 1) Mark current playing as played
-    const [playingRows] = await pool.query(
-      `SELECT id FROM queue_items WHERE session_id = ? AND status = 'playing' LIMIT 1`,
+    // Serialize all advances for this session.
+    await connection.query(`SELECT id FROM sessions WHERE id = ? FOR UPDATE`, [
+      sessionId,
+    ]);
+
+    // 🔥 Listening für aktuellen Song abschließen (Teil derselben Transaktion)
+    await finalizeListeningForCurrentSong(sessionId, connection);
+
+    // 1) Lock + read the current playing row.
+    const [playingRows] = await connection.query(
+      `SELECT id FROM queue_items WHERE session_id = ? AND status = 'playing' LIMIT 1 FOR UPDATE`,
       [sessionId],
     );
-    if (playingRows.length > 0) {
-      const currentId = playingRows[0].id;
-      await pool.query(
-        `UPDATE queue_items SET status = 'played', playedAt = NOW() WHERE id = ?`,
+    const currentId = playingRows[0]?.id ?? null;
+
+    // Compare-and-swap: if the caller expected a specific current item and it's
+    // no longer the playing row, another advance already handled it → no-op.
+    if (expectedCurrentItemId !== null && currentId !== expectedCurrentItemId) {
+      await connection.commit();
+      return;
+    }
+
+    if (currentId !== null) {
+      await connection.query(
+        `UPDATE queue_items SET status = 'played', playedAt = NOW() WHERE id = ? AND status = 'playing'`,
         [currentId],
       );
-
-      // 🔥 Optional: Auch hier broadcasten (falls played-Songs mitzählen sollen)
-      await broadcastTodayTopArtists();
+      doBroadcast = true;
       console.log(`[Session ${sessionId}] Marked played: #${currentId}`);
     }
 
     // 2) Check if there are still queued items
-    const [queuedRows] = await pool.query(
+    const [queuedRows] = await connection.query(
       `SELECT qi.id, qi.video_id, qi.item_type,
               COALESCE(yvc.duration, qi.pause_duration_seconds) AS duration,
               COALESCE(yvc.title, qi.description)               AS title
@@ -468,7 +490,7 @@ const advanceToNext = async (sessionId) => {
 
     // ========= EMERGENCY: NO QUEUED ITEM? → AUTO-PROMOTE FROM CURRENT VOTING ROUND =========
     if (!next) {
-      const [openRound] = await pool.query(
+      const [openRound] = await connection.query(
         `SELECT id FROM voting_rounds WHERE session_id = ? AND status = 'open' LIMIT 1`,
         [sessionId],
       );
@@ -484,7 +506,7 @@ const advanceToNext = async (sessionId) => {
         let winnerId = null;
 
         // 1. Highest voted
-        const [votedSongs] = await pool.query(
+        const [votedSongs] = await connection.query(
           `
           SELECT qi.id
           FROM queue_items qi
@@ -502,7 +524,7 @@ const advanceToNext = async (sessionId) => {
           winnerId = votedSongs[0].id;
         } else {
           // 2. Fallback: oldest user/guest suggestion
-          const [userProposal] = await pool.query(
+          const [userProposal] = await connection.query(
             `
             SELECT id FROM queue_items
             WHERE voting_round_id = ? AND status = 'suggested' AND item_source IN ('user', 'guest')
@@ -512,13 +534,13 @@ const advanceToNext = async (sessionId) => {
           );
           if (userProposal.length > 0) winnerId = userProposal[0].id;
           else {
-            // 3. Random AI song if live users exist and ≥3 AI songs (deine Logik prüft nur Existenz, aber Kommentar sagt ≥3 – belassen wie ist)
-            const [liveCountRow] = await pool.query(
+            // 3. Random AI song if live users exist
+            const [liveCountRow] = await connection.query(
               `SELECT COUNT(*) AS cnt FROM session_participants WHERE session_id = ? AND is_live = 1`,
               [sessionId],
             );
             if (liveCountRow[0].cnt > 0) {
-              const [aiRows] = await pool.query(
+              const [aiRows] = await connection.query(
                 `
                 SELECT id FROM queue_items
                 WHERE voting_round_id = ? AND status = 'suggested' AND item_source = 'ai'
@@ -533,37 +555,34 @@ const advanceToNext = async (sessionId) => {
         }
 
         if (winnerId) {
-          await pool.query(
+          await connection.query(
             `UPDATE queue_items SET status = 'queued' WHERE id = ?`,
             [winnerId],
           );
 
           // Archive others
-          await pool.query(
+          await connection.query(
             `UPDATE queue_items SET status = 'archived'
              WHERE voting_round_id = ? AND status = 'suggested' AND id != ?`,
             [roundId, winnerId],
           );
 
           // Close round early
-          await pool.query(
+          await connection.query(
             `UPDATE voting_rounds SET status = 'closed', winner_queue_item_id = ? WHERE id = ?`,
             [winnerId, roundId],
           );
 
-          // 🔥 NEU: Auch hier zählt der Song jetzt mit!
-          await broadcastTodayTopArtists();
-
-          getIO().to(sessionId).emit("voting_round_completed", {
-            winnerId,
-            roundId,
-            emergency: true,
+          doBroadcast = true;
+          emits.push({
+            event: "voting_round_completed",
+            payload: { winnerId, roundId, emergency: true },
           });
-          getIO().to(sessionId).emit("proposals_updated");
-          getIO().to(sessionId).emit("queue_updated");
+          emits.push({ event: "proposals_updated" });
+          emits.push({ event: "queue_updated" });
 
           // Now fetch the newly queued song
-          const [emergencyNext] = await pool.query(
+          const [emergencyNext] = await connection.query(
             `SELECT qi.id, qi.video_id, qi.item_type,
                     COALESCE(yvc.duration, qi.pause_duration_seconds) AS duration,
                     COALESCE(yvc.title, qi.description)               AS title
@@ -580,19 +599,17 @@ const advanceToNext = async (sessionId) => {
       }
     }
 
-    // 3) Still no song? → End session properly (with extra safety check)
     if (!next) {
-      const [activeParticipants] = await pool.query(
+      // 3) Still no song? → End session properly (with extra safety check)
+      const [activeParticipants] = await connection.query(
         `SELECT COUNT(*) AS cnt FROM session_participants WHERE session_id = ? AND is_live = 1`,
         [sessionId],
       );
-      const [openRounds] = await pool.query(
+      const [openRounds] = await connection.query(
         `SELECT COUNT(*) AS cnt FROM voting_rounds WHERE session_id = ? AND status = 'open'`,
         [sessionId],
       );
-
-      // NEUE PRÜFUNG: Gibt es noch einen aktiven "playing" Eintrag?
-      const [currentlyPlaying] = await pool.query(
+      const [currentlyPlaying] = await connection.query(
         `SELECT COUNT(*) AS cnt FROM queue_items WHERE session_id = ? AND status = 'playing'`,
         [sessionId],
       );
@@ -602,20 +619,19 @@ const advanceToNext = async (sessionId) => {
       const nothingPlaying = currentlyPlaying[0].cnt === 0;
 
       if (noActiveUsers && noOpenVoting && nothingPlaying) {
-        // Jetzt wirklich sicher: nichts läuft mehr → Session beenden
-        await pool.query(`UPDATE sessions SET is_live = 0 WHERE id = ?`, [
+        await connection.query(`UPDATE sessions SET is_live = 0 WHERE id = ?`, [
           sessionId,
         ]);
-        await pool.query(
+        await connection.query(
           `UPDATE session_participants SET is_live = 0 WHERE session_id = ?`,
           [sessionId],
         );
-        getIO().to(sessionId).emit("session_ended");
+        emits.push({ event: "session_ended" });
         console.log(
           `[Session ${sessionId}] Session ended (no songs playing, no queued next, no users, no voting)`,
         );
       } else {
-        let reasons = [];
+        const reasons = [];
         if (!noActiveUsers) reasons.push("active users");
         if (!noOpenVoting) reasons.push("open voting");
         if (!nothingPlaying) reasons.push("song currently playing");
@@ -623,84 +639,108 @@ const advanceToNext = async (sessionId) => {
           `[Session ${sessionId}] No song to play next, but session stays alive → ${reasons.join(", ")}`,
         );
       }
-      return;
-    }
-
-    // 4) Play the next song (normal flow)
-    const {
-      id: nextId,
-      video_id: nextVideoId,
-      item_type,
-      duration,
-      title,
-    } = next;
-    const startTime = Date.now();
-
-    if (item_type === "pause") {
-      await pool.query(
-        `UPDATE queue_items SET status = 'playing', startedAt = NOW() WHERE id = ?`,
-        [nextId],
-      );
-      await pool.query(
-        `UPDATE playback_sync SET current_video_id = NULL, is_playing = 0, video_start_time = ? WHERE session_id = ?`,
-        [startTime, sessionId],
-      );
-      getIO().to(sessionId).emit("pause_started", {
-        queue_item_id: nextId,
-        title,
-        duration,
-        startTime,
-      });
-      getIO().to(sessionId).emit("playback_sync", {
-        current_queue_item_id: nextId,
-        current_video_id: null,
-        video_start_time: startTime,
-        is_playing: false,
-      });
-
-      if (sessionTimers[sessionId]) clearTimeout(sessionTimers[sessionId]);
-      sessionTimers[sessionId] = setTimeout(
-        () => advanceToNext(sessionId),
-        duration * 1000,
-      );
     } else {
-      await pool.query(
-        `UPDATE queue_items SET status = 'playing', startedAt = NOW() WHERE id = ?`,
-        [nextId],
-      );
-      await pool.query(
-        `INSERT INTO playback_sync (session_id, current_video_id, video_start_time, is_playing)
-         VALUES (?, ?, ?, 1)
-         ON DUPLICATE KEY UPDATE
-           current_video_id = VALUES(current_video_id),
-           video_start_time = VALUES(video_start_time),
-           is_playing = 1`,
-        [sessionId, nextVideoId, startTime],
-      );
+      // 4) Play the next song (normal flow)
+      const {
+        id: nextId,
+        video_id: nextVideoId,
+        item_type,
+        duration,
+        title,
+      } = next;
+      const startTime = Date.now();
 
-      getIO().to(sessionId).emit("playback_sync", {
-        current_queue_item_id: nextId,
-        current_video_id: nextVideoId,
-        video_start_time: startTime,
-        is_playing: true,
-      });
+      if (item_type === "pause") {
+        await connection.query(
+          `UPDATE queue_items SET status = 'playing', startedAt = NOW() WHERE id = ?`,
+          [nextId],
+        );
+        await connection.query(
+          `UPDATE playback_sync SET current_video_id = NULL, is_playing = 0, video_start_time = ? WHERE session_id = ?`,
+          [startTime, sessionId],
+        );
+        emits.push({
+          event: "pause_started",
+          payload: { queue_item_id: nextId, title, duration, startTime },
+        });
+        emits.push({
+          event: "playback_sync",
+          payload: {
+            current_queue_item_id: nextId,
+            current_video_id: null,
+            video_start_time: startTime,
+            is_playing: false,
+          },
+        });
+        const pauseMs = Math.max(1000, (duration || 1) * 1000);
+        armTimer = () => {
+          if (sessionTimers[sessionId]) clearTimeout(sessionTimers[sessionId]);
+          sessionTimers[sessionId] = setTimeout(
+            () => advanceToNext(sessionId, nextId),
+            pauseMs,
+          );
+        };
+      } else {
+        await connection.query(
+          `UPDATE queue_items SET status = 'playing', startedAt = NOW() WHERE id = ?`,
+          [nextId],
+        );
+        await connection.query(
+          `INSERT INTO playback_sync (session_id, current_video_id, video_start_time, is_playing)
+           VALUES (?, ?, ?, 1)
+           ON DUPLICATE KEY UPDATE
+             current_video_id = VALUES(current_video_id),
+             video_start_time = VALUES(video_start_time),
+             is_playing = 1`,
+          [sessionId, nextVideoId, startTime],
+        );
+        emits.push({
+          event: "playback_sync",
+          payload: {
+            current_queue_item_id: nextId,
+            current_video_id: nextVideoId,
+            video_start_time: startTime,
+            is_playing: true,
+          },
+        });
+        const safeDurationMs = Math.max(1000, (duration || 180) * 1000);
+        armTimer = () => {
+          if (sessionTimers[sessionId]) clearTimeout(sessionTimers[sessionId]);
+          sessionTimers[sessionId] = setTimeout(
+            () => advanceToNext(sessionId, nextId),
+            safeDurationMs,
+          );
+        };
+        console.log(
+          `[Session ${sessionId}] Now playing: "${title}" (#${nextId})`,
+        );
+      }
 
-      if (sessionTimers[sessionId]) clearTimeout(sessionTimers[sessionId]);
-      const safeDurationMs = Math.max(1000, (duration || 180) * 1000);
-      sessionTimers[sessionId] = setTimeout(
-        () => advanceToNext(sessionId),
-        safeDurationMs,
-      );
-
-      console.log(
-        `[Session ${sessionId}] Now playing: "${title}" (#${nextId})`,
-      );
+      emits.push({ event: "queue_updated" });
     }
 
-    getIO().to(sessionId).emit("queue_updated");
+    await connection.commit();
+    committed = true;
   } catch (err) {
+    try {
+      await connection.rollback();
+    } catch (rollbackErr) {
+      console.error(
+        `[Session ${sessionId}] rollback failed:`,
+        rollbackErr.message,
+      );
+    }
     console.error(`[Session ${sessionId}] advanceToNext error:`, err);
+  } finally {
+    connection.release();
   }
+
+  if (!committed) return;
+
+  // Side effects run only after the transaction has committed.
+  if (doBroadcast) broadcastTodayTopArtists();
+  for (const e of emits) getIO().to(sessionId).emit(e.event, e.payload);
+  if (armTimer) armTimer();
 };
 
 // Hilfsfunktion: Sendet aktuelle Live-Teilnehmer an alle in der Session
