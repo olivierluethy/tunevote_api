@@ -665,6 +665,7 @@ const advanceToNext = async (sessionId, expectedCurrentItemId = null) => {
           payload: {
             current_queue_item_id: nextId,
             current_video_id: null,
+            current_title: title,
             video_start_time: startTime,
             is_playing: false,
           },
@@ -687,7 +688,8 @@ const advanceToNext = async (sessionId, expectedCurrentItemId = null) => {
           payload: {
             current_queue_item_id: nextId,
             current_video_id: nextVideoId,
-            video_start_time: startTime,
+            current_title: title, // send the real title so the new song shows
+            video_start_time: startTime, // instantly — no "Loading…"/placeholder flash
             is_playing: true,
           },
         });
