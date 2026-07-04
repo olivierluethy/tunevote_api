@@ -299,6 +299,7 @@ Verify: `curl -s https://app.tunevote.com/ | grep index-` (new bundle hash) and
 ---
 
 ## 12. Related documents
+- **Next installment** (realtime presence, session rename, AI recommendations, now-playing): `docs/2026-07-04-realtime-recommendations-and-nowplaying-fixes.md`
 - **Architecture & DB analysis** (the "why"): `docs/2026-07-04-architecture-and-database-analysis.md`
 - **Phase 1 plan** (atomic advance, reconciler, heartbeat): `docs/superpowers/plans/2026-07-04-playback-reliability-phase1.md`
 - **Phase 2 plan** (source-of-truth collapse): `docs/superpowers/plans/2026-07-04-source-of-truth-collapse-phase2.md`
