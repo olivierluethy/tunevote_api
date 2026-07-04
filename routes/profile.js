@@ -662,8 +662,8 @@ async function fetchUserStats(userId) {
     // 4. Anzahl aktuell live Sessions (als Host)
     pool.query(
       `SELECT COUNT(*) AS count 
-       FROM sessions 
-       WHERE user_id = ? AND is_live = 1`,
+       FROM sessions
+       WHERE user_id = ? AND status = 'live'`,
       [userId],
     ),
 
@@ -678,9 +678,8 @@ async function fetchUserStats(userId) {
        JOIN sessions s ON s.id = sp.session_id
        LEFT JOIN session_participants sp2 
          ON sp2.session_id = s.id AND sp2.is_live = 1
-       WHERE sp.user_id = ? 
+       WHERE sp.user_id = ?
          AND sp.is_live = 1
-         AND s.is_active = 1
        GROUP BY s.id
        LIMIT 1`,
       [userId],

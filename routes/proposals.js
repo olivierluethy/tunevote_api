@@ -97,10 +97,10 @@ router.get("/sessions/:id/recommendations", async (req, res) => {
 
   // ---- Session check ----
   const [sessionRows] = await pool.query(
-    "SELECT is_live FROM sessions WHERE id = ? AND is_active = 1",
+    "SELECT status FROM sessions WHERE id = ?",
     [id],
   );
-  if (!sessionRows[0]?.is_live)
+  if (sessionRows[0]?.status !== "live")
     return res.status(400).json({ error: "Session not live" });
 
   // ---- Aktuelle Queue holen ----
@@ -536,12 +536,12 @@ router.post("/sessions/:id/recommendations/add", async (req, res) => {
     // Session-Status holen (wie in /proposals)
     // =================================================
     const [[sessionRow]] = await pool.query(
-      "SELECT user_id, is_live FROM sessions WHERE id = ?",
+      "SELECT user_id, status FROM sessions WHERE id = ?",
       [sessionId]
     );
     if (!sessionRow) return res.status(404).json({ error: "Session not found" });
 
-    const isSessionLive = sessionRow.is_live === 1;
+    const isSessionLive = sessionRow.status === "live";
 
     let votingRoundId = null;
     let status = "suggested"; // Default für Empfehlungen: immer suggested
@@ -675,13 +675,13 @@ router.post("/sessions/:id/proposals", async (req, res) => {
   try {
     // 1. Session-Status holen
     const [[sessionRow]] = await pool.query(
-      "SELECT user_id, is_live FROM sessions WHERE id = ?",
+      "SELECT user_id, status FROM sessions WHERE id = ?",
       [sessionId]
     );
     if (!sessionRow) return res.status(404).json({ error: "Session not found" });
 
     const isHost = user && sessionRow.user_id === user.id;
-    const isSessionLive = sessionRow.is_live === 1;
+    const isSessionLive = sessionRow.status === "live";
 
     let votingRoundId = null;
     let status = "queued";
@@ -1027,10 +1027,10 @@ router.post("/sessions/:id/proposals/:propId/vote", async (req, res) => {
 
   // Session live?
   const [[sessionRow]] = await pool.query(
-    "SELECT is_live FROM sessions WHERE id = ?",
+    "SELECT status FROM sessions WHERE id = ?",
     [id],
   );
-  if (!sessionRow || sessionRow.is_live !== 1) {
+  if (!sessionRow || sessionRow.status !== "live") {
     return res.status(403).json({ error: "Session nicht live" });
   }
 

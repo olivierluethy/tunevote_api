@@ -35,7 +35,7 @@ router.get("/sessions/:id/playback-sync", async (req, res) => {
     const [rows] = await pool.query(
       `SELECT qi.video_id                          AS current_video_id,
               UNIX_TIMESTAMP(qi.startedAt) * 1000  AS video_start_time,
-              (s.is_live = 1 AND qi.item_type = 'music') AS is_playing
+              (s.status = 'live' AND qi.item_type = 'music') AS is_playing
          FROM sessions s
          JOIN queue_items qi
            ON qi.session_id = s.id AND qi.status = 'playing'
@@ -282,7 +282,7 @@ router.get("/join", async (req, res) => {
       const [existing] = await pool.query(`
         SELECT id
         FROM sessions
-        WHERE is_private = 0 AND is_live = 1
+        WHERE is_private = 0 AND status = 'live'
         ORDER BY created_at ASC
         LIMIT 1
       `);
@@ -458,10 +458,10 @@ router.post("/sessions/:id/queue/add", async (req, res) => {
   if (!user) return res.status(401).json({ error: "Unauthorized" });
 
   const [sess] = await pool.query(
-    "SELECT user_id, is_live FROM sessions WHERE id = ?",
+    "SELECT user_id, status FROM sessions WHERE id = ?",
     [id],
   );
-  if (sess[0].is_live)
+  if (sess[0].status === "live")
     return res.status(403).json({ error: "Session started" });
 
   try {
@@ -556,11 +556,11 @@ router.post("/sessions/:id/start", async (req, res) => {
   const { id } = req.params;
 
   const [[sess]] = await pool.query(
-    "SELECT is_live FROM sessions WHERE id = ?",
+    "SELECT status FROM sessions WHERE id = ?",
     [id],
   );
   if (!sess) return res.status(404).json({ error: "Session not found" });
-  if (sess.is_live) {
+  if (sess.status === "live") {
     return res.status(400).json({ error: "Session already live" });
   }
 
