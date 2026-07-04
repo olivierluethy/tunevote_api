@@ -764,6 +764,26 @@ const broadcastLiveParticipants = async (sessionId) => {
   }
 };
 
+// Presence-derived live viewer count. Recomputes from session_participants
+// (is_live = 1) — never a stored counter — and broadcasts it globally so every
+// dashboard viewer updates without a refresh. Emitted globally (not scoped to a
+// room) because the sessions overview socket isn't joined to any session room.
+// Call this on every presence transition: join, clean leave, tab-close
+// (disconnect) and the reconciler's stale-heartbeat reap.
+const broadcastParticipantCount = async (sessionId) => {
+  try {
+    const sid = parseInt(sessionId, 10);
+    const [[{ count }]] = await pool.query(
+      "SELECT COUNT(*) AS count FROM session_participants WHERE session_id = ? AND is_live = 1",
+      [sid],
+    );
+    getIO().emit("participant_count_update", { sessionId: sid, count: count || 0 });
+    return count || 0;
+  } catch (err) {
+    console.error("Fehler beim Broadcast der Teilnehmerzahl:", err);
+  }
+};
+
 async function createNewPublicSession(title) {
   const connection = await pool.getConnection();
   await connection.beginTransaction();
@@ -898,6 +918,7 @@ module.exports = {
   finalizeListeningForCurrentSong,
   advanceToNext,
   broadcastLiveParticipants,
+  broadcastParticipantCount,
   createNewPublicSession,
   checkQuorum,
 };

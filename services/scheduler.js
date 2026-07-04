@@ -1,5 +1,5 @@
 const pool = require("../db");
-const { advanceToNext } = require("./playback");
+const { advanceToNext, broadcastParticipantCount } = require("./playback");
 
 // ---------------------------------------------------------------------------
 // RECONCILER
@@ -39,14 +39,30 @@ async function reconcileOnce({ graceSeconds = 30 } = {}) {
     advanced++;
   }
 
-  // 2) Reap participants with no recent heartbeat.
-  await pool.query(
-    `UPDATE session_participants
-        SET is_live = 0
+  // 2) Reap participants with no recent heartbeat. This is what makes the count
+  //    self-healing: a user who crashed, closed the tab, or lost connection
+  //    stops sending heartbeats and is dropped here. We first note which sessions
+  //    are affected, then broadcast their fresh presence-derived count so the
+  //    live viewer count drops for everyone without a page refresh.
+  const [staleSessions] = await pool.query(
+    `SELECT DISTINCT session_id
+       FROM session_participants
       WHERE is_live = 1
         AND (last_seen IS NULL OR last_seen < DATE_SUB(NOW(), INTERVAL ? SECOND))`,
     [graceSeconds],
   );
+  if (staleSessions.length) {
+    await pool.query(
+      `UPDATE session_participants
+          SET is_live = 0
+        WHERE is_live = 1
+          AND (last_seen IS NULL OR last_seen < DATE_SUB(NOW(), INTERVAL ? SECOND))`,
+      [graceSeconds],
+    );
+    for (const { session_id } of staleSessions) {
+      await broadcastParticipantCount(session_id);
+    }
+  }
 
   // 3) End sessions that are live but have nothing playable, nobody live, and no
   //    open voting round — self-heals the "stuck live after kill" bug.

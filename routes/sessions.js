@@ -17,6 +17,7 @@ const {
   startPhaseTimer,
   advanceToNext,
   broadcastLiveParticipants,
+  broadcastParticipantCount,
   createNewPublicSession,
 } = require("../services/playback");
 const { normalize, parseIsoDuration } = require("../utils/helpers");
@@ -784,16 +785,7 @@ router.post("/sessions/:id/join-live", async (req, res) => {
     });
 
     await broadcastLiveParticipants(parseInt(id, 10));
-
-    const [[{ count }]] = await pool.query(
-      "SELECT COUNT(*) AS count FROM session_participants WHERE session_id = ? AND is_live = 1",
-      [parseInt(id, 10)],
-    );
-
-    getIO().emit("participant_count_update", {
-      sessionId: parseInt(id, 10),
-      count: count || 0,
-    });
+    await broadcastParticipantCount(parseInt(id, 10));
 
     res.json({ success: true });
   } catch (err) {
@@ -872,16 +864,7 @@ router.post("/sessions/:id/leave-live", async (req, res) => {
     );
 
     await broadcastLiveParticipants(sessionIdInt);
-
-    const [[{ count }]] = await pool.query(
-      "SELECT COUNT(*) AS count FROM session_participants WHERE session_id = ? AND is_live = 1",
-      [sessionIdInt],
-    );
-
-    getIO().emit("participant_count_update", {
-      sessionId: sessionIdInt,
-      count: count || 0,
-    });
+    await broadcastParticipantCount(sessionIdInt);
     res.json({ success: true });
   } catch (err) {
     console.error("❌ [LEAVE-LIVE] Error occurred:", err);
