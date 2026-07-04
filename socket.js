@@ -22,9 +22,15 @@ io.on("connection", (socket) => {
     headers: socket.handshake.headers,
   });
 
+  // Session-less connections (the sessions dashboard) are GLOBAL LISTENERS:
+  // keep them connected so they receive global broadcasts like
+  // participant_count_update and session_renamed. They join no room and carry
+  // no presence/heartbeat, so we return before wiring those handlers. Previously
+  // these were disconnected immediately, which is why the dashboard's live
+  // counts and renames never updated without a manual refresh.
   if (!sessionId) {
-    console.log("❌ [WS-CONNECT] Missing sessionId → disconnect");
-    return socket.disconnect();
+    console.log("🔌 [WS-CONNECT] Global listener (no sessionId):", socket.id);
+    return;
   }
 
   socket.join(sessionId);
