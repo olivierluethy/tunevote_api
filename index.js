@@ -29,9 +29,14 @@ const {
   ensureParticipant,
 } = require("./services/auth");
 
-const generateResetToken = () => crypto.randomBytes(32).toString("hex");
-
-const hashPassword = (password) => bcrypt.hash(password, 10);
+const {
+  generateResetToken,
+  hashPassword,
+  parseIsoDuration,
+  normalize,
+  getScalar,
+  getSingleValue,
+} = require("./utils/helpers");
 
 const app = express();
 app.use(cors());
@@ -605,18 +610,6 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
     }
   }, seconds * 1000);
 }
-
-// Function to parse ISO duration
-const parseIsoDuration = (iso) => {
-  let seconds = 0;
-  const matches = iso.match(/PT(\d+H)?(\d+M)?(\d+S)?/);
-  if (matches) {
-    seconds += (parseInt(matches[1]) || 0) * 3600;
-    seconds += (parseInt(matches[2]) || 0) * 60;
-    seconds += parseInt(matches[3]) || 0;
-  }
-  return seconds;
-};
 
 async function finalizeListeningForCurrentSong(sessionId) {
   // 1. Aktuellen Song holen
@@ -2695,13 +2688,6 @@ app.post("/sessions/:id/proposals", async (req, res) => {
   }
 });
 
-function normalize(str) {
-  return str
-    .toLowerCase()
-    .replace(/[^\w\s-]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
 
 // === GET: Alle vorgeschlagenen Songs (für Voting) ===
 app.get("/sessions/:id/proposals", async (req, res) => {
@@ -5066,12 +5052,6 @@ app.get("/artist/:artistId", async (req, res) => {
     res.status(500).json({ error: "Failed to load artist details" });
   }
 });
-
-// Hilfsfunktion zum sicheren Extrahieren von Skalarwerten aus Query-Ergebnissen
-const getScalar = (result, field = "count") => result?.[0]?.[field] ?? 0;
-
-// Hilfsfunktion für einzelne Zeile mit benanntem Feld
-const getSingleValue = (result, field) => result?.[0]?.[field] ?? 0;
 
 /**
  * Holt alle relevanten Statistiken eines Users parallel
