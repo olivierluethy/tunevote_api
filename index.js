@@ -3,7 +3,6 @@ const express = require("express");
 const cors = require("cors");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
-const mysql = require("mysql2/promise");
 const { Server } = require("socket.io");
 const { v4: uuidv4 } = require("uuid");
 const axios = require("axios");
@@ -200,15 +199,7 @@ app.post(
 
 app.use(express.json());
 
-const pool = mysql.createPool({
-  host: process.env.DB_HOST || "localhost",
-  user: process.env.DB_USER || "root",
-  password: process.env.DB_PASSWORD || "",
-  database: process.env.DB_NAME || "tunevote",
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0,
-});
+const pool = require("./db");
 
 // === DB Connection Check ===
 (async () => {
