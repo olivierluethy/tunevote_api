@@ -10,7 +10,7 @@ const {
   hasActiveSubscription,
 } = require("../services/auth");
 const transporter = require("../services/mailer");
-const { openai, safeParseOpenAI } = require("../services/openai");
+const { openai, safeParseOpenAI, CHAT_MODEL } = require("../services/openai");
 const { broadcastTodayTopArtists } = require("../services/broadcast");
 const {
   sessionTimers,
@@ -103,22 +103,6 @@ router.get("/sessions/:id/recommendations", async (req, res) => {
   if (sessionRows[0]?.status !== "live")
     return res.status(400).json({ error: "Session not live" });
 
-  // ---- Aktuelle Queue holen ----
-  const [queueRows] = await pool.query(
-    `
-    SELECT yvc.title
-    FROM queue_items qi
-    JOIN youtube_video_cache yvc ON qi.video_id = yvc.youtube_id
-    WHERE qi.session_id = ?
-      AND qi.item_type = 'music'
-      AND qi.status IN ('queued','playing')
-    ORDER BY qi.id DESC
-    `,
-    [id],
-  );
-
-  const titles = queueRows.map((r) => r.title);
-
   // ---- Voting-Round & AI Suggestion Check ----
   const [votingRoundRows] = await pool.query(
     `SELECT id FROM voting_rounds 
@@ -195,45 +179,91 @@ router.get("/sessions/:id/recommendations", async (req, res) => {
         `[AI] ${numItems} total suggested items. Generating ${needed} new AI suggestion(s) to reach exactly 3...`
       );
 
-      // ---- Get suggested titles to avoid duplicates ----
-      const [suggestedTitleRows] = await pool.query(
-        `
-        SELECT yvc.title
-        FROM queue_items qi
-        JOIN youtube_video_cache yvc ON qi.video_id = yvc.youtube_id
-        WHERE qi.voting_round_id = ? AND qi.status = 'suggested'
-        `,
-        [currentRoundId],
+      // ---- COMPREHENSIVE exclusion list ----
+      // Everything this session has ever touched — across ALL rounds and ALL
+      // statuses (played, queued, playing, suggested, skipped) — so we never
+      // re-suggest a song the group has already seen. The old code only excluded
+      // the current queue, which is why played/earlier-round songs kept coming
+      // back. Capped so the prompt stays bounded on long sessions.
+      const [seenRows] = await pool.query(
+        `SELECT yvc.title
+           FROM queue_items qi
+           JOIN youtube_video_cache yvc ON qi.video_id = yvc.youtube_id
+          WHERE qi.session_id = ? AND qi.item_type = 'music'
+          GROUP BY yvc.title
+          ORDER BY MAX(qi.id) DESC
+          LIMIT 200`,
+        [id],
       );
+      const allTitles = seenRows.map((r) => r.title);
 
-      const allTitles = [...titles, ...suggestedTitleRows.map((r) => r.title)];
+      // ---- Taste seed ----
+      // Songs the humans in this session actually chose (user/guest, not AI)
+      // reveal the group's taste, steering recommendations toward the session's
+      // vibe instead of generic global top-40.
+      const [tasteRows] = await pool.query(
+        `SELECT yvc.title
+           FROM queue_items qi
+           JOIN youtube_video_cache yvc ON qi.video_id = yvc.youtube_id
+          WHERE qi.session_id = ?
+            AND qi.item_type = 'music'
+            AND qi.item_source IN ('user','guest')
+          ORDER BY qi.id DESC
+          LIMIT 12`,
+        [id],
+      );
+      const tasteSeed = [...new Set(tasteRows.map((r) => r.title))];
+
+      // ---- Rotating exploration angle ----
+      // The DB state changes slowly, so identical inputs would otherwise yield
+      // identical output. Picking a random angle each call forces variety across
+      // genres, eras and regions even when the queue looks the same.
+      const EXPLORATION_ANGLES = [
+        "lean into lesser-known deep cuts, not just chart-toppers",
+        "include tracks released before the year 2000",
+        "include international / non-English-language artists",
+        "focus on indie, alternative and underground artists",
+        "include hip-hop, rap and R&B",
+        "include electronic, house and dance",
+        "include rock, punk and their subgenres",
+        "surface fresh releases from the last two years",
+        "include soul, funk, disco and jazz-influenced tracks",
+        "mix in acoustic and singer-songwriter material",
+        "include Latin, Afrobeats and other global-pop styles",
+        "include classic, iconic tracks people may have forgotten",
+      ];
+      const angle =
+        EXPLORATION_ANGLES[
+          Math.floor(Math.random() * EXPLORATION_ANGLES.length)
+        ];
+
+      const tasteLine = tasteSeed.length
+        ? `The people in this room added these songs, which reflect their taste:\n${JSON.stringify(
+            tasteSeed,
+          )}\nRecommend songs a fan of those would enjoy, but branch out.`
+        : `There is no strong taste signal yet, so recommend broadly appealing songs.`;
 
       // ---- Prompt für AI ----
       const prompt = `
-You are a music recommendation engine. Your job is to suggest popular songs that likely exist on YouTube.
+You are a music recommendation engine for a live group listening session.
+Suggest real songs that exist on YouTube with an official music video.
 
-RULES (MUST FOLLOW EXACTLY):
-1. Output songs in this format: "Artist - Song Title"
-2. NEVER include "(feat. ...)", "[Official...]", "(Official...)", "Remix", "Live", "Lyric Video"
-3. Use only the MAIN ARTIST and SONG TITLE
-4. The song MUST have an official YouTube music video
-5. NEVER suggest any song that is already in the Current Queue
+${tasteLine}
 
-Examples of CORRECT format:
-- "Dua Lipa - Levitating"
-- "Beyoncé - Halo"
-- "Khalid - Better"
+Variety directive for THIS batch: ${angle}. Do NOT return only obvious global chart hits — favour a diverse mix of different artists.
 
-Examples of WRONG format:
-- "Dua Lipa - Levitating (feat. DaBaby) [Official Music Video]"
-- "Beyoncé - Halo (Official Video)"
+FORMAT RULES (MUST FOLLOW EXACTLY):
+1. Output each song as "Artist - Song Title", using only the MAIN artist and title.
+2. NEVER add "(feat. ...)", "[Official...]", "(Official Video)", "Remix", "Live", "Lyric Video" or similar suffixes.
+3. Correct: "Artist Name - Song Title". Wrong: "Artist Name - Song Title (feat. X) [Official Music Video]".
 
-Current queue: ${JSON.stringify(allTitles)}
+HARD CONSTRAINTS:
+- Do NOT suggest anything in the "Already used" list below, nor any near-identical title.
+- Return ${needed} DIFFERENT song(s), each by a different artist where possible.
 
-Instructions:
-- Recommend ${needed} completely new songs NOT in the Current Queue.
-- Output ONLY songs in the EXACT format above.
-- Output ONLY JSON array:
+Already used (never repeat any of these): ${JSON.stringify(allTitles)}
+
+Output ONLY a JSON array, nothing else:
 [{"title": "Artist - Song Title"}]
 `;
 
@@ -281,11 +311,18 @@ Instructions:
         );
       };
 
-      console.log("[OpenAI] Requesting recommendations for session:", id);
+      console.log(
+        `[OpenAI] Requesting ${needed} recommendation(s) for session ${id} · model=${CHAT_MODEL} · angle="${angle}"`,
+      );
       const completion = await openai.chat.completions.create({
-        model: "gpt-3.5-turbo",
+        model: CHAT_MODEL,
         messages: [{ role: "user", content: prompt }],
-        temperature: 0.7,
+        // Higher temperature + penalties push away from the same handful of
+        // global chart hits and reduce repeats within a batch.
+        temperature: 0.95,
+        top_p: 0.9,
+        presence_penalty: 0.6,
+        frequency_penalty: 0.5,
         max_tokens: 400,
       });
 
