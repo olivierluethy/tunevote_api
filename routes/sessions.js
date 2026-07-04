@@ -651,6 +651,7 @@ router.post("/sessions/:id/start", async (req, res) => {
     getIO().to(id).emit("playback_sync", {
       current_queue_item_id: firstId,
       current_video_id: firstVideoId,
+      current_title: first[0].title,
       video_start_time: startTime,
       is_playing: true,
     });
