@@ -161,6 +161,7 @@ app.use(require("./routes/oauth"));
 app.use(require("./routes/auth"));
 app.use(require("./routes/password"));
 app.use(require("./routes/profile"));
+app.use(require("./routes/artists"));
 app.use(require("./routes/sessions"));
 
 // === Socket.IO ===
