@@ -39,11 +39,8 @@ async function seedLiveSession(pool_, { videos, startPlayingIndex = 0 }) {
     );
     itemIds.push(r.insertId);
   }
-  await pool_.query(
-    `INSERT INTO playback_sync (session_id, current_video_id, video_start_time, is_playing)
-     VALUES (?, ?, ?, 1)`,
-    [sessionId, videos[startPlayingIndex].id, Date.now()],
-  );
+  // No playback_sync row — "now playing" is derived from the queue_items row
+  // whose status='playing' (its startedAt is the authoritative start time).
   return { sessionId, itemIds };
 }
 
