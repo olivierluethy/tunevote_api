@@ -79,7 +79,7 @@ async function reconcileOnce({ graceSeconds = 30 } = {}) {
            WHERE p.session_id = s.id AND p.is_live = 1)
         AND NOT EXISTS (
           SELECT 1 FROM voting_rounds v
-           WHERE v.session_id = s.id AND v.status = 'open')`,
+           WHERE v.session_id = s.id AND v.state IN ('suggesting','voting'))`,
   );
   for (const s of dead) {
     const [r] = await pool.query(
