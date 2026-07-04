@@ -1,53 +1,17 @@
+// ---------------------------------------------------------------------------
+// COMPOSITION ROOT
+//
+// index.js wires the app together and owns the load-bearing startup order:
+// cors → Stripe webhook (raw body) → express.json → DB check → server + io →
+// route modules → socket handlers. All feature logic lives in ./routes,
+// ./services, ./utils, ./lib and ./socket.js.
+// ---------------------------------------------------------------------------
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
-const bcrypt = require("bcrypt");
-const jwt = require("jsonwebtoken");
 const { init: initIO } = require("./lib/io");
-const { v4: uuidv4 } = require("uuid");
-const axios = require("axios");
-const crypto = require("crypto");
-const ytdl = require("@distube/ytdl-core");
-const multer = require("multer");
-
-const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
-const GOOGLE_USERINFO_URL = 'https://www.googleapis.com/oauth2/v3/userinfo';
-
-const transporter = require("./services/mailer");
-const { openai, safeParseOpenAI } = require("./services/openai");
-const {
-  stripe,
-  STRIPE_WEBHOOK_SECRET,
-  STRIPE_PRICE_ID,
-  APP_PUBLIC_URL,
-} = require("./services/stripe");
-const {
-  JWT_SECRET,
-  getUserFromToken,
-  hasActiveSubscription,
-  getGuestFromToken,
-  ensureParticipant,
-} = require("./services/auth");
-const { broadcastTodayTopArtists } = require("./services/broadcast");
-const {
-  sessionTimers,
-  phaseTimers,
-  startPhaseTimer,
-  finalizeListeningForCurrentSong,
-  advanceToNext,
-  broadcastLiveParticipants,
-  createNewPublicSession,
-  checkQuorum,
-} = require("./services/playback");
-
-const {
-  generateResetToken,
-  hashPassword,
-  parseIsoDuration,
-  normalize,
-  getScalar,
-  getSingleValue,
-} = require("./utils/helpers");
+const pool = require("./db");
+const { stripe, STRIPE_WEBHOOK_SECRET } = require("./services/stripe");
 
 const app = express();
 app.use(cors());
@@ -162,8 +126,6 @@ app.post(
 
 app.use(express.json());
 
-const pool = require("./db");
-
 // === DB Connection Check ===
 (async () => {
   try {
@@ -186,7 +148,6 @@ const pool = require("./db");
   }
 })();
 
-const YOUTUBE_KEY = process.env.YOUTUBE_KEY;
 
 const httpServer = app.listen(4000, () =>
   console.log("Server läuft auf https://app.tunevote.com/"),
