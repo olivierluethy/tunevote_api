@@ -418,6 +418,13 @@ router.patch("/sessions/:id", async (req, res) => {
       id,
     ]);
 
+    // Broadcast so every viewer (dashboard cards + inside the session) sees the
+    // new name within a second, instead of waiting for the next poll cycle.
+    getIO().emit("session_renamed", {
+      sessionId: parseInt(id, 10),
+      title: cleanTitle,
+    });
+
     res.json({ success: true, title: cleanTitle });
   } catch (err) {
     console.error("Fehler beim Umbenennen der Session:", err);
