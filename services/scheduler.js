@@ -83,7 +83,7 @@ async function reconcileOnce({ graceSeconds = 30 } = {}) {
   );
   for (const s of dead) {
     const [r] = await pool.query(
-      `UPDATE sessions SET is_live = 0, ended_at = NOW() WHERE id = ? AND is_live = 1`,
+      `UPDATE sessions SET is_live = 0, status = 'ended', ended_at = NOW() WHERE id = ? AND is_live = 1`,
       [s.id],
     );
     if (r.affectedRows) ended++;
