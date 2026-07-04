@@ -3,7 +3,7 @@ const express = require("express");
 const cors = require("cors");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
-const { Server } = require("socket.io");
+const { init: initIO } = require("./lib/io");
 const { v4: uuidv4 } = require("uuid");
 const axios = require("axios");
 const crypto = require("crypto");
@@ -229,7 +229,7 @@ const YOUTUBE_KEY = process.env.YOUTUBE_KEY;
 const httpServer = app.listen(4000, () =>
   console.log("Server läuft auf https://app.tunevote.com/"),
 );
-const io = new Server(httpServer, { cors: { origin: "*" } });
+const io = initIO(httpServer);
 
 const sessionTimers = {};
 
