@@ -28,6 +28,7 @@ const {
   getGuestFromToken,
   ensureParticipant,
 } = require("./services/auth");
+const { broadcastTodayTopArtists } = require("./services/broadcast");
 
 const {
   generateResetToken,
@@ -478,7 +479,7 @@ async function startPhaseTimer(sessionId, roundId, currentPhase, seconds) {
         console.log(`[Voting] Runde ${roundId} geschlossen`);
 
         // Top-Charts aktualisieren
-        await broadcastTodayTopArtists(io);
+        await broadcastTodayTopArtists();
         console.log(`[Broadcast] Top Artists aktualisiert`);
 
         // Broadcasts
@@ -623,7 +624,7 @@ const advanceToNext = async (sessionId) => {
       );
 
       // 🔥 Optional: Auch hier broadcasten (falls played-Songs mitzählen sollen)
-      await broadcastTodayTopArtists(io);
+      await broadcastTodayTopArtists();
       console.log(`[Session ${sessionId}] Marked played: #${currentId}`);
     }
 
@@ -728,7 +729,7 @@ const advanceToNext = async (sessionId) => {
           );
 
           // 🔥 NEU: Auch hier zählt der Song jetzt mit!
-          await broadcastTodayTopArtists(io);
+          await broadcastTodayTopArtists();
 
           io.to(sessionId).emit("voting_round_completed", {
             winnerId,
@@ -2854,7 +2855,7 @@ app.post("/sessions/:id/proposals/:propId/vote", async (req, res) => {
   io.to(id).emit("proposals_updated");
 
   // 🔥 NEU: Top-Charts aktualisieren (Votes zählen ja mit!)
-  await broadcastTodayTopArtists(io);
+  await broadcastTodayTopArtists();
 
   res.json({ success: true });
 });
@@ -5874,54 +5875,6 @@ app.delete("/profile/image", async (req, res) => {
 
 // Irgendwo zentral, z. B. in deiner socket.io oder utils Datei
 // Direkt nach der io-Definition (z. B. nach const io = new Server(...))
-let topArtistsBroadcastTimeout = null;
-
-async function broadcastTodayTopArtists(io) {
-  // Debounce: Max. alle 2 Sekunden broadcasten (verhindert Spam bei vielen Votes)
-  if (topArtistsBroadcastTimeout) {
-    clearTimeout(topArtistsBroadcastTimeout);
-  }
-
-  topArtistsBroadcastTimeout = setTimeout(async () => {
-    try {
-      const [rows] = await pool.query(`
-        SELECT
-          a.id AS artist_id,
-          a.name AS artist_name,
-          a.image_url,
-          COUNT(v.id) AS vote_count
-        FROM votes v
-        JOIN queue_items qi ON qi.id = v.queue_item_id
-        JOIN youtube_video_cache yvc ON yvc.youtube_id = qi.video_id
-        JOIN artists a ON a.id = yvc.artist_id
-        WHERE DATE(v.created_at) = CURDATE()
-          AND qi.status IN ('queued', 'playing', 'played')
-        GROUP BY a.id, a.name, a.image_url
-        ORDER BY vote_count DESC
-        LIMIT 10
-      `);
-
-      // Nur senden, wenn es überhaupt Artists gibt (vermeidet unnötige Events)
-      if (rows.length > 0 || true) {
-        // immer senden, damit Frontend leere Liste erkennt
-        io.emit("today_top_artists_updated", {
-          date: new Date().toISOString().slice(0, 10),
-          artists: rows,
-        });
-        console.log(
-          "[Live Charts] Top Artists broadcasted →",
-          rows.length,
-          "artists",
-        );
-      }
-    } catch (err) {
-      console.error("Error broadcasting today top artists:", err);
-    } finally {
-      topArtistsBroadcastTimeout = null;
-    }
-  }, 1500); // 1,5 Sekunden warten → sammelt mehrere Änderungen
-}
-
 // ─── Google Login URL generieren ───
 app.get('/auth/google', (req, res) => {
   const rootUrl = 'https://accounts.google.com/o/oauth2/v2/auth';
