@@ -174,6 +174,7 @@ CREATE TABLE `queue_items` (
   `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
   `playedAt` DATETIME DEFAULT NULL,
   `startedAt` DATETIME DEFAULT NULL,
+  `started_at_ms` BIGINT DEFAULT NULL,
   `pause_duration_seconds` INT DEFAULT NULL,
   `description` VARCHAR(255) DEFAULT NULL,
   `item_type` ENUM('music','pause') NOT NULL DEFAULT 'music',
