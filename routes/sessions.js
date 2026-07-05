@@ -34,7 +34,7 @@ router.get("/sessions/:id/playback-sync", async (req, res) => {
     // 'playing' (video_id + startedAt). No separate playback_sync table.
     const [rows] = await pool.query(
       `SELECT qi.video_id                          AS current_video_id,
-              UNIX_TIMESTAMP(qi.startedAt) * 1000  AS video_start_time,
+              COALESCE(qi.started_at_ms, UNIX_TIMESTAMP(qi.startedAt) * 1000) AS video_start_time,
               (s.status = 'live' AND qi.item_type = 'music') AS is_playing
          FROM sessions s
          JOIN queue_items qi
@@ -631,8 +631,8 @@ router.post("/sessions/:id/start", async (req, res) => {
 
     // 🕒 Ersten Song auf "playing" setzen (startedAt = single source of truth)
     await pool.query(
-      `UPDATE queue_items SET status = 'playing', startedAt = NOW() WHERE id = ?`,
-      [firstId],
+      `UPDATE queue_items SET status = 'playing', startedAt = NOW(), started_at_ms = ? WHERE id = ?`,
+      [startTime, firstId],
     );
 
     // Durable deadline so the reconciler can advance/recover the first song too.

@@ -653,8 +653,8 @@ const advanceToNext = async (sessionId, expectedCurrentItemId = null) => {
 
       if (item_type === "pause") {
         await connection.query(
-          `UPDATE queue_items SET status = 'playing', startedAt = NOW() WHERE id = ?`,
-          [nextId],
+          `UPDATE queue_items SET status = 'playing', startedAt = NOW(), started_at_ms = ? WHERE id = ?`,
+          [startTime, nextId],
         );
         emits.push({
           event: "pause_started",
@@ -681,8 +681,8 @@ const advanceToNext = async (sessionId, expectedCurrentItemId = null) => {
         };
       } else {
         await connection.query(
-          `UPDATE queue_items SET status = 'playing', startedAt = NOW() WHERE id = ?`,
-          [nextId],
+          `UPDATE queue_items SET status = 'playing', startedAt = NOW(), started_at_ms = ? WHERE id = ?`,
+          [startTime, nextId],
         );
         emits.push({
           event: "playback_sync",
