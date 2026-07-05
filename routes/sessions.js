@@ -42,7 +42,10 @@ router.get("/sessions/:id/playback-sync", async (req, res) => {
         WHERE s.id = ?`,
       [id],
     );
-    res.json(rows[0] || {});
+    // server_time lets the client estimate its clock offset vs the server (the
+    // start time and "now" are both on the server clock), so every device
+    // converges to the same playback position regardless of its local clock.
+    res.json({ ...(rows[0] || {}), server_time: Date.now() });
   } catch (err) {
     console.error("Playback sync error:", err);
     res.status(500).json({ error: "Internal server error" });
@@ -646,6 +649,7 @@ router.post("/sessions/:id/start", async (req, res) => {
       autoStarted: true,
       firstVideoId,
       video_start_time: startTime,
+      server_time: startTime,
     });
 
     getIO().to(id).emit("playback_sync", {
@@ -653,6 +657,7 @@ router.post("/sessions/:id/start", async (req, res) => {
       current_video_id: firstVideoId,
       current_title: first[0].title,
       video_start_time: startTime,
+      server_time: startTime,
       is_playing: true,
     });
 
