@@ -5,6 +5,11 @@ work done on TuneVote in early July 2026 — every fix, refactor, and deploy, wi
 the *why* behind each. It spans **both repos** (`tunevote_api` backend +
 `tunevote_frontend` frontend).
 
+> **📁 This is Part 1 of the TuneVote docs.** Start at the
+> **[documentation index (`docs/README.md`)](README.md)** for the full map and the
+> "is this bug already fixed?" workflow. The continuation is
+> **[Part 2 — Realtime, Recommendations & Now-Playing](2026-07-04-realtime-recommendations-and-nowplaying-fixes.md)**.
+
 **How to use it:**
 - **"Is this bug already fixed?"** → jump to [§2 Fixed-bugs registry](#2-fixed-bugs-registry).
   Each row has the symptom, the root cause, the fix, and the commit. If a bug you're
@@ -323,4 +328,6 @@ Verify: `curl -s https://app.tunevote.com/ | grep index-` (new bundle hash) and
   (`status`) so old and new code/clients coexist safely until the old column is dropped.
 ```
 
-*Journal covers work through 2026-07-04. Keep appending as work continues.*
+*Part 1 covers work through 2026-07-04. Continued in
+[Part 2 — Realtime, Recommendations & Now-Playing](2026-07-04-realtime-recommendations-and-nowplaying-fixes.md);
+see the [documentation index](README.md) to navigate everything.*

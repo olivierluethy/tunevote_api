@@ -17,10 +17,13 @@ noted, verified live.
   [§4 Deploy runbook](#4-deploy-runbook) so you can ship safely.
 - **Planning more work?** → [§3 Open items & known limitations](#3-open-items--known-limitations)
   is the live backlog.
-- **Two documents, one story.** The earlier [Engineering Journal](./2026-07-ENGINEERING-JOURNAL.md)
-  covers the persistent player, the backend modularization and the playback/DB reliability
-  refactor. *This* document is the next installment (realtime presence, session rename,
-  AI recommendations quality, and now-playing metadata).
+- **Start at the [documentation index (`docs/README.md`)](./README.md)** for the full map
+  of all docs and the "is this bug already fixed?" workflow.
+- **Two documents, one story.** This is **Part 2**. The earlier
+  [Engineering Journal (Part 1)](./2026-07-ENGINEERING-JOURNAL.md) covers the persistent
+  player, the backend modularization and the playback/DB reliability refactor. *This*
+  document is the next installment (realtime presence, session rename, AI recommendations
+  quality, now-playing/waveform, and the mini-player redesign).
 
 **Design principles this work followed (unchanged from the journal):** one source of
 truth per fact; the **server is authoritative**; presence and counts are **derived, not
