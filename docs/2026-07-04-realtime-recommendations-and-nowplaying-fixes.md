@@ -318,9 +318,13 @@ Verified facts about the production environment (corrects some older notes):
   on prod `sudo`: extract into `dist_new` (`tar xzf … --no-same-owner`), then
   `mv dist dist_prev && mv dist_new dist && chown -R root:root dist`. The output is
   equivalent (URLs are hard-coded, not env-baked; the `vite-plugin-pwa` version only
-  affects build-time, not runtime). Longer-term fix: add permanent swap to the box or
-  build in CI. Beware the `setsid`+SSH build race: a killed/timed-out build can leave
-  stray processes — `sudo pkill -9 -f 'vite build'` before retrying.
+  affects build-time, not runtime). **2026-07-05: a permanent 2 GB swapfile was added**
+  to the box (`/swapfile`, in `/etc/fstab`, `vm.swappiness=10`) as general OOM
+  resilience for the app/DB — but **local-build-and-ship stays the recommended deploy
+  path** because prod SSH is flaky on long commands and an interrupted `vite build`
+  leaves a zombie that can overwrite `dist` with the pre-pull bundle. Beware that
+  `setsid`+SSH race: `sudo pkill -9 -f 'vite build'` before retrying, and verify the
+  served JS actually contains a symbol you just added (`grep -rl … dist/assets/`).
 - **Database:** MySQL is **local on the app server** (container), reachable as the app's
   `user`. It has full privileges on `tunevote.*`.
 - **Public health checks:** `curl https://app.tunevote.com/` → 200;
