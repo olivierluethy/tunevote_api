@@ -1,5 +1,11 @@
 const pool = require("../db");
 const { advanceToNext, broadcastParticipantCount } = require("./playback");
+const { generateAiSuggestions } = require("./recommendations");
+
+// Sessions with an AI auto-fill generation in flight. Prevents the reconciler
+// from starting a second (expensive) OpenAI/YouTube generation for the same
+// session across ticks. Single-process, so an in-memory Set is enough.
+const autoFilling = new Set();
 
 // ---------------------------------------------------------------------------
 // RECONCILER
@@ -19,9 +25,10 @@ const { advanceToNext, broadcastParticipantCount } = require("./playback");
 
 let timer = null;
 
-async function reconcileOnce({ graceSeconds = 30 } = {}) {
+async function reconcileOnce({ graceSeconds = 30, autoFillEnabled = true } = {}) {
   let advanced = 0;
   let ended = 0;
+  let autoFilled = 0;
 
   // 1) Advance songs whose deadline has passed. Pass the current playing item id
   //    so advanceToNext's compare-and-swap no-ops if a timer already advanced.
@@ -89,13 +96,71 @@ async function reconcileOnce({ graceSeconds = 30 } = {}) {
     if (r.affectedRows) ended++;
   }
 
-  return { advanced, ended };
+  // 4) AI AUTO-FILL — keep a live session with users present from going silent.
+  //    When a session has run dry (nothing queued AND its open voting round has
+  //    no suggestions) yet people are still present, top up the OPEN round with
+  //    AI suggestions so the existing emergency-promote (voted → user → random
+  //    AI) always has something to play. Deliberately SAFE + additive:
+  //      • only INSERT into an already-open round — never create rounds or touch
+  //        the phase-timer state machine (avoids double-round races);
+  //      • fire the OpenAI/YouTube work OFF the tick (non-blocking) and
+  //        single-flight per session so concurrent ticks don't double-generate;
+  //      • presence-gated (is_live participants > 0), so an empty session is
+  //        ended by phase 3, never auto-filled (no zombie sessions / API spend);
+  //      • never calls advanceToNext(null) directly — instead nudges
+  //        current_plays_until (guarded to sessions with nothing playing) so the
+  //        single, serialized phase-1 advance promotes one next tick. This avoids
+  //        the double-advance hazard of two null-advances racing.
+  if (autoFillEnabled) {
+    const [needFill] = await pool.query(
+      `SELECT s.id AS session_id,
+              (SELECT v.id FROM voting_rounds v
+                WHERE v.session_id = s.id AND v.state IN ('suggesting','voting')
+                ORDER BY v.id DESC LIMIT 1) AS round_id
+         FROM sessions s
+        WHERE s.status = 'live'
+          AND EXISTS (SELECT 1 FROM session_participants p
+                       WHERE p.session_id = s.id AND p.is_live = 1)
+          AND NOT EXISTS (SELECT 1 FROM queue_items q
+                           WHERE q.session_id = s.id AND q.status = 'queued')
+          AND NOT EXISTS (SELECT 1 FROM queue_items q
+                           WHERE q.session_id = s.id AND q.status = 'suggested')`,
+    );
+    for (const { session_id, round_id } of needFill) {
+      if (!round_id || autoFilling.has(session_id)) continue;
+      autoFilling.add(session_id);
+      autoFilled++;
+      generateAiSuggestions(session_id, round_id, 3)
+        .then(async (created) => {
+          if (!created.length) return;
+          // Make the overdue-advance (phase 1) promote one next tick — but only
+          // if nothing is currently playing (never cut a playing song short).
+          await pool.query(
+            `UPDATE sessions SET current_plays_until = NOW()
+              WHERE id = ? AND status = 'live'
+                AND NOT EXISTS (SELECT 1 FROM queue_items q
+                                 WHERE q.session_id = sessions.id
+                                   AND q.status = 'playing')`,
+            [session_id],
+          );
+        })
+        .catch((e) =>
+          console.error(`[auto-fill] session ${session_id}:`, e.message),
+        )
+        .finally(() => autoFilling.delete(session_id));
+    }
+  }
+
+  return { advanced, ended, autoFilled };
 }
 
 function startReconciler({ intervalMs = 2000, graceSeconds = 30 } = {}) {
   if (timer) return;
+  // Server-authoritative AI auto-fill is ON by default; set AUTOFILL_DISABLED=true
+  // (then restart) to instantly turn it off if it ever misbehaves.
+  const autoFillEnabled = process.env.AUTOFILL_DISABLED !== "true";
   const tick = () =>
-    reconcileOnce({ graceSeconds }).catch((e) =>
+    reconcileOnce({ graceSeconds, autoFillEnabled }).catch((e) =>
       console.error("reconciler tick failed:", e.message),
     );
   tick(); // immediate pass on boot rebuilds overdue work
