@@ -31,7 +31,7 @@ never slow polling.
 
 ## 1. TL;DR
 
-Seven issues were investigated to root cause and fixed. In the order they were tackled:
+Ten issues were investigated to root cause and fixed/shipped. In the order they were tackled:
 
 1. **Live viewer count (Twitch-style).** The participant number on session cards was
    stale and only drifted upward. It was already *derived* from presence in the DB, but
@@ -55,6 +55,18 @@ Seven issues were investigated to root cause and fixed. In the order they were t
 7. **"Unknown"/placeholder flash on song change.** `playback_sync` sent only the video
    id, so the client had to resolve the title over the network → a placeholder flashed.
    The server now sends the title with the event. (Shipped; runtime capture still pending.)
+8. **Songs out of sync between listeners (some ahead, some behind).** The position was
+   computed from *each device's own clock*, so clock skew put everyone at a different
+   spot. Now the server sends its time; the client corrects for its clock offset (P1) and
+   uses a millisecond-precise start reference (P2), plus buffering compensation (P3).
+9. **Now-playing waveform.** The hard-coded "sound bars" became a SoundCloud-style
+   waveform — deterministic shape per song, real progress. (A real audio waveform is
+   impossible with YouTube's cross-origin iframe — see §2.9 so nobody re-attempts it.)
+10. **Never-ending playback + UI batch.** A session no longer goes silent while someone
+    is present: the server (reconciler) auto-fills AI songs into the open voting round and
+    the existing advance keeps playing (presence-gated, idempotent, cost-bounded). Plus:
+    the waveform is now prominent + in the mini-player, the bottom white void is fixed at
+    the root, and AI suggestions are tagged + votable in the mini-player queue.
 
 A recurring, important discovery in item 6: **the dashboard socket was silently dead.**
 That single server-side bug also explains why item 1's live count never actually updated
