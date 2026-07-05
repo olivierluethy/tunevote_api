@@ -286,6 +286,56 @@ on the dashboard until item 6 landed. See [§2.6](#26-session-rename-slow--dashb
 - **Commit:** frontend `893f2d6`. (A teammate separately added a mini-player live
   progress bar, `7960331`.)
 
+### 2.10 Never-ending playback + prominent/mini-player waveform + AI-tagged queue + dark bg — ✅ Shipped (auto-fill mechanism verified; song insertion gated by YouTube quota)
+- **Goals:** (a) waveform bigger in the now-playing card and also in the mini-player;
+  (b) no white void at the page bottom; (c) a session should never go silent while
+  someone is present — auto-fill AI songs and keep playing; (d) AI suggestions
+  visible + votable + tagged in the mini-player queue.
+- **(a) Waveform** — `SongWaveform` got a configurable `heightClass`; larger in
+  `NowPlayingCard`, and it replaced the mini-player's linear progress bar. Frontend
+  `3acda53`.
+- **(b) White void** — root cause: no dark background on the document root. Fixed in
+  `index.css` (`@layer base`): `html/body/#root` are `bg-slate-950` + `min-h-screen`
+  so the dark fills the whole viewport and overscroll; dashboard bottom padding
+  bumped so the last card clears the taller mini-player. Frontend `3acda53`.
+- **(d) AI queue UI** — `QueueOverlay` already showed votable `suggested` proposals;
+  added a sparkle **"AI" badge** for `item_source==='ai'`, and the mini-player queue
+  dot now reflects any votable suggestions. Frontend `3acda53`.
+- **(c) Never-ending playback (the big one) — server-authoritative, additive:**
+  - **Most of the machinery already existed:** `advanceToNext` is idempotent
+    (`FOR UPDATE` + compare-and-swap) with an emergency-promote path (highest-voted →
+    user/guest → **random AI**); a voting round is (almost) always open; presence
+    (`is_live`/`last_seen` + reaper) already counts mini-player-only users.
+  - **The one gap:** nothing generated AI suggestions server-side when the round ran
+    dry (it was client-triggered only). New `services/recommendations.js` extracts
+    `generateAiSuggestions(sessionId, roundId, count)` (the GET endpoint keeps its own
+    copy for now — consolidation is a follow-up). The reconciler gains a phase 4:
+    for a **live session with is_live participants present** whose queue has run dry
+    (nothing queued AND the open round has no suggestions), it generates AI into the
+    **already-open** round as votable `suggested`/`ai` items, off the tick
+    (non-blocking), single-flight, with a **cooldown+back-off** (30s after a real
+    fill, 5min after an empty/error result — so a quota-blocked generation can't loop
+    OpenAI). It never creates rounds or touches the phase-timer state machine (avoids
+    double-round races), and never calls `advanceToNext(null)` directly (which could
+    race the phase-1 advance and skip a song) — instead it nudges `current_plays_until`
+    (guarded to sessions with nothing playing) so the single serialized phase-1 advance
+    promotes one. Presence-gated ⇒ empty sessions are ended by phase 3, never
+    auto-filled (no zombies / no spend). Kill switch: `AUTOFILL_DISABLED=true`. Backend
+    `02cc84e` + `86c6704`.
+  - **Verified on prod:** auto-fill fires for a dry+present session (OpenAI log),
+    and injecting AI suggestions + the nudge promotes one to `playing` (revive+play
+    end-to-end). ⚠️ **Real song insertion depends on the YouTube Data API quota** —
+    OpenAI returns titles but the title→video mapping (search) is quota-limited and
+    often `403`s, so generation can yield 0 songs (see §3). When songs map (cache hits
+    / fresh quota) it fills and plays; when quota is out, the cooldown prevents a spend
+    loop but no new songs appear.
+  - **Known edge (documented, not a bug):** after an emergency-promote closes a round,
+    there's a brief window with no open round until the phase timer creates the next
+    one (~≤150s); auto-fill only fills existing open rounds (safe), so a very short song
+    ending in that window can briefly idle. Robust gap-free coverage would need
+    hardening the voting-round timer state machine (a larger, riskier change).
+- **Commits:** backend `02cc84e`, `86c6704`; frontend `3acda53`.
+
 ---
 
 ## 3. Open items & known limitations
@@ -385,6 +435,8 @@ Verified facts about the production environment (corrects some older notes):
 | `5088dd4` | cap live YouTube searches per call — quota guard (§2.5) |
 | `e120470` | live session rename + keep dashboard socket connected (§2.6) |
 | `d5eb174` | send song title with `playback_sync` (§2.7) |
+| `02cc84e` | server-authoritative AI auto-fill (never-ending playback) (§2.10) |
+| `86c6704` | auto-fill cooldown + back-off (prevent OpenAI spend loop) (§2.10) |
 | `cea3ff7` | send `server_time` for client clock-offset correction (§2.8, P1) |
 | `227b44f` | millisecond-precise, consistent song start reference (§2.8, P2) |
 
@@ -400,6 +452,7 @@ Verified facts about the production environment (corrects some older notes):
 | `76385d3` | correct playback position for device clock skew (§2.8, P1) |
 | `9a6d797` | faster sync convergence — buffering comp + tighter poll (§2.8, P3) |
 | `893f2d6` | now-playing waveform visualizer (deterministic shape + real progress) (§2.9) |
+| `3acda53` | prominent + mini-player waveform, full-height dark bg, AI-tagged queue (§2.10) |
 
 ---
 
