@@ -7,6 +7,15 @@ const { generateAiSuggestions } = require("./recommendations");
 // session across ticks. Single-process, so an in-memory Set is enough.
 const autoFilling = new Set();
 
+// Per-session cooldown so we don't re-generate every couple of seconds. Crucial
+// for cost: if generation yields 0 (e.g. the YouTube quota is exhausted so
+// nothing maps), the "dry" condition stays true — without a cooldown the
+// reconciler would call OpenAI in a tight loop. Short cooldown after a real
+// fill; long back-off after an empty result or an error.
+const autoFillCooldownUntil = new Map(); // sessionId -> epoch ms
+const AUTOFILL_COOLDOWN_OK_MS = 30_000;
+const AUTOFILL_COOLDOWN_EMPTY_MS = 300_000;
+
 // ---------------------------------------------------------------------------
 // RECONCILER
 //
@@ -126,12 +135,21 @@ async function reconcileOnce({ graceSeconds = 30, autoFillEnabled = true } = {})
           AND NOT EXISTS (SELECT 1 FROM queue_items q
                            WHERE q.session_id = s.id AND q.status = 'suggested')`,
     );
+    const now = Date.now();
     for (const { session_id, round_id } of needFill) {
       if (!round_id || autoFilling.has(session_id)) continue;
+      if (now < (autoFillCooldownUntil.get(session_id) || 0)) continue; // cooling down
       autoFilling.add(session_id);
       autoFilled++;
       generateAiSuggestions(session_id, round_id, 3)
         .then(async (created) => {
+          // Back off longer when nothing could be mapped (YouTube quota etc.) so
+          // we never spend OpenAI in a tight loop; short cooldown after a real fill.
+          autoFillCooldownUntil.set(
+            session_id,
+            Date.now() +
+              (created.length ? AUTOFILL_COOLDOWN_OK_MS : AUTOFILL_COOLDOWN_EMPTY_MS),
+          );
           if (!created.length) return;
           // Make the overdue-advance (phase 1) promote one next tick — but only
           // if nothing is currently playing (never cut a playing song short).
@@ -144,9 +162,10 @@ async function reconcileOnce({ graceSeconds = 30, autoFillEnabled = true } = {})
             [session_id],
           );
         })
-        .catch((e) =>
-          console.error(`[auto-fill] session ${session_id}:`, e.message),
-        )
+        .catch((e) => {
+          autoFillCooldownUntil.set(session_id, Date.now() + AUTOFILL_COOLDOWN_EMPTY_MS);
+          console.error(`[auto-fill] session ${session_id}:`, e.message);
+        })
         .finally(() => autoFilling.delete(session_id));
     }
   }
