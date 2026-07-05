@@ -262,6 +262,30 @@ on the dashboard until item 6 landed. See [§2.6](#26-session-rename-slow--dashb
   into the `join-live` response to remove the join round-trip/race (low impact — the
   socket is already in the room by then).
 
+### 2.9 Now-playing waveform visualizer — ✅ Shipped (deterministic shape + real progress)
+- **Goal:** replace the hard-coded decorative "sound bars" with a waveform that
+  reflects the song.
+- **Key finding — a REAL audio waveform is infeasible with YouTube playback (do not
+  re-attempt without changing the audio source):**
+  - Audio plays in a **cross-origin YouTube iframe**, so the browser **cannot** tap it
+    with the Web Audio API (`AnalyserNode`) — no live FFT of the real sound is possible.
+  - `wavesurfer.js` needs the audio samples/file, which YouTube doesn't provide.
+  - **Server-side extraction was tested on prod and is blocked:** `@distube/ytdl-core`
+    4.16.12 can't decipher current YouTube stream URLs ("Could not parse decipher
+    function") and the audio download returns **403** (datacenter-IP bot-check); there's
+    **no `ffmpeg`/`audiowaveform`** installed. A `yt-dlp`+`ffmpeg` pipeline might work but
+    risks continued 403s, violates YouTube ToS, and loads the 2 GB box. Product chose not
+    to go there.
+- **What shipped (the honest "good fake"):** `components/session/SongWaveform.jsx` — a
+  SoundCloud-style bar waveform whose **shape is deterministic per song** (seeded PRNG
+  from the video id → stable, distinct per track, never random-flickers) and whose
+  **progress is real**, driven by the clock-offset-corrected `getPlaybackProgress()`.
+  Played bars light emerald; the playhead glows while playing, calms when paused. Shown
+  in the Now-Playing card (`NowPlayingCard`, wired from `SessionPage`). It is NOT the
+  real audio and is labelled as such.
+- **Commit:** frontend `893f2d6`. (A teammate separately added a mini-player live
+  progress bar, `7960331`.)
+
 ---
 
 ## 3. Open items & known limitations
@@ -375,6 +399,7 @@ Verified facts about the production environment (corrects some older notes):
 | `c618703` | use server-sent title on song change (§2.7) |
 | `76385d3` | correct playback position for device clock skew (§2.8, P1) |
 | `9a6d797` | faster sync convergence — buffering comp + tighter poll (§2.8, P3) |
+| `893f2d6` | now-playing waveform visualizer (deterministic shape + real progress) (§2.9) |
 
 ---
 
