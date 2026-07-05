@@ -667,6 +667,7 @@ const advanceToNext = async (sessionId, expectedCurrentItemId = null) => {
             current_video_id: null,
             current_title: title,
             video_start_time: startTime,
+            server_time: startTime,
             is_playing: false,
           },
         });
@@ -690,6 +691,7 @@ const advanceToNext = async (sessionId, expectedCurrentItemId = null) => {
             current_video_id: nextVideoId,
             current_title: title, // send the real title so the new song shows
             video_start_time: startTime, // instantly — no "Loading…"/placeholder flash
+            server_time: startTime, // client clock-offset reference
             is_playing: true,
           },
         });
