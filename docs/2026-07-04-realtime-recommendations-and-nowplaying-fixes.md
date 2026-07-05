@@ -348,6 +348,36 @@ on the dashboard until item 6 landed. See [§2.6](#26-session-rename-slow--dashb
     hardening the voting-round timer state machine (a larger, riskier change).
 - **Commits:** backend `02cc84e`, `86c6704`; frontend `3acda53`.
 
+### 2.11 Mini-player visual redesign — premium glassmorphism + motion — ✅ Shipped
+- **Goal:** the persistent bottom banner looked flat and generic. Make it feel
+  premium and *alive* (tasteful motion) and fully responsive on phone — **visual
+  only**, with 100% of the existing controls/behaviour and the `usePlayback()`
+  data contract unchanged.
+- **What shipped** (`components/MiniPlayer.jsx`, `tailwind.config.js`):
+  - **Frosted-glass floating pill** — layered `slate-900→950` gradient,
+    `backdrop-blur`, state-coloured border, top sheen, and a **breathing ambient
+    glow** behind it that reacts to state (emerald = playing, amber = on a break,
+    dim = idle/waiting).
+  - **Live equalizer bars** over the album art while actively playing (calm when
+    paused/idle); **play/pause icon morph**; hover-glow + press-scale on every
+    control; **vote-count pop**; **Up-Next cross-fade** on track change; spring
+    slide-up entrance/exit.
+  - New Tailwind keyframes `equalize`, `shimmer`, `ambient-glow`.
+  - **Fully responsive:** Up-Next details collapse below `md` (access via the
+    Queue button, whose dot signals votable suggestions), thumb-sized controls,
+    graceful truncation; checked at ~375 px / 768 px / desktop.
+  - **Accessibility:** every animation gated by `prefers-reduced-motion`
+    (framer presets collapse to opacity; CSS animations use `motion-reduce:`).
+- **Note on the progress bar:** the same pass first added a *linear* live progress
+  bar (`getPlaybackProgress()`, server-authoritative, read-only — commit `7960331`);
+  it was then **replaced by the deterministic waveform** in the mini-player (see
+  §2.10). `getPlaybackProgress()` remains and now drives the waveform's real progress.
+- **Deploy footnote:** this was the deploy that surfaced the **zombie `vite build`
+  overwriting `dist` with the pre-pull bundle** (symptom: hash changed but UI didn't).
+  Root-caused and fixed by **building locally and shipping `dist`** — now the
+  recommended path in [§4](#4-deploy-runbook).
+- **Commit:** frontend `7e8002d` (redesign) + `7960331` (progress getter).
+
 ---
 
 ## 3. Open items & known limitations
@@ -465,6 +495,8 @@ Verified facts about the production environment (corrects some older notes):
 | `9a6d797` | faster sync convergence — buffering comp + tighter poll (§2.8, P3) |
 | `893f2d6` | now-playing waveform visualizer (deterministic shape + real progress) (§2.9) |
 | `3acda53` | prominent + mini-player waveform, full-height dark bg, AI-tagged queue (§2.10) |
+| `7e8002d` | mini-player glassmorphism redesign with live animations (§2.11) |
+| `7960331` | mini-player live song progress getter/bar (§2.11; superseded by §2.10 waveform) |
 
 ---
 
