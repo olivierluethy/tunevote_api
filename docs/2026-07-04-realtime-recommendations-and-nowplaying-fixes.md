@@ -218,6 +218,45 @@ on the dashboard until item 6 landed. See [§2.6](#26-session-rename-slow--dashb
   with a screenshot.
 - **Commits:** backend `d5eb174`; frontend `c618703`.
 
+### 2.8 Songs out of sync between participants (some ahead, some behind) — ✅ Fixed (P1+P2); ⚠️ runtime-unconfirmed with 2 devices
+- **Symptom:** when several people are in the same live session, the song is at
+  different positions on different devices — some far ahead, some noticeably
+  delayed — and it varies per device/session.
+- **Root cause (empirically narrowed):** every client computed the playback
+  position as `elapsed = (Date.now()[device] − video_start_time[server]) / 1000`
+  in all four sync paths (join, 10s drift poll, resume, tab-visibility). The only
+  per-device variable is the device's own `Date.now()`, so a device whose local
+  clock is off by N seconds plays N seconds ahead/behind everyone else. The
+  server side was checked and is **not** at fault: Node and MySQL are both UTC and
+  agree to <1s (verified on prod), so there is no timezone/server-clock bug. A
+  secondary, smaller issue: the socket events sent the exact `Date.now()` (ms)
+  while `GET /playback-sync` derived the start from `startedAt` (second-resolution
+  DATETIME) → the two references disagreed by up to ~1s, so a client jumped on
+  each drift poll.
+- **Fix P1 — clock-offset correction (the big one):** the server now sends
+  `server_time` (its `Date.now()`) in every sync payload (3 `playback_sync` socket
+  emits, `session_started`, and `GET /playback-sync`). The client estimates its
+  offset to the server clock — RTT-compensated on the timed GETs, one-way from
+  pushed events — and computes position as `serverNow() − video_start_time`. Every
+  device converges to the server clock regardless of its local clock.
+- **Fix P2 — millisecond-precise, consistent reference:** added
+  `queue_items.started_at_ms` (BIGINT), written with the exact ms start value at
+  every song start; `GET /playback-sync` returns
+  `COALESCE(started_at_ms, UNIX_TIMESTAMP(startedAt)*1000)`, so the GET and socket
+  paths now return an identical ms-precise start time (no more ~1s poll jitter).
+- **Verified:** on prod, `GET /playback-sync` returns `server_time` and a
+  ms-precise `video_start_time` matching `started_at_ms` (not the truncated
+  second). **Not yet confirmed** with two devices that have differing clocks in a
+  live playing session (couldn't fabricate headlessly) — confirm by having two
+  people watch one session (hard-refresh first for the PWA cache).
+- **Files:** backend `services/playback.js`, `routes/sessions.js` (+ `init.sql`,
+  migration `20260705000001_queue_items_started_at_ms`, `scripts/2026-07-05-…`);
+  frontend `context/PlaybackContext.jsx` (`syncClock`/`serverNow`).
+- **Commits:** backend `cea3ff7` (P1), `227b44f` (P2); frontend `76385d3` (P1).
+- **Still open (P3, optional):** tighten the drift poll interval/tolerance, add a
+  server-side periodic sync tick, buffering compensation after seek, and fold the
+  current playback state into the `join-live` response to remove the join round-trip.
+
 ---
 
 ## 3. Open items & known limitations
@@ -303,6 +342,8 @@ Verified facts about the production environment (corrects some older notes):
 | `5088dd4` | cap live YouTube searches per call — quota guard (§2.5) |
 | `e120470` | live session rename + keep dashboard socket connected (§2.6) |
 | `d5eb174` | send song title with `playback_sync` (§2.7) |
+| `cea3ff7` | send `server_time` for client clock-offset correction (§2.8, P1) |
+| `227b44f` | millisecond-precise, consistent song start reference (§2.8, P2) |
 
 **Frontend — `tunevote_frontend` (all on `main`, deployed):**
 
@@ -313,6 +354,7 @@ Verified facts about the production environment (corrects some older notes):
 | `ceaab60` | don't downgrade a returning user to guest on a stale token (§2.2) — via PR #3 `93f10da` |
 | `83be256` | reflect session rename in real time (§2.6) |
 | `c618703` | use server-sent title on song change (§2.7) |
+| `76385d3` | correct playback position for device clock skew (§2.8, P1) |
 
 ---
 
