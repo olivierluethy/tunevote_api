@@ -253,9 +253,14 @@ on the dashboard until item 6 landed. See [§2.6](#26-session-rename-slow--dashb
   migration `20260705000001_queue_items_started_at_ms`, `scripts/2026-07-05-…`);
   frontend `context/PlaybackContext.jsx` (`syncClock`/`serverNow`).
 - **Commits:** backend `cea3ff7` (P1), `227b44f` (P2); frontend `76385d3` (P1).
-- **Still open (P3, optional):** tighten the drift poll interval/tolerance, add a
-  server-side periodic sync tick, buffering compensation after seek, and fold the
-  current playback state into the `join-live` response to remove the join round-trip.
+- **P3 done (frontend `9a6d797`):** buffering compensation — a one-shot seek ~2.5s
+  after each song change once the player has buffered (seek only, no player rebuild)
+  — and a tighter drift poll (10s→5s, tolerance 2s→1.5s). **Deliberately NOT done:**
+  a server-side periodic `playback_sync` tick, because that event's client handler
+  rebuilds the YouTube player (`createPlayer`), so periodic emits would interrupt
+  audio every few seconds. **Still open (optional):** fold the current playback state
+  into the `join-live` response to remove the join round-trip/race (low impact — the
+  socket is already in the room by then).
 
 ---
 
@@ -306,6 +311,16 @@ Verified facts about the production environment (corrects some older notes):
   a change adds deps. Zero-downtime build+swap:
   `./node_modules/.bin/vite build --outDir dist_new --emptyOutDir` then
   `mv dist dist_prev && mv dist_new dist`. No nginx reload needed for a static swap.
+- **⚠️ The prod box (2 GB RAM, no swap) OOM-kills the vite build** now that the
+  frontend has grown — observed 2026-07-05, even with a temporary 2 GB swapfile the
+  build was `Killed`. **Reliable workaround: build the frontend LOCALLY and upload
+  the `dist`.** Local build → `tar czf - -C dist . | ssh … 'cat > /tmp/d.tgz'` →
+  on prod `sudo`: extract into `dist_new` (`tar xzf … --no-same-owner`), then
+  `mv dist dist_prev && mv dist_new dist && chown -R root:root dist`. The output is
+  equivalent (URLs are hard-coded, not env-baked; the `vite-plugin-pwa` version only
+  affects build-time, not runtime). Longer-term fix: add permanent swap to the box or
+  build in CI. Beware the `setsid`+SSH build race: a killed/timed-out build can leave
+  stray processes — `sudo pkill -9 -f 'vite build'` before retrying.
 - **Database:** MySQL is **local on the app server** (container), reachable as the app's
   `user`. It has full privileges on `tunevote.*`.
 - **Public health checks:** `curl https://app.tunevote.com/` → 200;
@@ -355,6 +370,7 @@ Verified facts about the production environment (corrects some older notes):
 | `83be256` | reflect session rename in real time (§2.6) |
 | `c618703` | use server-sent title on song change (§2.7) |
 | `76385d3` | correct playback position for device clock skew (§2.8, P1) |
+| `9a6d797` | faster sync convergence — buffering comp + tighter poll (§2.8, P3) |
 
 ---
 
