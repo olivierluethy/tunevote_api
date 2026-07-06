@@ -7,7 +7,6 @@ const {
   getUserFromToken,
   getGuestFromToken,
   ensureParticipant,
-  hasActiveSubscription,
 } = require("../services/auth");
 const transporter = require("../services/mailer");
 const { openai, safeParseOpenAI } = require("../services/openai");
@@ -207,18 +206,7 @@ router.post("/sessions", async (req, res) => {
 
   const privateFlag = is_private ? 1 : 0;
 
-  // Paywall: private sessions require an active $5/month subscription.
-  // Public sessions remain free.
-  if (privateFlag === 1) {
-    const entitled = await hasActiveSubscription(user.id);
-    if (!entitled) {
-      return res.status(402).json({
-        error: "subscription_required",
-        message:
-          "A $5/month subscription is required to create private sessions.",
-      });
-    }
-  }
+  // Public and private sessions are both free to create — no entitlement gate.
 
   try {
     const [result] = await pool.query(
