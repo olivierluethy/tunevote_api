@@ -17,23 +17,6 @@ const getUserFromToken = async (token) => {
   }
 };
 
-// === Subscription entitlement ===
-// "active" status alone is not enough — Stripe keeps a sub in 'active' through
-// its paid window even after the user has clicked Cancel, with the actual
-// expiry sitting in current_period_end. Both must be checked.
-async function hasActiveSubscription(userId) {
-  const [rows] = await pool.query(
-    `SELECT subscription_status, subscription_current_period_end
-       FROM users WHERE id = ?`,
-    [userId],
-  );
-  const row = rows[0];
-  if (!row) return false;
-  if (row.subscription_status !== "active") return false;
-  if (!row.subscription_current_period_end) return false;
-  return new Date(row.subscription_current_period_end) > new Date();
-}
-
 const getGuestFromToken = async (guestToken) => {
   if (!guestToken) return null;
 
@@ -83,7 +66,6 @@ const ensureParticipant = async (
 module.exports = {
   JWT_SECRET,
   getUserFromToken,
-  hasActiveSubscription,
   getGuestFromToken,
   ensureParticipant,
 };

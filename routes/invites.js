@@ -7,7 +7,6 @@ const {
   getUserFromToken,
   getGuestFromToken,
   ensureParticipant,
-  hasActiveSubscription,
 } = require("../services/auth");
 const transporter = require("../services/mailer");
 const { openai, safeParseOpenAI } = require("../services/openai");
