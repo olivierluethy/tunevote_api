@@ -955,6 +955,7 @@ router.get("/sessions/:id/proposals", async (req, res) => {
         q.description,      -- für Pausen
         COALESCE(yvc.duration, q.pause_duration_seconds) AS duration,
         COALESCE(v.vote_count, 0) AS votes,
+        q.added_by AS addedById,
         u.username AS addedByUser,
         g.nickname AS addedByGuest
       FROM queue_items q
@@ -990,6 +991,7 @@ router.get("/sessions/:id/proposals", async (req, res) => {
       duration: p.duration,
       votes: p.votes,
       addedBy: p.addedByUser || p.addedByGuest || "Unbekannt",
+      addedById: p.addedById || null, // user id → lets the client show an avatar
     }));
 
     res.json(result);
