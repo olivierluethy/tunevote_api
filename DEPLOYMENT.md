@@ -255,7 +255,7 @@ vps 'set -a; . /var/www/tunevote_api/.env; set +a
   mkdir -p ~/tunevote-backups
   OUT=~/tunevote-backups/tunevote-pre-migrate-$(date +%Y%m%d-%H%M%S).sql
   docker exec mysql mysqldump -u"$DB_USER" -p"$DB_PASSWORD" \
-    --single-transaction --routines "$DB_NAME" > "$OUT" 2>/dev/null
+    --default-character-set=utf8mb4 --single-transaction --routines "$DB_NAME" > "$OUT" 2>/dev/null
   gzip -k "$OUT"
   ls -lh "$OUT"*
   grep -c "^CREATE TABLE" "$OUT"'
@@ -264,6 +264,12 @@ vps 'set -a; . /var/www/tunevote_api/.env; set +a
 > If `$DB_USER` lacks privileges for `--routines`/locking, use root instead:
 > `docker exec mysql mysqldump -uroot -p"$DEPLOY_DB_ROOT_PASSWORD" ...`
 > **Do not continue if the dump is empty or the table count looks wrong.**
+>
+> **Encoding:** always dump/restore with `--default-character-set=utf8mb4`, and
+> never restore a pre-2026-07-28 dump (it holds the old mojibake). The MySQL
+> server also forces utf8mb4 on every connection
+> (`--skip-character-set-client-handshake`). See
+> [`docs/encoding-repair.md`](docs/encoding-repair.md) §3a.
 
 ### 6.3 Review, then apply (Knex)
 
