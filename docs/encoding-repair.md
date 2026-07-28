@@ -204,6 +204,45 @@ can also be reverted from the log if ever needed.
 
 ---
 
+## 3a. Prevention — so it never recurs
+
+Adding songs/titles **through the app** is already safe (utf8mb4 pool, utf8mb4
+columns, UTF-8 ingestion). These layers close the remaining out-of-band paths
+(manual imports, CLI/phpMyAdmin, a future script, restoring an old dump):
+
+1. **Server forces utf8mb4 (root cause, closed at the source).**
+   `docker-compose.yml` runs MySQL with:
+   ```
+   --character-set-server=utf8mb4
+   --collation-server=utf8mb4_0900_ai_ci
+   --skip-character-set-client-handshake
+   ```
+   `--skip-character-set-client-handshake` makes the server **ignore** the
+   charset a client requests and use utf8mb4. Previously the server handed out
+   **latin1** to any client that didn't ask for utf8mb4 — the exact hole the
+   original import fell through. Now the CLI, phpMyAdmin, an import, or a script
+   that forgets `charset` all get utf8mb4. Applying it requires recreating the
+   `mysql` container (`docker compose up -d mysql`; data is on the named volume
+   `mysql_data`; take a backup first).
+
+2. **App fails fast on a wrong charset.** `index.js` checks
+   `@@character_set_client/connection/results` at startup and refuses to boot if
+   any is not utf8mb4 — a misconfiguration surfaces immediately instead of
+   silently corrupting writes.
+
+3. **Static guard test.** `npm run test:charset-guard`
+   (`test/db_charset_guard.test.js`) fails if any source file opens a DB
+   connection without `charset: "utf8mb4"`, so a future connection can't
+   regress. Plus `npm run test:encoding` proves a full write→read→API round-trip.
+
+4. **Import / backup discipline.**
+   - Dumps: always `mysqldump --default-character-set=utf8mb4`; the file must be
+     UTF-8 (`file -I dump.sql`).
+   - Restores: always `mysql --default-character-set=utf8mb4 < dump.sql`.
+   - **Never restore a pre-2026-07-28 backup** — those still hold the old
+     mojibake and would reintroduce it. If you must, re-run
+     `node scripts/repair-encoding.js --apply` afterwards.
+
 ## 4. Acceptance criteria — how each is met
 
 - `Rag’n’Bone Man - Guilty` renders identically on prod and localhost → after

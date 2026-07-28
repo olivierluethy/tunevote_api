@@ -12,7 +12,8 @@
     "migrate:mark-baseline": "node scripts/mark-baseline.js",
     "verify-schema": "node scripts/verify-schema.js",
     "repair:encoding": "node scripts/repair-encoding.js",
-    "test:encoding": "node test/run.js test/encoding_roundtrip.test.js"
+    "test:encoding": "node test/run.js test/encoding_roundtrip.test.js",
+    "test:charset-guard": "node test/run.js test/db_charset_guard.test.js"
   },
   "keywords": [],
   "author": "",

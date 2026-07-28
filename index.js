@@ -28,6 +28,24 @@ app.use(express.json());
     console.log("   Database:", rows[0].db);
     console.log("   User:", rows[0].user);
     console.log("   Server time:", rows[0].time);
+
+    // Fail fast on a non-utf8mb4 connection. A latin1 session silently
+    // double-encodes non-ASCII text on write (the mojibake bug). If the charset
+    // is ever wrong, refuse to serve rather than corrupt data. See
+    // docs/encoding-repair.md.
+    const [[cs]] = await connection.query(
+      "SELECT @@character_set_client c, @@character_set_connection n, " +
+        "@@character_set_results r, @@collation_connection coll",
+    );
+    const wrong = ["c", "n", "r"].filter((k) => !String(cs[k]).startsWith("utf8mb4"));
+    if (wrong.length) {
+      console.error("❌ Connection charset is NOT utf8mb4:", cs);
+      console.error("   Refusing to start — a latin1 session corrupts non-ASCII text.");
+      console.error("   Fix db.js `charset: \"utf8mb4\"` and/or the MySQL server charset.");
+      connection.release();
+      process.exit(1);
+    }
+    console.log(`   Charset: client=${cs.c} connection=${cs.n} results=${cs.r} (${cs.coll})`);
     connection.release();
   } catch (err) {
     console.error("❌ MySQL connection failed!");
