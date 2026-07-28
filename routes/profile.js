@@ -6,6 +6,7 @@ const pool = require("../db");
 const transporter = require("../services/mailer");
 const { getUserFromToken } = require("../services/auth");
 const { getScalar, getSingleValue, hashPassword } = require("../utils/helpers");
+const { resolveId } = require("../services/publicId");
 
 const router = express.Router();
 
@@ -549,7 +550,7 @@ router.get("/profile/listening-summary", async (req, res) => {
         ),
         pool.query(
           `SELECT
-            a.id AS artist_id,
+            a.public_id AS artist_id,
            a.name,
            a.image_url,
            SUM(s.listen_seconds) AS total_seconds,
@@ -611,7 +612,7 @@ router.get("/profile/recent-listens", async (req, res) => {
          s.listened_from,
          s.listen_seconds,
          s.completed,
-         y.artist_id,
+         a.public_id AS artist_id,
          a.name      AS artist_name,
          a.image_url AS artist_image_url
        FROM session_song_listens s
@@ -998,7 +999,8 @@ router.get("/profile/artist/:artistId/insights", async (req, res) => {
   }
 
   const userId = user.id;
-  const artistId = parseInt(req.params.artistId, 10);
+  const artistId = await resolveId("artists", req.params.artistId);
+  if (!artistId) return res.status(404).json({ error: "Artist not found" });
 
   try {
     const [[artist]] = await pool.query(

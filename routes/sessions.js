@@ -10,6 +10,7 @@ const {
 } = require("../services/auth");
 const transporter = require("../services/mailer");
 const { openai, safeParseOpenAI } = require("../services/openai");
+const { resolveSessionId } = require("../services/publicId");
 const { broadcastTodayTopArtists } = require("../services/broadcast");
 const {
   sessionTimers,
@@ -100,6 +101,7 @@ router.get("/sessions", async (req, res) => {
       [rows] = await pool.query(`
         SELECT 
           s.id,
+          s.public_id,
           s.title,
           s.created_at,
           s.user_id AS hostId,
@@ -136,7 +138,7 @@ router.get("/sessions", async (req, res) => {
       [rows] = await pool.query(
         `
         SELECT 
-          s.id, s.title, s.created_at, s.user_id AS hostId, u.username AS host,
+          s.id, s.public_id, s.title, s.created_at, s.user_id AS hostId, u.username AS host,
           s.is_live, s.status, s.is_private,
           (
             SELECT COUNT(*) FROM session_participants sp
@@ -157,6 +159,7 @@ router.get("/sessions", async (req, res) => {
       `
       SELECT DISTINCT
         s.id,
+        s.public_id,
         s.title,
         s.created_at,
         s.user_id AS hostId,
@@ -210,7 +213,7 @@ router.post("/sessions", async (req, res) => {
 
   try {
     const [result] = await pool.query(
-      "INSERT INTO sessions (user_id, title, is_private) VALUES (?, ?, ?)",
+      "INSERT INTO sessions (user_id, title, is_private, public_id) VALUES (?, ?, ?, UUID())",
       [user.id, title.trim(), privateFlag],
     );
 
@@ -228,6 +231,7 @@ router.post("/sessions", async (req, res) => {
     const [newSession] = await pool.query(
       `SELECT
          s.id,
+         s.public_id,
          s.title,
          s.created_at,
          s.user_id AS hostId,
@@ -335,7 +339,9 @@ router.get("/join", async (req, res) => {
 // GET /sessions/:id/current-voting-phase
 
 router.get("/sessions/:id", async (req, res) => {
-  const { id } = req.params;
+  // Accept either the numeric id or the long public_id in the URL.
+  const id = await resolveSessionId(req.params.id);
+  if (!id) return res.status(404).json({ error: "Not found" });
   const token = req.headers.authorization?.split(" ")[1];
   const guestToken = req.headers["x-guest-token"];
   const user = token ? await getUserFromToken(token) : null;
@@ -500,8 +506,8 @@ router.post("/sessions/:id/queue/add", async (req, res) => {
     // Ensure the cache row exists before inserting into queue_items —
     // queue_items.video_id is now an FK to youtube_video_cache.youtube_id.
     await pool.query(
-      `INSERT INTO youtube_video_cache (youtube_id, title, title_norm, thumbnail, duration)
-       VALUES (?, ?, ?, ?, ?)
+      `INSERT INTO youtube_video_cache (youtube_id, title, title_norm, thumbnail, duration, public_id)
+       VALUES (?, ?, ?, ?, ?, UUID())
        ON DUPLICATE KEY UPDATE
          title = VALUES(title),
          title_norm = VALUES(title_norm),

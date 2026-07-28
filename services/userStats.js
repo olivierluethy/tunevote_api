@@ -28,7 +28,7 @@ async function fetchUserStats(userId) {
     // 1. Top 10 Songs (nach Hördauer) — only songs actually listened to.
     pool.query(
       `SELECT
-         q.video_id,
+         MAX(y.public_id)      AS video_id,
          MAX(y.title)          AS title,
          MAX(y.thumbnail)      AS thumbnail,
          SUM(l.listen_seconds) AS total_seconds,
@@ -47,7 +47,7 @@ async function fetchUserStats(userId) {
     // 2. Top 10 Mit-Hörer
     pool.query(
       `SELECT
-         u.id,
+         u.public_id AS id,
          u.username,
          u.imageData,
          u.imageType,
