@@ -221,9 +221,27 @@ columns, UTF-8 ingestion). These layers close the remaining out-of-band paths
    charset a client requests and use utf8mb4. Previously the server handed out
    **latin1** to any client that didn't ask for utf8mb4 — the exact hole the
    original import fell through. Now the CLI, phpMyAdmin, an import, or a script
-   that forgets `charset` all get utf8mb4. Applying it requires recreating the
-   `mysql` container (`docker compose up -d mysql`; data is on the named volume
-   `mysql_data`; take a backup first).
+   that forgets `charset` all get utf8mb4. **Applied to prod on 2026-07-28** —
+   verified: a client requesting no charset now reports
+   `character_set_client/connection/results = utf8mb4` (was `latin1`).
+
+   > **Ops caveat:** the VPS's `docker-compose` is v1.29.2, incompatible with the
+   > current Docker Engine (`KeyError: 'ContainerConfig'` on recreate — it deletes
+   > the container then fails to rebuild it). So the `mysql` container is managed
+   > with plain `docker run`, not compose. To change its config, re-run (data
+   > lives on the named volume `tunevote_api_mysql_data`; **back up first**):
+   > ```bash
+   > docker rm -f mysql
+   > docker run -d --name mysql --restart always --network tunevote_api_default -p 3306:3306 \
+   >   -e MYSQL_ROOT_PASSWORD=… -e MYSQL_DATABASE=tunevote -e MYSQL_USER=user -e MYSQL_PASSWORD=… \
+   >   -v tunevote_api_mysql_data:/var/lib/mysql \
+   >   mysql:8.0 \
+   >   --character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci \
+   >   --skip-character-set-client-handshake
+   > ```
+   > (Env vars are ignored once the data dir exists — existing users/passwords are
+   > preserved.) `docker-compose.yml` keeps the same flags for local dev and as the
+   > source of truth; fixing compose on the host means installing Compose v2.
 
 2. **App fails fast on a wrong charset.** `index.js` checks
    `@@character_set_client/connection/results` at startup and refuses to boot if
