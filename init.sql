@@ -48,6 +48,7 @@ CREATE TABLE users (
   updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   imageType varchar(255),
   imageData longblob,
+  image_source_url varchar(1024) DEFAULT NULL,
   UNIQUE KEY username (username),
   UNIQUE KEY email (email)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;

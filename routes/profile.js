@@ -1,10 +1,36 @@
 const express = require("express");
 const multer = require("multer");
+const crypto = require("crypto");
+const bcrypt = require("bcrypt");
 const pool = require("../db");
+const transporter = require("../services/mailer");
 const { getUserFromToken } = require("../services/auth");
-const { getScalar, getSingleValue } = require("../utils/helpers");
+const { getScalar, getSingleValue, hashPassword } = require("../utils/helpers");
 
 const router = express.Router();
+
+// Sniff an image's real type from its magic bytes, independent of any
+// caller-supplied Content-Type. Returns a mimetype string or null.
+function sniffImageType(buf) {
+  if (!buf || buf.length < 12) return null;
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return "image/jpeg";
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47)
+    return "image/png";
+  if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38)
+    return "image/gif";
+  if (
+    buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 &&
+    buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50
+  )
+    return "image/webp";
+  return null;
+}
+
+// Generate a readable-but-strong random password for the "email me a new
+// password" flow. base64url avoids ambiguous characters and shell/URL issues.
+function generatePassword(bytes = 12) {
+  return crypto.randomBytes(bytes).toString("base64url");
+}
 
 router.get("/profile", async (req, res) => {
   console.log("\n=== GET /profile aufgerufen ===");
@@ -55,14 +81,16 @@ router.get("/profile", async (req, res) => {
   try {
     console.log(`Führe DB-Query aus für user.id = ${user.id}`);
     const [userRow] = await pool.query(
-      `SELECT 
-       id, 
-       username, 
-       email, 
+      `SELECT
+       id,
+       username,
+       email,
        created_at,
        imageType,
-       imageData 
-     FROM users 
+       imageData,
+       image_source_url,
+       password_hash
+     FROM users
      WHERE id = ?`,
       [user.id],
     );
@@ -95,6 +123,14 @@ router.get("/profile", async (req, res) => {
       imageData: dbUser.imageData
         ? dbUser.imageData.toString("base64") // Direkt vom Buffer → Base64
         : null,
+      // Where the current picture came from, if it was set via a URL rather
+      // than an uploaded file. null means "uploaded" (or no picture).
+      imageSourceUrl: dbUser.image_source_url || null,
+      // OAuth-only users (Google/Facebook) are created without a password_hash.
+      // The client hides the whole password area when this is false.
+      hasPassword: !!(
+        dbUser.password_hash && String(dbUser.password_hash).length > 0
+      ),
     });
   } catch (err) {
     console.error("Schwerer Fehler beim Laden des Profils:", err);
@@ -297,7 +333,7 @@ router.get("/profile/user-stats", async (req, res) => {
             ROW_NUMBER() OVER (ORDER BY started_at) AS grp
           FROM wins
         )
-        SELECT MAX(rn - grp + 1) AS max_streak
+        SELECT MAX(CAST(rn AS SIGNED) - CAST(grp AS SIGNED) + 1) AS max_streak
         FROM ranked
       `,
         [userId],
@@ -370,7 +406,7 @@ router.get("/profile/user-stats", async (req, res) => {
           FROM foreign_votes
         ),
         streaks AS (
-          SELECT did_win, MAX(rn - grp + 1) AS streak_length
+          SELECT did_win, MAX(CAST(rn AS SIGNED) - CAST(grp AS SIGNED) + 1) AS streak_length
           FROM ranked
           GROUP BY did_win
         )
@@ -420,7 +456,7 @@ router.get("/profile/user-stats", async (req, res) => {
             ROW_NUMBER() OVER (PARTITION BY has_voted ORDER BY created_at) AS grp
           FROM session_activity
         )
-        SELECT MAX(CASE WHEN has_voted = 0 THEN (rn - grp + 1) ELSE 0 END) AS max_streak
+        SELECT MAX(CASE WHEN has_voted = 0 THEN (CAST(rn AS SIGNED) - CAST(grp AS SIGNED) + 1) ELSE 0 END) AS max_streak
         FROM ranked
       `,
         [userId, userId],
@@ -500,7 +536,8 @@ router.get("/profile/listening-summary", async (req, res) => {
            y.title,
            y.thumbnail,
            SUM(s.listen_seconds) AS total_seconds,
-           COUNT(*) AS listens
+           COUNT(*) AS listens,
+           MAX(s.listened_from) AS last_listened
          FROM session_song_listens s
          JOIN queue_items q ON q.id = s.queue_item_id
          LEFT JOIN youtube_video_cache y ON y.youtube_id = q.video_id
@@ -515,7 +552,8 @@ router.get("/profile/listening-summary", async (req, res) => {
             a.id AS artist_id,
            a.name,
            a.image_url,
-           SUM(s.listen_seconds) AS total_seconds
+           SUM(s.listen_seconds) AS total_seconds,
+           MAX(s.listened_from) AS last_listened
          FROM session_song_listens s
          JOIN queue_items q ON q.id = s.queue_item_id
          JOIN youtube_video_cache y ON y.youtube_id = q.video_id
@@ -572,10 +610,14 @@ router.get("/profile/recent-listens", async (req, res) => {
          y.thumbnail,
          s.listened_from,
          s.listen_seconds,
-         s.completed
+         s.completed,
+         y.artist_id,
+         a.name      AS artist_name,
+         a.image_url AS artist_image_url
        FROM session_song_listens s
        JOIN queue_items q ON q.id = s.queue_item_id
        LEFT JOIN youtube_video_cache y ON y.youtube_id = q.video_id
+       LEFT JOIN artists a ON a.id = y.artist_id
        WHERE s.user_id = ?
        ORDER BY s.listened_from DESC
        LIMIT 20`,
@@ -704,7 +746,7 @@ async function fetchUserStats(userId) {
          WHERE qi.added_by = ?
          ORDER BY vr.started_at
        )
-       SELECT MAX(rn - grp + 1) AS max_streak
+       SELECT MAX(CAST(rn AS SIGNED) - CAST(grp AS SIGNED) + 1) AS max_streak
        FROM (
          SELECT 
            started_at,
@@ -766,8 +808,8 @@ async function fetchUserStats(userId) {
          FROM foreign_votes
        )
        SELECT 
-         MAX(CASE WHEN did_win = 1 THEN (rn - grp + 1) ELSE 0 END) AS max_winning_streak,
-         MAX(CASE WHEN did_win = 0 THEN (rn - grp + 1) ELSE 0 END) AS max_losing_streak
+         MAX(CASE WHEN did_win = 1 THEN (CAST(rn AS SIGNED) - CAST(grp AS SIGNED) + 1) ELSE 0 END) AS max_winning_streak,
+         MAX(CASE WHEN did_win = 0 THEN (CAST(rn AS SIGNED) - CAST(grp AS SIGNED) + 1) ELSE 0 END) AS max_losing_streak
        FROM ranked`,
       [userId, userId],
     ),
@@ -804,7 +846,7 @@ async function fetchUserStats(userId) {
            ROW_NUMBER() OVER (PARTITION BY has_voted ORDER BY created_at) grp
          FROM session_activity
        )
-       SELECT MAX(CASE WHEN has_voted = 0 THEN (rn - grp + 1) ELSE 0 END) AS max_streak
+       SELECT MAX(CASE WHEN has_voted = 0 THEN (CAST(rn AS SIGNED) - CAST(grp AS SIGNED) + 1) ELSE 0 END) AS max_streak
        FROM ranked`,
       [userId, userId],
     ),
@@ -909,10 +951,11 @@ router.post("/profile/image", upload.single("profileImage"), async (req, res) =>
     const imageType = req.file.mimetype; // z. B. "image/jpeg"
     const imageData = req.file.buffer; // ← Roh-Bytes, kein Base64!
 
-    // Update in der users-Tabelle
+    // Update in der users-Tabelle. An uploaded file has no source URL, so
+    // clear image_source_url so the edit UI shows "Uploaded file" afterwards.
     const query = `
-      UPDATE users 
-      SET imageType = ?, imageData = ?, updated_at = CURRENT_TIMESTAMP 
+      UPDATE users
+      SET imageType = ?, imageData = ?, image_source_url = NULL, updated_at = CURRENT_TIMESTAMP
       WHERE id = ?
     `;
 
@@ -996,7 +1039,8 @@ router.get("/profile/artist/:artistId/insights", async (req, res) => {
         MAX(y.title)          AS title,
         MAX(y.thumbnail)      AS thumbnail,
         SUM(l.listen_seconds) AS total_seconds,
-        COUNT(*)              AS listen_count
+        COUNT(*)              AS listen_count,
+        MAX(l.listened_from)  AS last_listened
       FROM session_song_listens l
       JOIN queue_items q ON q.id = l.queue_item_id
       JOIN youtube_video_cache y ON y.youtube_id = q.video_id
@@ -1121,6 +1165,26 @@ router.get("/profile/artist/:artistId/insights", async (req, res) => {
       (a, b) => new Date(a.date) - new Date(b.date),
     );
 
+    // Individual listen events of THIS artist by THIS user (last 90 days), for
+    // the per-artist calendar: which day, at what time, which song.
+    const [listenEvents] = await pool.query(
+      `
+      SELECT
+        l.listened_from,
+        l.listen_seconds,
+        y.title
+      FROM session_song_listens l
+      JOIN queue_items q ON q.id = l.queue_item_id
+      JOIN youtube_video_cache y ON y.youtube_id = q.video_id
+      WHERE y.artist_id = ?
+        AND l.user_id = ?
+        AND l.listened_from >= DATE_SUB(CURDATE(), INTERVAL 90 DAY)
+      ORDER BY l.listened_from DESC
+      LIMIT 500
+      `,
+      [artistId, userId],
+    );
+
     res.json({
       artist,
       total_minutes: Math.floor((summary.total_seconds || 0) / 60),
@@ -1137,6 +1201,7 @@ router.get("/profile/artist/:artistId/insights", async (req, res) => {
       max_daily_seconds: maxDailySeconds,
       sessions,
       daily_sessions: dailySessions,
+      listen_events: listenEvents,
     });
   } catch (err) {
     console.error("Artist insights failed:", err);
@@ -1158,8 +1223,200 @@ router.delete("/profile/image", async (req, res) => {
   res.json({ imageType: null, imageData: null });
 });
 
-// Irgendwo zentral, z. B. in deiner socket.io oder utils Datei
-// Direkt nach der io-Definition (z. B. nach const io = new Server(...))
+// 🗳️ Voting Activity: tägliche Vote- und Hör-Aktivität der letzten 30 Tage.
+// Feeds the profile "voting behavior" chart (when you voted vs. only listened).
+router.get("/profile/voting-activity", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Unauthenticated – kein Token" });
+  }
+  const token = authHeader.split(" ")[1];
+  let user;
+  try {
+    user = await getUserFromToken(token);
+    if (!user || !user.id) return res.status(401).json({ error: "Ungültiger Token" });
+  } catch (err) {
+    return res.status(401).json({ error: "Ungültiger Token" });
+  }
+  const userId = user.id;
 
+  try {
+    const [[votesByDay], [listensByDay]] = await Promise.all([
+      pool.query(
+        `SELECT DATE(created_at) AS date, COUNT(*) AS votes
+           FROM votes
+          WHERE user_id = ? AND created_at >= DATE_SUB(CURDATE(), INTERVAL 29 DAY)
+          GROUP BY DATE(created_at)
+          ORDER BY date ASC`,
+        [userId],
+      ),
+      pool.query(
+        `SELECT DATE(listened_from) AS date, COUNT(*) AS listens
+           FROM session_song_listens
+          WHERE user_id = ? AND listened_from >= DATE_SUB(CURDATE(), INTERVAL 29 DAY)
+          GROUP BY DATE(listened_from)
+          ORDER BY date ASC`,
+        [userId],
+      ),
+    ]);
+    res.json({ votesByDay, listensByDay });
+  } catch (err) {
+    console.error("Error fetching voting activity:", err);
+    res.status(500).json({ error: "Fehler beim Laden der Voting-Aktivität" });
+  }
+});
+
+// 📅 Listen Calendar: Hör-Events der letzten 90 Tage für die Kalenderansicht.
+router.get("/profile/listen-calendar", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ error: "Unauthenticated – kein Token" });
+  }
+  const token = authHeader.split(" ")[1];
+  let user;
+  try {
+    user = await getUserFromToken(token);
+    if (!user || !user.id) return res.status(401).json({ error: "Ungültiger Token" });
+  } catch (err) {
+    return res.status(401).json({ error: "Ungültiger Token" });
+  }
+  const userId = user.id;
+
+  try {
+    const [listens] = await pool.query(
+      `SELECT
+         y.title,
+         y.thumbnail,
+         s.listened_from,
+         s.listen_seconds,
+         s.completed
+       FROM session_song_listens s
+       JOIN queue_items q ON q.id = s.queue_item_id
+       LEFT JOIN youtube_video_cache y ON y.youtube_id = q.video_id
+       WHERE s.user_id = ? AND s.listened_from >= DATE_SUB(CURDATE(), INTERVAL 90 DAY)
+       ORDER BY s.listened_from DESC
+       LIMIT 500`,
+      [userId],
+    );
+    res.json({ listens });
+  } catch (err) {
+    console.error("Error fetching listen calendar:", err);
+    res.status(500).json({ error: "Fehler beim Laden des Hör-Kalenders" });
+  }
+});
+
+// 🖼️ Profilbild per URL: lädt ein Bild von einer URL, prüft es und speichert es.
+// So muss der Nutzer keine Datei hochladen — er kann einen Link einfügen.
+router.post("/profile/image-url", async (req, res) => {
+  const token = req.headers.authorization?.split(" ")[1];
+  const user = await getUserFromToken(token);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+
+  const { url } = req.body || {};
+  if (!url || typeof url !== "string" || !/^https?:\/\//i.test(url)) {
+    return res
+      .status(400)
+      .json({ error: "Bitte eine gültige Bild-URL angeben (http/https)" });
+  }
+
+  try {
+    const resp = await fetch(url, {
+      redirect: "follow",
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!resp.ok) {
+      return res
+        .status(400)
+        .json({ error: `Bild konnte nicht geladen werden (HTTP ${resp.status})` });
+    }
+    const buf = Buffer.from(await resp.arrayBuffer());
+    if (buf.length > 5 * 1024 * 1024) {
+      return res.status(400).json({ error: "Bild zu groß (max. 5 MB)" });
+    }
+    // Trust the bytes, not the Content-Type header.
+    const imageType = sniffImageType(buf);
+    if (!imageType) {
+      return res
+        .status(400)
+        .json({ error: "Nicht unterstütztes Bildformat (JPEG, PNG, GIF, WebP)" });
+    }
+
+    await pool.query(
+      `UPDATE users
+         SET imageType = ?, imageData = ?, image_source_url = ?, updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`,
+      [imageType, buf, url, user.id],
+    );
+
+    res.json({
+      imageType,
+      imageData: buf.toString("base64"),
+      imageSourceUrl: url,
+    });
+  } catch (err) {
+    console.error("Fehler beim Laden des Bildes von URL:", err);
+    res
+      .status(400)
+      .json({ error: "Bild konnte von dieser URL nicht geladen werden" });
+  }
+});
+
+// 🔐 "Schick mir ein neues Passwort": generiert ein neues Passwort, setzt es und
+// mailt es dem Nutzer. Hinweis: Passwörter per Mail zu versenden ist nicht best
+// practice — hier bewusst so umgesetzt, weil ausdrücklich gewünscht.
+router.post("/profile/email-new-password", async (req, res) => {
+  const token = req.headers.authorization?.split(" ")[1];
+  const user = await getUserFromToken(token);
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+
+  try {
+    const [rows] = await pool.query(
+      "SELECT email, username FROM users WHERE id = ?",
+      [user.id],
+    );
+    if (!rows.length) return res.status(404).json({ error: "User not found" });
+    const { email, username } = rows[0];
+
+    const newPassword = generatePassword();
+    const hash = await hashPassword(newPassword);
+    await pool.query(
+      "UPDATE users SET password_hash = ?, updated_at = NOW() WHERE id = ?",
+      [hash, user.id],
+    );
+
+    const html = `
+      <div style="font-family: sans-serif; max-width: 480px; margin: 0 auto; color: #1f2937;">
+        <h2 style="color: #7c3aed;">Dein neues TuneVote-Passwort</h2>
+        <p>Hallo ${username},</p>
+        <p>dein Passwort wurde zurückgesetzt. Dein neues Passwort lautet:</p>
+        <p style="font-size: 20px; font-weight: 700; letter-spacing: 1px;
+                  background: #f3f4f6; padding: 12px 16px; border-radius: 10px;
+                  display: inline-block;">${newPassword}</p>
+        <p>Bitte speichere es sicher (z. B. in deinem Passwort-Manager) und ändere
+           es nach dem Login, wenn du möchtest.</p>
+        <p style="color: #6b7280; font-size: 13px;">Wenn du das nicht angefordert
+           hast, ändere dein Passwort umgehend.</p>
+        <p style="color: #7c3aed; font-weight: 600;">– TuneVote</p>
+      </div>`;
+
+    await transporter.sendMail({
+      from: `"TuneVote" <${process.env.GMAIL_USER}>`,
+      to: email,
+      subject: "🔐 Dein neues TuneVote-Passwort",
+      text: `Hallo ${username},\n\nDein Passwort wurde zurückgesetzt. Dein neues Passwort lautet:\n\n${newPassword}\n\nBitte speichere es sicher und ändere es nach dem Login, wenn du möchtest.\n\n– TuneVote`,
+      html,
+    });
+
+    res.json({
+      success: true,
+      message: "Ein neues Passwort wurde an deine E-Mail-Adresse gesendet.",
+    });
+  } catch (err) {
+    console.error("Fehler beim Senden des neuen Passworts:", err);
+    res
+      .status(500)
+      .json({ error: "Neues Passwort konnte nicht gesendet werden" });
+  }
+});
 
 module.exports = router;
