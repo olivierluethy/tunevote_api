@@ -2,6 +2,7 @@ const express = require("express");
 const pool = require("../db");
 const { getUserFromToken } = require("../services/auth");
 const { getScalar, getSingleValue } = require("../utils/helpers");
+const { fetchUserStats } = require("../services/userStats");
 
 const router = express.Router();
 
