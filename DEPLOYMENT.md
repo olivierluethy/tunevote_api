@@ -20,30 +20,50 @@ drift, stale frontend build, Socket.IO not connecting, YouTube quota) with fixes
 > the user's job, done after the deploy.** Do not add or run feature tests here —
 > implement, deploy, hand it back for testing.
 
-> ⚠️ **Items marked `CONFIRM ON FIRST DEPLOY`** come from the archived description
-> of the old setup and have not been re-verified against the live box. On the
-> first real deployment, check each one over SSH and replace it with the true
-> value, then remove the warning.
+> As of the **July 2026 split-hosting migration**, frontend and backend live on
+> **two different hosts** (see §0). Paths below are verified against the live boxes.
 
 ---
 
-## 0. What you are deploying to
+## 0. What you are deploying to — a split setup
 
-**One VPS hosts both apps** (frontend and backend are *not* split across
-machines). This makes the deploy simpler: one host, one SSH session.
+The backend stays on the **VPS**; the frontend is static-hosted on a **GoDaddy
+cPanel** account. They deploy independently.
+
+### Backend — VPS (`api.tunevote.com`)
 
 | | |
 |---|---|
-| Provider | Host Europe VPS |
-| Host / IP | `$DEPLOY_SSH_HOST` (from `.env`) |
-| SSH user | `$DEPLOY_SSH_USER` (from `.env`) — archive used `su -` for root steps |
-| Frontend domain | `https://app.tunevote.com` (nginx, static build) |
-| Backend domain | `https://api.tunevote.com` (nginx → Node on `:4000`) |
-| Backend process | PM2 app **`tunevote_api`** |
-| Backend code dir | `/var/www/tunevote_api` — ⚠️ CONFIRM ON FIRST DEPLOY |
-| Frontend web root | `/var/www/html` or `/var/www/TuneVote/dist` — ⚠️ CONFIRM ON FIRST DEPLOY (the archive is inconsistent) |
+| Host / IP | `$DEPLOY_SSH_HOST` (from `.env`, currently `72.167.49.141`) |
+| SSH user | `$DEPLOY_SSH_USER` (from `.env`, `salade`) — code dir & PM2 are **root-owned, so use `sudo`** (same password) |
+| Domain | `https://api.tunevote.com` (nginx → Node on `:4000`) |
+| Process | PM2 app **`tunevote_api`**, running under **root** |
+| Code dir | `/var/www/tunevote_api` |
 | Database | MySQL 8 in Docker, container **`mysql`**, database **`tunevote`** |
-| Backups | `~/tunevote-backups/` (created on first backup) |
+| Also on box | phpMyAdmin (nginx → `:8080`). **No frontend here anymore.** |
+| Backups | `~/tunevote-backups/` |
+
+### Frontend — GoDaddy cPanel (`app.tunevote.com`)
+
+| | |
+|---|---|
+| Host / IP | `132.148.178.39` (shared cPanel `p3plzcpnl506305.prod.phx3.secureserver.net`) |
+| cPanel user | `gr41l1kzrrhf` |
+| Access | **SSH key** `~/.ssh/id_ed25519_tunevote_cpanel` (GoDaddy blocks password SSH, FTP, and cPanel-password API auth) |
+| Domain | `https://app.tunevote.com` (Apache **addon domain**, AutoSSL) |
+| Document root | `~/public_html/app.tunevote.com` |
+| Serving | static Vite build + `.htaccess` SPA fallback — **no build step, no process, no nginx** |
+
+> **DNS:** `api.tunevote.com` → the VPS; `app.tunevote.com` → the cPanel IP
+> `132.148.178.39`. The shared cPanel hosts other sites — **only ever touch
+> `~/public_html/app.tunevote.com`.**
+>
+> ⚠️ **Creating the cPanel domain/SSL is a one-time cPanel-UI step** (Domains →
+> Create A Domain, docroot `public_html/app.tunevote.com`), *not* scriptable from
+> here: GoDaddy's jailed shell lacks the domain API modules and rejects
+> cPanel-password API auth (401). Only **file deploys** are automatable (over the
+> SSH key). See [`cPanel-Create-Subdomain-Guide.md`]; to script domain ops later,
+> create a cPanel **API token**.
 
 ---
 
@@ -68,29 +88,44 @@ Load them into the shell for a deploy session (run from the API repo root):
 set -a; . ./.env; set +a
 ```
 
-### Two ways to authenticate
+### VPS — password auth via SSH's askpass
 
-**Password (what you're providing now)** — uses `sshpass`:
+`sshpass` can't be installed here (no interactive `sudo`), so use OpenSSH's
+built-in askpass. Define a `vps` helper once per session:
 
 ```bash
-# install once: sudo apt-get install -y sshpass
-alias vps='sshpass -p "$DEPLOY_SSH_PASSWORD" ssh -p "${DEPLOY_SSH_PORT:-22}" -o StrictHostKeyChecking=accept-new "$DEPLOY_SSH_USER@$DEPLOY_SSH_HOST"'
+cat > /tmp/askpass.sh <<'EOF'
+#!/bin/bash
+echo "$SSH_PW"
+EOF
+chmod +x /tmp/askpass.sh
+
+vps() { SSH_PW="$DEPLOY_SSH_PASSWORD" SSH_ASKPASS_REQUIRE=force SSH_ASKPASS=/tmp/askpass.sh \
+  setsid -w ssh -o StrictHostKeyChecking=accept-new \
+  -o PreferredAuthentications=password -o PubkeyAuthentication=no \
+  "$DEPLOY_SSH_USER@$DEPLOY_SSH_HOST" "$1"; }
+
 vps 'echo connected as $(whoami)'
 ```
 
-**Key-based (recommended, one-time hardening)** — the archive's #0 lesson is
-*never keep passwords in notes*. Once things work, switch to a key and drop the
-password from `.env`:
+**`sudo` on the VPS uses the same password:** `echo "$DEPLOY_SSH_PASSWORD" | sudo -S <cmd>`.
+For multi-line root scripts, base64-encode to avoid quoting hell:
+`B64=$(printf '%s' "$SCRIPT" | base64 -w0); vps "echo $B64 | base64 -d > /tmp/s.sh && echo '$DEPLOY_SSH_PASSWORD' | sudo -S bash /tmp/s.sh; rm -f /tmp/s.sh"`.
+
+### cPanel — SSH key (frontend host)
+
+Password/FTP/API-token auth are all blocked by GoDaddy; the authorized **SSH key**
+is the only programmatic access. Define a `cpanel` helper:
 
 ```bash
-ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519_tunevote -N "" -C "deploy@tunevote"
-sshpass -p "$DEPLOY_SSH_PASSWORD" ssh-copy-id -i ~/.ssh/id_ed25519_tunevote.pub \
-  -o StrictHostKeyChecking=accept-new "$DEPLOY_SSH_USER@$DEPLOY_SSH_HOST"
-# then use: ssh -i ~/.ssh/id_ed25519_tunevote "$DEPLOY_SSH_USER@$DEPLOY_SSH_HOST"
+cpanel() { ssh -i ~/.ssh/id_ed25519_tunevote_cpanel -o StrictHostKeyChecking=accept-new \
+  gr41l1kzrrhf@132.148.178.39 "export TERM=dumb; $1"; }
+
+cpanel 'echo connected as $(whoami)'
 ```
 
-> In the commands below, `vps '<cmd>'` means "run `<cmd>` on the server" using
-> whichever method is configured.
+> In the commands below, `vps '<cmd>'` runs on the backend VPS; `cpanel '<cmd>'`
+> runs on the frontend cPanel host.
 
 ---
 
@@ -114,15 +149,15 @@ node index.js                 # API on http://localhost:4000
 **Frontend** (`tunevote_frontend`):
 
 ```bash
-cp .env.example .env          # VITE_API_URL=http://localhost:4000/
 npm ci
 npm run dev                   # http://localhost:5173
 ```
 
-> ⚠️ **Known caveat (from the README):** several frontend files still hardcode
-> `https://api.tunevote.com/`. Until that's refactored to use `VITE_API_URL`,
-> those pages hit **prod** even when running locally. Consolidating to the env
-> var is the fix that makes local/prod truly identical.
+> All API calls now go through `VITE_API_URL` (no hardcoded URLs). `vite dev`
+> auto-loads `.env.development` (`VITE_API_URL=http://localhost:4000`) while
+> `vite build` uses `.env` (`https://api.tunevote.com`) — so local and prod are
+> the same code, no manual switching. **No trailing slash** on `VITE_API_URL`
+> (some pages build `${API_URL}/path`, which would otherwise double-slash).
 
 **Workflow:** implement a feature → run it locally → hand it to the user to test
 → once they confirm, deploy with the steps below.
@@ -164,26 +199,30 @@ restart PM2.
 > code sync and the PM2 restart** — new code must not serve requests against the
 > old schema for longer than necessary.
 
+`/var/www/tunevote_api` is root-owned and PM2 runs under root, so everything here
+goes through `sudo` (same password):
+
 ```bash
-vps 'set -e
-  cd /var/www/tunevote_api          # ⚠️ CONFIRM path
-  git fetch origin
-  git reset --hard origin/main      # deploy target is never hand-edited, so this is safe & intended
-  npm ci --omit=dev                 # reproducible install from package-lock
-'
+vps 'echo "$DEPLOY_SSH_PASSWORD" | sudo -S bash -c "
+  cd /var/www/tunevote_api &&
+  git fetch origin &&
+  git reset --hard origin/main &&
+  npm ci --omit=dev"'
 ```
 
-Then (after §6 if applicable) restart and persist:
+Then (after §6 if applicable) restart and persist (root's PM2):
 
 ```bash
-vps 'pm2 restart tunevote_api && pm2 save && pm2 status'
+vps 'echo "$DEPLOY_SSH_PASSWORD" | sudo -S pm2 restart tunevote_api'
+vps 'echo "$DEPLOY_SSH_PASSWORD" | sudo -S pm2 save'
+vps 'echo "$DEPLOY_SSH_PASSWORD" | sudo -S pm2 status'
 ```
 
 `pm2 status` must show `tunevote_api` as **online**. If it's `errored`, read the
 logs immediately:
 
 ```bash
-vps 'pm2 logs tunevote_api --lines 40 --nostream'
+vps 'echo "$DEPLOY_SSH_PASSWORD" | sudo -S pm2 logs tunevote_api --lines 40 --nostream'
 ```
 
 ---
@@ -193,6 +232,10 @@ vps 'pm2 logs tunevote_api --lines 40 --nostream'
 **Back up before touching the schema. This is not optional** — the archive
 records the `youtube_video_cache` table being lost to un-backed-up overwrites
 (problem #2).
+
+> All §6 commands run **as root** (`sudo`): the app `.env` is root-owned and the
+> `mysql` Docker container needs root. Prefix with `echo "$DEPLOY_SSH_PASSWORD" |
+> sudo -S bash -c "…"` (base64-wrap multi-line scripts, see §1).
 
 ### 6.1 Record row counts (proof nothing is lost)
 
@@ -225,8 +268,8 @@ vps 'set -a; . /var/www/tunevote_api/.env; set +a
 ### 6.3 Review, then apply (Knex)
 
 ```bash
-vps 'cd /var/www/tunevote_api && npm run migrate:status'   # shows what WOULD run, changes nothing
-vps 'cd /var/www/tunevote_api && npm run migrate:latest'   # apply
+vps 'echo "$DEPLOY_SSH_PASSWORD" | sudo -S bash -c "cd /var/www/tunevote_api && npm run migrate:status"'   # dry
+vps 'echo "$DEPLOY_SSH_PASSWORD" | sudo -S bash -c "cd /var/www/tunevote_api && npm run migrate:latest"'   # apply
 ```
 
 Migrations are idempotent (INFORMATION_SCHEMA-guarded); re-running is safe.
@@ -234,48 +277,40 @@ Migrations are idempotent (INFORMATION_SCHEMA-guarded); re-running is safe.
 ### 6.4 Verify the schema matches the canonical source
 
 ```bash
-vps 'cd /var/www/tunevote_api && npm run verify-schema'    # exit 0 = live DB matches init.sql
+vps 'echo "$DEPLOY_SSH_PASSWORD" | sudo -S bash -c "cd /var/www/tunevote_api && npm run verify-schema"'    # exit 0 = OK
 ```
 
 Then re-run the §6.1 count query and confirm existing rows are unchanged.
 
 ---
 
-## 7. Deploy the frontend
+## 7. Deploy the frontend — to cPanel
 
-Build **locally** and upload the static artifacts. Do **not** build on the server
-(the archive's problem #7: the frontend ran on the VPS and wasted its resources).
+Build **locally**, upload the static `dist/` to the cPanel docroot over the SSH
+key. There is no build step, process, or nginx on the frontend host — it's plain
+Apache static hosting.
 
 ```bash
 cd ~/Documents/tunevote_frontend
-# ensure .env points VITE_API_URL at the prod backend for the prod build:
-#   VITE_API_URL=https://api.tunevote.com/
 npm ci
-npm run build                 # outputs to dist/
-```
-
-Confirm the bundle targets prod, then upload the **contents** of `dist/`
-(including any dotfiles) to the web root:
-
-```bash
+npm run build                 # dist/ — uses .env (VITE_API_URL=https://api.tunevote.com)
 grep -o 'https://api.tunevote.com' dist/assets/*.js | head -1   # must print the prod URL
-
-# ⚠️ CONFIRM the web root path first
-FE_ROOT=/var/www/html
-sshpass -p "$DEPLOY_SSH_PASSWORD" rsync -az --delete -e "ssh -p ${DEPLOY_SSH_PORT:-22} -o StrictHostKeyChecking=accept-new" \
-  dist/ "$DEPLOY_SSH_USER@$DEPLOY_SSH_HOST:$FE_ROOT/"
+test -f dist/.htaccess && echo ".htaccess present"              # SPA fallback (from public/.htaccess)
 ```
 
-`--delete` removes stale old-build files so no orphaned hashed chunks linger. If
-`rsync` isn't available on the server, `scp -r dist/. ...` works but leaves old
-files behind — clear the directory first in that case.
-
-Static files need no service restart. Only reload nginx if you changed nginx
-config:
+Upload the **contents** of `dist/` (including the dotfile `.htaccess`) with
+`--delete` so stale hashed chunks are removed:
 
 ```bash
-vps 'sudo nginx -t && sudo systemctl reload nginx'
+rsync -az --delete -e "ssh -i ~/.ssh/id_ed25519_tunevote_cpanel -o StrictHostKeyChecking=accept-new" \
+  dist/ gr41l1kzrrhf@132.148.178.39:~/public_html/app.tunevote.com/
 ```
+
+> If `rsync` isn't available, zip and extract instead:
+> `cd dist && zip -qr /tmp/fe.zip . && scp -i ~/.ssh/id_ed25519_tunevote_cpanel /tmp/fe.zip gr41l1kzrrhf@132.148.178.39:~/ && cpanel 'cd ~/public_html/app.tunevote.com && rm -rf assets icons && unzip -o ~/fe.zip && rm ~/fe.zip'`
+
+Nothing to restart. The `.htaccess` provides the SPA fallback; Apache picks up new
+files immediately. HTTPS is handled by cPanel **AutoSSL** (already provisioned).
 
 ---
 
@@ -285,19 +320,22 @@ These confirm the *deployment* worked — not that a feature works (that's the
 user's testing). All should be green before you report done.
 
 ```bash
-# Backend process is up
-vps 'pm2 status | grep tunevote_api'
+# Backend (VPS) process is up
+vps 'echo "$DEPLOY_SSH_PASSWORD" | sudo -S pm2 status | grep tunevote_api'
 
-# Endpoints answer
-curl -s -o /dev/null -w "api:       %{http_code}\n" https://api.tunevote.com/
-curl -s -o /dev/null -w "dashboard: %{http_code}\n" https://app.tunevote.com/
+# Endpoints answer (a real backend route, not "/" which 404s)
+curl -s -o /dev/null -w "api:       %{http_code}\n" https://api.tunevote.com/top-today   # expect 200
+curl -s -o /dev/null -w "dashboard: %{http_code}\n" https://app.tunevote.com/            # expect 200
 
-# The live dashboard references the bundle you just built (hashes match)
+# The live frontend references the bundle you just built (hashes match)
 curl -s https://app.tunevote.com/ | grep -o 'assets/index-[A-Za-z0-9_-]*\.js' | head -1
 ls ~/Documents/tunevote_frontend/dist/assets/ | grep -o 'index-[A-Za-z0-9_-]*\.js' | head -1
 
+# If DNS is still propagating, test the frontend against the cPanel IP directly:
+curl -sk --resolve app.tunevote.com:443:132.148.178.39 -o /dev/null -w "cpanel: %{http_code}\n" https://app.tunevote.com/
+
 # If a migration ran, it's recorded
-vps 'cd /var/www/tunevote_api && npm run migrate:status'
+vps 'echo "$DEPLOY_SSH_PASSWORD" | sudo -S bash -c "cd /var/www/tunevote_api && npm run migrate:status"'
 ```
 
 Report the results to the user and hand off for feature testing.
@@ -306,14 +344,16 @@ Report the results to the user and hand off for feature testing.
 
 ## 9. Rolling back
 
-**Backend code** — redeploy the previous commit:
+**Backend code** (VPS, as root) — redeploy the previous commit:
 
 ```bash
-vps 'cd /var/www/tunevote_api && git reset --hard <previous-commit> && npm ci --omit=dev && pm2 restart tunevote_api'
+vps 'echo "$DEPLOY_SSH_PASSWORD" | sudo -S bash -c "cd /var/www/tunevote_api && git reset --hard <previous-commit> && npm ci --omit=dev && pm2 restart tunevote_api"'
 ```
 
-**Frontend** — rebuild the previous commit locally and re-run §7, or keep the
-prior `dist/` and re-upload it.
+**Frontend** (cPanel) — rebuild the previous commit locally and re-run §7's
+`rsync`, or keep the prior `dist/` and re-upload it. The nginx-config backup from
+the migration (`/root/nginx-sites-backup-*.tgz` on the VPS) restores the *old*
+single-host setup if you ever need to move the frontend back to the VPS.
 
 **Database** — restore the pre-migration dump from §6.2:
 
@@ -330,14 +370,14 @@ vps 'set -a; . /var/www/tunevote_api/.env; set +a
 ## 10. Deployment checklist
 
 - [ ] Change committed and pushed to `origin/main`
-- [ ] (Backend) `git reset --hard origin/main` + `npm ci --omit=dev` on the server
+- [ ] (Backend, VPS via sudo) `git reset --hard origin/main` + `npm ci --omit=dev`
 - [ ] (Schema) Row counts recorded **before** touching the DB
 - [ ] (Schema) Database backed up, dump verified non-empty
 - [ ] (Schema) `migrate:status` reviewed → `migrate:latest` applied → `verify-schema` exit 0
-- [ ] (Backend) `pm2 restart tunevote_api`, status **online**, `pm2 save`
-- [ ] (Frontend) Built locally against prod `.env`, bundle targets `api.tunevote.com`
-- [ ] (Frontend) `dist/` uploaded with `--delete`, live hash matches local hash
-- [ ] Endpoints return expected HTTP codes
+- [ ] (Backend) `sudo pm2 restart tunevote_api`, status **online**, `sudo pm2 save`
+- [ ] (Frontend) Built locally, bundle targets `api.tunevote.com`, `.htaccess` present
+- [ ] (Frontend, cPanel) `dist/` rsynced to `~/public_html/app.tunevote.com` with `--delete`, live hash matches
+- [ ] Endpoints: `api.tunevote.com/top-today` 200, `app.tunevote.com/` 200
 - [ ] Results reported → handed to user for feature testing
 
 ---
