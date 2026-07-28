@@ -21,8 +21,8 @@ router.post("/youtube-cache", async (req, res) => {
   try {
     await pool.query(
       `
-      INSERT INTO youtube_video_cache (title_norm, title, youtube_id, thumbnail)
-      VALUES (?, ?, ?, ?)
+      INSERT INTO youtube_video_cache (title_norm, title, youtube_id, thumbnail, public_id)
+      VALUES (?, ?, ?, ?, UUID())
       ON DUPLICATE KEY UPDATE
         title = VALUES(title),
         thumbnail = VALUES(thumbnail)
@@ -81,9 +81,9 @@ router.get("/youtube-info/:id", async (req, res) => {
 
     // 3. **In Cache schreiben**
     await pool.query(
-      `INSERT INTO youtube_video_cache 
-       (youtube_id, title, thumbnail, title_norm, duration) 
-       VALUES (?, ?, ?, ?, ?)`,
+      `INSERT INTO youtube_video_cache
+       (youtube_id, title, thumbnail, title_norm, duration, public_id)
+       VALUES (?, ?, ?, ?, ?, UUID())`,
       [
         id,
         title,

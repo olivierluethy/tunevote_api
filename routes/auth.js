@@ -61,7 +61,7 @@ router.post("/register", async (req, res) => {
     // 3. Neuer Benutzer anlegen
     const password_hash = await bcrypt.hash(password, 10);
     const [result] = await pool.query(
-      "INSERT INTO users (username, email, password_hash) VALUES (?, ?, ?)",
+      "INSERT INTO users (username, email, password_hash, public_id) VALUES (?, ?, ?, UUID())",
       [finalUsername, email, password_hash]
     );
 

@@ -509,9 +509,9 @@ Output ONLY a JSON array, nothing else:
           }
 
           await pool.query(
-            `INSERT INTO youtube_video_cache (youtube_id, title, title_norm, thumbnail, duration)
-             VALUES (?, ?, ?, ?, ?)
-             ON DUPLICATE KEY UPDATE 
+            `INSERT INTO youtube_video_cache (youtube_id, title, title_norm, thumbnail, duration, public_id)
+             VALUES (?, ?, ?, ?, ?, UUID())
+             ON DUPLICATE KEY UPDATE
                title = VALUES(title),
                title_norm = VALUES(title_norm),
                thumbnail = VALUES(thumbnail),
@@ -869,8 +869,8 @@ router.post("/sessions/:id/proposals", async (req, res) => {
         duration = parseInt(videoDetails.lengthSeconds) || 0;
 
         await pool.query(
-          `INSERT INTO youtube_video_cache (youtube_id, title, title_norm, thumbnail, duration)
-           VALUES (?, ?, ?, ?, ?)`,
+          `INSERT INTO youtube_video_cache (youtube_id, title, title_norm, thumbnail, duration, public_id)
+           VALUES (?, ?, ?, ?, ?, UUID())`,
           [videoId, title, normalize(title), thumbnail, duration]
         );
       } catch (ytdlErr) {

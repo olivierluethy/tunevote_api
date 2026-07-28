@@ -49,8 +49,10 @@ CREATE TABLE users (
   imageType varchar(255),
   imageData longblob,
   image_source_url varchar(1024) DEFAULT NULL,
+  public_id CHAR(36) DEFAULT NULL,
   UNIQUE KEY username (username),
-  UNIQUE KEY email (email)
+  UNIQUE KEY email (email),
+  UNIQUE KEY uq_users_public_id (public_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE guest_users (
@@ -67,7 +69,9 @@ CREATE TABLE artists (
   name_norm VARCHAR(255) NOT NULL,
   image_url TEXT,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  channel_id VARCHAR(255) DEFAULT NULL UNIQUE
+  channel_id VARCHAR(255) DEFAULT NULL UNIQUE,
+  public_id CHAR(36) DEFAULT NULL,
+  UNIQUE KEY uq_artists_public_id (public_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE youtube_video_cache (
@@ -79,6 +83,8 @@ CREATE TABLE youtube_video_cache (
   duration INT DEFAULT NULL,
   thumbnail TEXT,
   cached_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  public_id CHAR(36) DEFAULT NULL,
+  UNIQUE KEY uq_youtube_video_cache_public_id (public_id),
   FOREIGN KEY (artist_id) REFERENCES artists(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
@@ -91,7 +97,9 @@ CREATE TABLE sessions (
   ended_at TIMESTAMP NULL DEFAULT NULL,
   is_live TINYINT(1) DEFAULT '0',
   is_private TINYINT(1) DEFAULT 0,
+  public_id CHAR(36) DEFAULT NULL,
   KEY user_id (user_id),
+  UNIQUE KEY uq_sessions_public_id (public_id),
   CONSTRAINT sessions_ibfk_1 FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
@@ -391,7 +399,8 @@ CREATE TABLE shouts (
     message TEXT NOT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    
+    is_edited TINYINT(1) NOT NULL DEFAULT 0, -- vom Autor bearbeitet
+
     -- Optional: um Löschungen/Moderation zu unterstützen
     is_deleted TINYINT(1) DEFAULT 0,
     deleted_at DATETIME DEFAULT NULL,
@@ -409,6 +418,7 @@ CREATE TABLE shout_likes (
     id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
     shout_id INT NOT NULL,
     user_id INT NOT NULL,
+    value TINYINT NOT NULL DEFAULT 1, -- 1 = like (thumbs up), -1 = dislike (thumbs down)
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
     UNIQUE KEY unique_like (shout_id, user_id),

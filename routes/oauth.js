@@ -81,7 +81,7 @@ router.get("/auth/google/callback", async (req, res) => {
     if (!user) {
       // ─── Neuer User ───
       const [result] = await pool.query(
-        "INSERT INTO users (google_id, email, username, imageUrl) VALUES (?, ?, ?, ?)",
+        "INSERT INTO users (google_id, email, username, imageUrl, public_id) VALUES (?, ?, ?, ?, UUID())",
         [googleId, email, newUsername, newImageUrl]
       );
 
@@ -200,7 +200,7 @@ router.get("/auth/facebook/callback", async (req, res) => {
     if (!user) {
       // ─── Neuer User (weder Facebook-ID noch E-Mail bekannt) ───
       const [result] = await pool.query(
-        "INSERT INTO users (facebook_id, email, username, imageUrl) VALUES (?, ?, ?, ?)",
+        "INSERT INTO users (facebook_id, email, username, imageUrl, public_id) VALUES (?, ?, ?, ?, UUID())",
         [facebookId, email, newUsername, newImageUrl]
       );
 
