@@ -46,7 +46,8 @@
  *  5. Detection over blind conversion: selection is the round-trip test above,
  *     not a hardcoded string list.
  *  6. Verifiable: re-runs the HEX() check on the Rag'n'Bone Man rows and prints a
- *     scanned / changed / skipped / unrepairable summary.
+ *     scanned / changed / clean summary. Applies loop-until-dry so multi-level
+ *     (triple-)encoded rows fully converge in a single invocation.
  *  7. Covers every user-visible text column found in diagnosis (see TARGETS).
  *
  * USAGE
@@ -105,10 +106,6 @@ const latin1Lossless = (c) =>
 const mojibakeCond = (c) =>
   `${c} IS NOT NULL AND ${repaired(c)} IS NOT NULL ` +
   `AND HEX(${repaired(c)}) <> HEX(${c}) AND ${latin1Lossless(c)}`;
-// "Looks like double-encoding but can't be safely reversed" — for logging.
-const unrepairableCond = (c) =>
-  `${c} IS NOT NULL AND ${repaired(c)} IS NULL AND ${latin1Lossless(c)} ` +
-  `AND (HEX(${c}) LIKE '%C382%' OR HEX(${c}) LIKE '%C383%' OR HEX(${c}) LIKE '%C3A2%')`;
 
 // ---------------------------------------------------------------------------
 // Arg parsing
@@ -248,7 +245,7 @@ async function main() {
   const logStream = fs.createWriteStream(logPath, { flags: "a" });
   const logLine = (o) => logStream.write(JSON.stringify(o) + "\n");
 
-  const totals = { scanned: 0, toChange: 0, changed: 0, unrepairable: 0 };
+  const totals = { scanned: 0, toChange: 0, changed: 0 };
   const samples = [];
 
   try {
@@ -262,12 +259,8 @@ async function main() {
       const [[{ n: toChange }]] = await pool.query(
         `SELECT COUNT(*) AS n FROM ${t} WHERE ${mojibakeCond(c)}`,
       );
-      const [[{ n: unrep }]] = await pool.query(
-        `SELECT COUNT(*) AS n FROM ${t} WHERE ${unrepairableCond(c)}`,
-      );
       totals.scanned += total;
       totals.toChange += toChange;
-      totals.unrepairable += unrep;
 
       // Collect a few before/after samples for the report.
       if (toChange > 0 && samples.length < opts.samples) {
@@ -279,53 +272,61 @@ async function main() {
         for (const r of rows) samples.push({ table, id: r.id, before: r.before_val, after: r.after_val });
       }
 
-      // Log the unrepairable candidates (skipped, never written).
-      if (unrep > 0) {
-        const [rows] = await pool.query(
-          `SELECT id, ${c} AS val, HEX(${c}) AS hexv FROM ${t} WHERE ${unrepairableCond(c)}`,
-        );
-        for (const r of rows) logLine({ kind: "unrepairable", table, column, id: r.id, value: r.val, hex: r.hexv });
-      }
-
       let changed = 0;
+      let passes = 0;
       if (opts.apply && toChange > 0) {
-        // Chunked, byte-exact, concurrency-guarded repair. We SELECT a batch,
-        // log each (id, before, after) for a full reversible audit trail, then
-        // UPDATE by PK with a HEX() guard so a row edited underneath us is never
-        // clobbered. The UPDATE recomputes the value with MySQL's own CONVERT so
-        // the written bytes are exactly the detected repair.
-        let lastId = 0;
+        // Loop-until-dry: repeat the full chunked pass until a pass changes zero
+        // rows. This converges multi-level (triple-)encoding — one pass peels one
+        // layer — and mops up any row skipped by the concurrency guard. Bounded
+        // by MAX_PASSES as a safety backstop.
+        const MAX_PASSES = 12;
         for (;;) {
-          const [rows] = await pool.query(
-            `SELECT id, ${c} AS before_val, HEX(${c}) AS hexbefore, ${repaired(c)} AS after_val
-               FROM ${t} WHERE ${mojibakeCond(c)} AND id > ? ORDER BY id LIMIT ?`,
-            [lastId, CHUNK],
-          );
-          if (rows.length === 0) break;
-          const conn = await pool.getConnection();
-          try {
-            await conn.beginTransaction();
-            for (const r of rows) {
-              const [res] = await conn.query(
-                `UPDATE ${t} SET ${c} = ${repaired(c)} WHERE id = ? AND HEX(${c}) = ?`,
-                [r.id, r.hexbefore],
-              );
-              if (res.affectedRows === 1) {
-                changed++;
-                logLine({ kind: "changed", table, column, id: r.id, before: r.before_val, after: r.after_val });
-              } else {
-                logLine({ kind: "skip-concurrent", table, column, id: r.id });
+          passes++;
+          let changedThisPass = 0;
+          let lastId = 0;
+          // Chunked, byte-exact, concurrency-guarded repair. SELECT a batch, log
+          // each (id, before, after) for a reversible audit trail, then UPDATE by
+          // PK with a HEX() guard so a row edited underneath us is never clobbered.
+          // The UPDATE recomputes the value with MySQL's own CONVERT so the written
+          // bytes are exactly the detected repair.
+          for (;;) {
+            const [rows] = await pool.query(
+              `SELECT id, ${c} AS before_val, HEX(${c}) AS hexbefore, ${repaired(c)} AS after_val
+                 FROM ${t} WHERE ${mojibakeCond(c)} AND id > ? ORDER BY id LIMIT ?`,
+              [lastId, CHUNK],
+            );
+            if (rows.length === 0) break;
+            const conn = await pool.getConnection();
+            try {
+              await conn.beginTransaction();
+              for (const r of rows) {
+                const [res] = await conn.query(
+                  `UPDATE ${t} SET ${c} = ${repaired(c)} WHERE id = ? AND HEX(${c}) = ?`,
+                  [r.id, r.hexbefore],
+                );
+                if (res.affectedRows === 1) {
+                  changedThisPass++;
+                  logLine({ kind: "changed", pass: passes, table, column, id: r.id, before: r.before_val, after: r.after_val });
+                } else {
+                  logLine({ kind: "skip-concurrent", pass: passes, table, column, id: r.id });
+                }
               }
+              await conn.commit();
+            } catch (e) {
+              await conn.rollback();
+              throw e;
+            } finally {
+              conn.release();
             }
-            await conn.commit();
-          } catch (e) {
-            await conn.rollback();
-            throw e;
-          } finally {
-            conn.release();
+            lastId = rows[rows.length - 1].id;
           }
-          lastId = rows[rows.length - 1].id;
-          if (changed % 5000 < CHUNK && changed > 0) console.log(`   … ${table}.${column}: ${changed} changed so far`);
+          changed += changedThisPass;
+          if (changedThisPass > 0) console.log(`   … ${table}.${column}: pass ${passes} changed ${changedThisPass}`);
+          if (changedThisPass === 0) break;
+          if (passes >= MAX_PASSES) {
+            console.warn(`   ⚠ ${table}.${column}: stopped after ${MAX_PASSES} passes (still converging?)`);
+            break;
+          }
         }
       }
       totals.changed += changed;
@@ -333,7 +334,7 @@ async function main() {
       const verb = opts.apply ? "changed" : "would change";
       console.log(
         `• ${table}.${column}: scanned ${total}, ${verb} ${opts.apply ? changed : toChange}` +
-          (unrep ? `, unrepairable ${unrep} (logged, skipped)` : ""),
+          (opts.apply && passes > 1 ? ` (over ${passes - 1} pass${passes - 1 === 1 ? "" : "es"}, multi-level)` : ""),
       );
     }
 
@@ -374,8 +375,7 @@ async function main() {
     console.log("========================= SUMMARY =========================");
     console.log(`Rows scanned          : ${totals.scanned}`);
     console.log(`Rows ${opts.apply ? "changed          " : "to change        "}: ${opts.apply ? totals.changed : totals.toChange}`);
-    console.log(`Rows skipped (clean)  : ${totals.scanned - (opts.apply ? totals.changed : totals.toChange)}`);
-    console.log(`Rows unrepairable     : ${totals.unrepairable} (logged, never written)`);
+    console.log(`Rows clean (untouched): ${totals.scanned - totals.toChange}`);
     console.log(`Remaining mojibake in youtube_video_cache.title: ${remaining}`);
     console.log(`Log file              : ${logPath}`);
     if (!opts.apply) {
