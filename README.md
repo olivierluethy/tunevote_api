@@ -1,51 +1,160 @@
-URLs:
+# TuneVote — API
 
-http://localhost:8080/index.php?route=/sql&pos=0&db=tunevote&table=session_participants
-http://phpmyadmin.tunevote.com/index.php?route=/database/structure&db=tunevote
-http://phpmyadmin.tunevote.com/index.php?route=/database/export&db=tunevote
-http://localhost:8080/index.php?route=/sql&pos=0&db=tunevote&table=sessions
-https://ksuite.infomaniak.com/1556868/mail/1
-https://www.billboard.com/lists/best-rappers-all-time/2-kendrick-lamar/
-https://www.last.fm/music/NF/+similar
-https://tripx-api-test.dp-applications.ch/
-https://france4fans.com/blog/f/10-erfolgreiche-franz%C3%B6sische-s%C3%A4nger
-https://kworb.net/spotify/listeners.html
-https://www.google.com/search?q=music+voting+app&oq=music+voting+app&gs_lcrp=EgZjaHJvbWUyBggAEEUYOTIGCAEQRRg9MgYIAhBFGD0yBggDEEUYPdIBCDI1OTBqMGowqAIAsAIA&sourceid=chrome&ie=UTF-8
-https://www.google.com/search?q=gr%C3%B6sste+schweizer+musiker&oq=gr%C3%B6sste+schweizer+musiker&gs_lcrp=EgZjaHJvbWUqBwgAEAAYgAQyBwgAEAAYgAQyCggBEAAYgAQYogQyCggCEAAYogQYiQXSAQg0MTc1ajBqMagCALACAA&sourceid=chrome&ie=UTF-8
-https://www.google.com/search?q=beste+franz%C3%B6sische+musiker&oq=beste+franz%C3%B6sische+musiker&gs_lcrp=EgZjaHJvbWUyBggAEEUYOTIHCAEQABiABDIHCAIQABjvBTIHCAMQABjvBTIHCAQQABjvBdIBCDQ3OTBqMGoxqAIAsAIA&sourceid=chrome&ie=UTF-8
-https://www.google.com/search?q=gr%C3%B6sste+italienische+musiker&oq=gr%C3%B6sste+italienische+musiker&gs_lcrp=EgZjaHJvbWUyCggAEEUYFhgeGDkyCggBEAAYogQYiQUyCggCEAAYgAQYogQyBwgDEAAY7wUyCggEEAAYgAQYogQyCggFEAAYogQYiQXSAQg0ODk5ajBqMagCALACAA&sourceid=chrome&ie=UTF-8
-https://www.lingoda.com/blog/de/schweizer-musiker/
-https://popkultur.de/die-erfolgreichsten-italienischen-saenger-und-saengerinnen-aller-zeiten/
-https://stackoverflow.com/questions/7696924/how-do-i-create-multiline-comments-in-python
-https://github.com/BaskLash/jdl-expo/blob/df53483c2a3ae6beb53f58e3f9bcf088da191485/goat.py
-https://github.com/BaskLash/jdl-expo/blob/1c603564216a1e4537b11f63b20a2cd32d757463/unique_channels.txt
-https://github.com/BaskLash/jdl-expo/blob/a8b87181b6eb230f848090c69ee2a705422fc226/unique_channels.txt
-https://developers.facebook.com/docs/facebook-login/web
-https://developers.facebook.com/apps/1224999756429913/use_cases/customize/?use_case_enum=FB_LOGIN&selected_tab=settings&product_route=fb-login
-https://console.cloud.google.com/welcome?project=tunevote-477521
-https://github.com/BaskLash/tunevote_frontend/commits/main/?after=06d6737795057cca140fd650838a8d2e87f76f56+34
-https://github.com/BaskLash/tunevote_frontend/blob/7df699877be312f0c65040ebc3d30b572afad5ec/src/components/SessionPage.jsx
-https://github.com/BaskLash/tunevote_frontend/blob/a4cba12661621388282c98d8a3d529d8ed904386/src/components/SessionPage.jsx
-https://github.com/BaskLash/tunevote_api/blob/e7f3856cd6cd396e42b8cbf67a105f7d47434bde/index.js
-https://github.com/BaskLash/tunevote_frontend/blob/main/src/components/SessionPage.jsx
-https://github.com/BaskLash/tunevote_frontend/tree/726e6e36ff7e8e8183fc7f1afcf250d39559c1ca
-https://github.com/BaskLash/tunevote_api/tree/d14ff613e4e6d0b9dc6f8b52a8de101b6ca96f0c
-https://github.com/BaskLash/tunevote_frontend/commit/3e0a13e7a2fd3af70379719970e762a84074c260
-https://github.com/BaskLash/tunevote_frontend/tree/9f93e46f8e3e53ed174602606665226df97520c7
-https://console.cloud.google.com/auth/clients/995921910794-26m1bfqr15gk4mjefhbadd5pn8fdaucc.apps.googleusercontent.com?project=tunevote-477521
-https://grok.com/c/c9c9b9c6-6990-4d47-8451-22b448bde5e6
-https://grok.com/c/773ec5a8-7275-44a6-9d0a-c51d901aae20
-https://grok.com/c/e6ce95c6-355e-48c8-8656-ea4229982364
-https://grok.com/c/c1e915a5-1460-4cab-bf95-7b80038e7918
-https://grok.com/c/2462c32a-220c-4469-8fe0-e2eafe5db0a1
-https://grok.com/c/46d7327e-9482-4241-803e-0ab7df06b01f
-https://chatgpt.com/c/68fbda18-442c-832b-b771-05c24f65270e
-https://chatgpt.com/c/68fab085-e148-8333-ae25-827c57b1e9f2
-https://chatgpt.com/c/69284352-006c-8327-8c46-d7d529268dff
-https://chatgpt.com/c/68fa99b1-f1b8-832f-bd6f-f075728d39ef
-https://chatgpt.com/c/68fbc72d-5128-8333-b1d1-0d79055821b7
-https://chatgpt.com/c/68fa7a17-4424-8329-897c-601fdc7302a7
-https://chatgpt.com/c/68fb402d-5a7c-8328-b6b6-704d934a2625
-https://chatgpt.com/c/68f9554e-91f8-8327-aa4e-41facb7d8614
-https://chatgpt.com/c/68fb71d5-2084-8329-a6c2-cdc6a7f9e59a
-https://chatgpt.com/g/g-p-68dae3585d8081918c49317d400d02f5-chrome-extension/c/689876d6-2e60-8322-9005-09736f4f3db6
+The **backend** for TuneVote, a real-time collaborative music-listening app. People join a shared listening room ("session"), suggest YouTube songs, and vote in rounds to decide what plays next — with everyone's audio kept in sync across devices.
+
+This repository is the **server**: it owns all business logic, the database, authentication, real-time events, and the server-authoritative playback engine. The companion web client, [`tunevote_frontend`](https://github.com/olivierluethy/tunevote_frontend), is a thin UI that talks to this API over REST + WebSockets.
+
+## What it does
+
+- **Accounts & auth** — email/password signup and login (bcrypt-hashed), stateless **JWT** (7-day expiry) verified per request, plus **Google & Facebook OAuth** with account linking by email. Anonymous **guests** get a UUID token so they can join sessions without registering. Password reset over email.
+- **Sessions & voting engine** — hosts create public or private rooms; the app runs repeating rounds of *suggestion phase (90s) → voting phase (60s) → winner*. Winners are chosen with a quorum threshold, then played. All of this is driven by per-session phase timers.
+- **Server-authoritative playback** — the currently playing song and its start time are derived from the database (the `queue_items` row with `status='playing'`), and `GET /sessions/:id/playback-sync` returns the server clock so every client can correct for clock skew. A background **reconciler** loop (every 2s) advances finished songs, reaps stale participants, closes empty rooms, and is crash-safe (it rebuilds its work from the DB on boot).
+- **AI auto-fill & recommendations** — when an occupied room runs dry, OpenAI generates "Artist – Title" suggestions (seeded by the room's own taste), which are matched against the YouTube cache / YouTube Data API and inserted as votable AI picks.
+- **Real-time events** — Socket.IO broadcasts session start, voting-phase changes, round completion, queue/proposal updates, playback sync, live participant counts, and invite acceptances. Clients send heartbeats to maintain presence.
+- **Invitations** — email invites for private sessions, with accept/reject/revoke and participant management.
+- **Profiles, stats & social** — profile editing, profile images (stored as blobs in the DB), rich listening statistics (win streaks, top songs/artists, listen minutes), public user & artist pages, and a threaded artist "shouts" wall with likes. Gamification badges are seeded in the schema.
+
+## Tech stack
+
+- **Node.js** + **Express 5** (CommonJS), listens on **port 4000**
+- **MySQL 8** — runtime queries via a raw **mysql2/promise** pool; **Knex** used only for migrations
+- **Socket.IO 4** for real-time
+- **jsonwebtoken** + **bcrypt** + **uuid** for auth (users and guests)
+- **nodemailer** for email (Gmail transport is the active one)
+- **openai** SDK (default model `gpt-4o-mini`) for recommendations/auto-fill
+- **@distube/ytdl-core** + YouTube Data API v3 for video metadata & search
+- **multer** for profile-image uploads
+- **docker-compose** provisions MySQL 8 + phpMyAdmin for local dev (the app itself runs separately)
+
+## Architecture at a glance
+
+```
+index.js                # app bootstrap: mounts routers, starts HTTP server + Socket.IO + scheduler
+db.js                   # mysql2 connection pool (runtime queries)
+knexfile.js             # Knex config — migrations only
+lib/io.js               # Socket.IO singleton
+socket.js               # Socket.IO handlers (join room, heartbeat, disconnect)
+routes/                 # HTTP endpoints, grouped by resource
+services/
+  auth.js               # resolve user/guest from token
+  playback.js           # voting rounds, phase timers, winner + quorum logic
+  scheduler.js          # 2s reconciler loop (advance songs, reap participants, AI auto-fill)
+  recommendations.js    # AI song suggestions
+  openai.js             # OpenAI client wrapper
+  mailer.js             # Gmail transport (password reset + invites)
+init.sql                # canonical schema — the single source of truth
+migrations/             # Knex migrations (idempotent, INFORMATION_SCHEMA-guarded)
+docs/                   # engineering journal + architecture notes (start at docs/README.md)
+```
+
+## API endpoints
+
+All routers are mounted at the root (no `/api` prefix). Auth is read per-handler from the `Authorization: Bearer <jwt>` and/or `x-guest-token` headers.
+
+**Auth & accounts** — `POST /register`, `POST /login`, `POST /guest/join`
+**OAuth** — `GET /auth/google[/callback]`, `GET /auth/facebook[/callback]`
+**Password reset** — `POST /forgot-password`, `GET /reset-password/:token`, `POST /reset-password`
+**Profile & stats** — `GET|POST /profile`, `POST|DELETE /profile/image`, `GET /profile/user-stats`, `GET /profile/listening-summary`, `GET /profile/recent-listens`, `GET /profile/artist/:artistId/insights`
+**Sessions & playback** — `GET|POST /sessions`, `GET|PATCH|DELETE /sessions/:id`, `GET /sessions/:id/queue`, `POST /sessions/:id/queue/add`, `POST /sessions/:id/start`, `POST /sessions/:id/join-live`, `POST /sessions/:id/leave-live`, `GET /sessions/:id/playback-sync`, `GET /sessions/:id/live/stream`
+**Voting / proposals / recommendations** — `GET /sessions/:id/current-phase`, `POST|GET /sessions/:id/proposals`, `DELETE /sessions/:sessionId/proposals/:proposalId`, `POST /sessions/:id/proposals/:propId/vote`, `POST /voting-rounds/:id/close`, `GET /sessions/:id/recommendations`, `POST /sessions/:id/recommendations/add`
+**Invites & participants** — `POST /sessions/:sessionId/invite`, `GET /sessions/:id/invites/accepted`, `GET /invites/sent`, `GET /invites/received`, `POST /invites/:inviteId/{accept,reject,revoke}`, `GET /sessions/:sessionId/participants`
+**Artists / charts / shouts** — `GET /artist/:artistId`, `GET /user/:userId`, `GET /top-today`, `GET /top-weekly-songs`, `GET|POST /artist/:artistId/shouts`, `POST /shouts/:shoutId/like`, `DELETE /shouts/:shoutId`
+**YouTube cache** — `GET|POST /youtube-cache`, `GET /youtube-info/:id`
+
+## Database
+
+`init.sql` is the **canonical schema and single source of truth** (the dumps in `archive/` are non-authoritative). Core tables:
+
+- **users** / **guest_users** — registered accounts (with OAuth ids, reset tokens, profile blobs, Stripe subscription columns) and anonymous guests
+- **sessions** / **session_participants** / **session_invites** — rooms, presence, and email invites
+- **queue_items** — the central row for both proposals and playback (`status`, `item_type` music/pause, `item_source` user/guest/ai, voting round, timings)
+- **votes** / **voting_rounds** — upvotes and the per-round state machine (`state`: suggesting/voting/closed, with durations, quorum, winner)
+- **artists** / **youtube_video_cache** — canonical song metadata (title, thumbnail, duration) keyed by YouTube id
+- **playback_history** / **session_song_listens** — playback log + per-user listen events powering stats
+- **badges / user_badges / user_badge_progress** — gamification
+- **shouts / shout_likes** — artist fan-wall comments + likes
+
+## Getting started
+
+**Prerequisites:** Node.js 18+, Docker (for local MySQL), and a `.env` file (see below).
+
+```bash
+# 1. Install dependencies
+npm install
+
+# 2. Start MySQL + phpMyAdmin (phpMyAdmin at http://localhost:8080)
+docker compose up -d
+
+# 3. Load the canonical schema, then apply any pending migrations
+#    (import init.sql into the `tunevote` database, then:)
+npm run migrate:latest
+
+# 4. Run the server (listens on port 4000)
+node index.js
+```
+
+### Environment variables
+
+Create a `.env` file in the project root:
+
+```env
+# Database
+DB_HOST=localhost
+DB_USER=user
+DB_PASSWORD=userpass123!
+DB_NAME=tunevote
+DB_PORT=3306
+
+# Auth
+JWT_SECRET=your_jwt_secret
+
+# Google OAuth
+GOOGLE_CLIENT_ID=...
+GOOGLE_CLIENT_SECRET=...
+GOOGLE_CALLBACK_URL=...
+
+# Facebook OAuth
+FACEBOOK_CLIENT_ID=...
+FACEBOOK_CLIENT_SECRET=...
+FACEBOOK_CALLBACK_URL=...
+
+# Email (Gmail — used by password reset & invites)
+GMAIL_USER=...
+GMAIL_APP_PASSWORD=...
+
+# AI
+OPENAI_API_KEY=...
+OPENAI_MODEL=gpt-4o-mini        # optional, this is the default
+
+# YouTube Data API v3
+YOUTUBE_KEY=...
+
+# App
+FRONTEND_URL=http://localhost:5173/   # default in prod: https://app.tunevote.com/
+NODE_ENV=development
+AUTOFILL_DISABLED=false               # set true to turn off AI auto-fill
+```
+
+> A secondary cPanel SMTP transport (`email.js`, using `EMAIL_USER` / `EMAIL_PASSWORD`) also exists but is legacy — the active mailer is Gmail (`services/mailer.js`).
+
+### Scripts
+
+| Command | Description |
+|---|---|
+| `npm run migrate:latest` | Apply all pending Knex migrations |
+| `npm run migrate:status` | Show migration status |
+| `npm run migrate:up` / `migrate:rollback` | Step migrations up / roll back the last batch |
+| `npm run migrate:mark-baseline` | Mark the baseline migration as applied (skips it on `migrate:latest`) |
+| `npm run verify-schema` | Check the live DB against canonical `init.sql` (exit 0 = OK) |
+
+Notes:
+- There is **no `start` script** — run `node index.js` directly (production uses PM2).
+- `npm test` is **not** wired up. The real tests in `test/` run via a custom harness: `node test/run.js`.
+
+## Documentation
+
+See [`docs/`](docs/) for detailed engineering notes — start at [`docs/README.md`](docs/README.md). The engineering journal covers the backend modularization, the playback/DB reliability refactor, and a registry of fixed bugs. Production runs on a single Ubuntu box: the API under PM2 as `tunevote_api`, nginx serving the frontend build, and a local MySQL, with domains `api.tunevote.com` (this API) and `app.tunevote.com` (the frontend).
+
+## Related
+
+- Web client: [`tunevote_frontend`](https://github.com/olivierluethy/tunevote_frontend)
