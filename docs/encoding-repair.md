@@ -1,7 +1,12 @@
 # Production text-encoding repair (UTF-8 ← MySQL-latin1 double-encoding)
 
-**Status:** diagnosed, pipeline verified hardened, repair script ready.
-**Destructive step (`--apply`) NOT yet run — awaiting go-ahead.**
+**Status: DONE — applied to production on 2026-07-28.** 38,837 corrupt
+`youtube_video_cache.title` rows repaired (one legacy row was triple-encoded and
+took a second layer; the script's loop-until-dry handled it in the follow-up
+run). Final state: **0 remaining mojibake**; a re-run reports 0 changes; the live
+API returns `Rag’n’Bone Man - Guilty …` with the apostrophe as `E2 80 99`.
+Pre-repair backup: `/root/tunevote-backups/tunevote-pre-encoding-repair-20260728-205510.sql`
+(41 MB). The section below is retained as the diagnosis + runbook of record.
 
 Symptom: song titles with non-ASCII characters render garbled in production
 (`app.tunevote.com`) but correctly on localhost — e.g. `Rag’n’Bone Man - Guilty`
