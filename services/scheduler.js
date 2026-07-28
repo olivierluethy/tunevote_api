@@ -34,7 +34,11 @@ const AUTOFILL_COOLDOWN_EMPTY_MS = 300_000;
 
 let timer = null;
 
-async function reconcileOnce({ graceSeconds = 30, autoFillEnabled = true } = {}) {
+async function reconcileOnce({
+  graceSeconds = 30,
+  emptyGraceSeconds = 600,
+  autoFillEnabled = true,
+} = {}) {
   let advanced = 0;
   let ended = 0;
   let autoFilled = 0;
@@ -98,6 +102,38 @@ async function reconcileOnce({ graceSeconds = 30, autoFillEnabled = true } = {})
            WHERE v.session_id = s.id AND v.state IN ('suggesting','voting'))`,
   );
   for (const s of dead) {
+    const [r] = await pool.query(
+      `UPDATE sessions SET is_live = 0, status = 'ended', ended_at = NOW() WHERE id = ? AND is_live = 1`,
+      [s.id],
+    );
+    if (r.affectedRows) ended++;
+  }
+
+  // 3b) End sessions everyone has abandoned: still 'live', but no participant has
+  //     been present for `emptyGraceSeconds`. Unlike phase 3 this deliberately
+  //     does NOT require the queue or an open voting round to be empty — a host
+  //     who simply closes the tab leaves queued songs (and sometimes an open
+  //     round) behind, and phase 3's `NOT EXISTS queue_items` then never fires,
+  //     stranding the session "live" forever. Presence, not leftover content,
+  //     decides a session is dead. The grace window (each participant's
+  //     last_seen, or the session's created_at when nobody ever joined)
+  //     tolerates brief disconnects/reconnects so we never end a session someone
+  //     is still in — a returning user heartbeats and is excluded next tick.
+  const [abandoned] = await pool.query(
+    `SELECT s.id
+       FROM sessions s
+      WHERE s.status = 'live'
+        AND NOT EXISTS (
+          SELECT 1 FROM session_participants p
+           WHERE p.session_id = s.id AND p.is_live = 1)
+        AND COALESCE(
+              (SELECT MAX(p.last_seen) FROM session_participants p
+                WHERE p.session_id = s.id),
+              s.created_at
+            ) < DATE_SUB(NOW(), INTERVAL ? SECOND)`,
+    [emptyGraceSeconds],
+  );
+  for (const s of abandoned) {
     const [r] = await pool.query(
       `UPDATE sessions SET is_live = 0, status = 'ended', ended_at = NOW() WHERE id = ? AND is_live = 1`,
       [s.id],
@@ -173,13 +209,17 @@ async function reconcileOnce({ graceSeconds = 30, autoFillEnabled = true } = {})
   return { advanced, ended, autoFilled };
 }
 
-function startReconciler({ intervalMs = 2000, graceSeconds = 30 } = {}) {
+function startReconciler({
+  intervalMs = 2000,
+  graceSeconds = 30,
+  emptyGraceSeconds = 600,
+} = {}) {
   if (timer) return;
   // Server-authoritative AI auto-fill is ON by default; set AUTOFILL_DISABLED=true
   // (then restart) to instantly turn it off if it ever misbehaves.
   const autoFillEnabled = process.env.AUTOFILL_DISABLED !== "true";
   const tick = () =>
-    reconcileOnce({ graceSeconds, autoFillEnabled }).catch((e) =>
+    reconcileOnce({ graceSeconds, emptyGraceSeconds, autoFillEnabled }).catch((e) =>
       console.error("reconciler tick failed:", e.message),
     );
   tick(); // immediate pass on boot rebuilds overdue work
