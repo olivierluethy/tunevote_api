@@ -10,6 +10,10 @@ everything here is driven from committed code and environment variables — no
 hand-editing URLs before a push, no building on the server, no typing the DB
 password on a command line.
 
+**If anything goes wrong, read [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) first** —
+it lists TuneVote's real failure modes (API down after deploy, migration/schema
+drift, stale frontend build, Socket.IO not connecting, YouTube quota) with fixes.
+
 > **Scope of "testing" in this document.** This runbook only verifies that the
 > deploy itself *mechanically succeeded*: the process is back online, the
 > endpoints answer, the migration is recorded. **Functional / feature testing is
