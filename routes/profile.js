@@ -1402,7 +1402,6 @@ router.post("/profile/email-new-password", async (req, res) => {
       </div>`;
 
     await transporter.sendMail({
-      from: `"TuneVote" <${process.env.GMAIL_USER}>`,
       to: email,
       subject: "🔐 Dein neues TuneVote-Passwort",
       text: `Hallo ${username},\n\nDein Passwort wurde zurückgesetzt. Dein neues Passwort lautet:\n\n${newPassword}\n\nBitte speichere es sicher und ändere es nach dem Login, wenn du möchtest.\n\n– TuneVote`,
