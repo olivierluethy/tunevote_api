@@ -379,7 +379,6 @@ router.post("/sessions/:sessionId/invite", async (req, res) => {
     // === 5. E-Mail versenden ===
     try {
       await transporter.sendMail({
-        from: `"TuneVote" <${process.env.GMAIL_USER}>`,
         to: email,
         subject,
         text: userExists

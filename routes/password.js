@@ -126,7 +126,6 @@ router.post("/forgot-password", async (req, res) => {
     // E-Mail versenden
     try {
       await transporter.sendMail({
-        from: `"TuneVote" <${process.env.GMAIL_USER}>`,
         to: email,
         subject: "🔑 Passwort zurücksetzen – TuneVote",
         text: `Klicke hier, um dein Passwort zurückzusetzen (gültig für 1 Stunde): ${resetLink}\n\nFalls du diese Anfrage nicht gestellt hast, ignoriere diese E-Mail.`,
