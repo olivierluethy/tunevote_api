@@ -4,7 +4,7 @@ const crypto = require("crypto");
 const bcrypt = require("bcrypt");
 const pool = require("../db");
 const transporter = require("../services/mailer");
-const { renderEmail, APP_URL } = require("../services/emailLayout");
+const { renderEmail, APP_URL, LOGO_ATTACHMENT } = require("../services/emailLayout");
 const { getUserFromToken } = require("../services/auth");
 const { getScalar, getSingleValue, hashPassword } = require("../utils/helpers");
 const { resolveId } = require("../services/publicId");
@@ -1411,6 +1411,7 @@ router.post("/profile/email-new-password", async (req, res) => {
     await transporter.sendMail({
       to: email,
       subject: "Your new TuneVote password",
+      attachments: [LOGO_ATTACHMENT],
       text: `Hi${username ? ` ${username}` : ""},
 
 Your password has been reset. Your new password is:
