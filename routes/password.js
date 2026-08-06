@@ -2,7 +2,7 @@ const express = require("express");
 const crypto = require("crypto");
 const pool = require("../db");
 const transporter = require("../services/mailer");
-const { renderEmail } = require("../services/emailLayout");
+const { renderEmail, LOGO_ATTACHMENT } = require("../services/emailLayout");
 const { hashPassword } = require("../utils/helpers");
 
 const router = express.Router();
@@ -79,6 +79,7 @@ If you didn't request this, you can safely ignore this email.
         subject: "Reset your TuneVote password",
         text,
         html,
+        attachments: [LOGO_ATTACHMENT],
       });
     } catch (mailErr) {
       console.error("Password reset email could not be sent:", mailErr);

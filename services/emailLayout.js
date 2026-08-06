@@ -4,15 +4,25 @@
 //
 // Styling is inline and table-based for email-client compatibility, and uses
 // the app's dark palette so the mail matches the product.
+const path = require("path");
 
-// Public base URL of the web app, used for the absolutely-referenced logo so
-// it loads inside email clients. No trailing slash.
+// Public base URL of the web app (used for links / the login button). No
+// trailing slash.
 const APP_URL = (process.env.APP_URL || "https://app.tunevote.com").replace(
   /\/+$/,
   "",
 );
 
-const LOGO_URL = `${APP_URL}/icons/icon-192.png`;
+// The logo is embedded as an inline CID attachment rather than a remote URL:
+// most email clients block or defer remotely-hosted images, so referencing a
+// URL leaves the logo broken. Callers must attach LOGO_ATTACHMENT on the mail
+// for the `cid:` reference below to resolve.
+const LOGO_CID = "tunevote-logo";
+const LOGO_ATTACHMENT = {
+  filename: "tunevote-logo.png",
+  path: path.join(__dirname, "..", "assets", "email-logo.png"),
+  cid: LOGO_CID,
+};
 const SUPPORT_EMAIL = "hello@tunevote.ch";
 
 /**
@@ -65,7 +75,7 @@ function renderEmail({ title, heading, bodyHtml, button, footerNote }) {
           <!-- Logo header -->
           <tr>
             <td align="center" style="padding:36px 40px 8px;">
-              <img src="${LOGO_URL}" width="56" height="56" alt="TuneVote"
+              <img src="cid:${LOGO_CID}" width="56" height="56" alt="TuneVote"
                    style="display:block;border:0;width:56px;height:56px;" />
             </td>
           </tr>
@@ -105,4 +115,4 @@ function renderEmail({ title, heading, bodyHtml, button, footerNote }) {
 </html>`;
 }
 
-module.exports = { renderEmail, SUPPORT_EMAIL, APP_URL, LOGO_URL };
+module.exports = { renderEmail, SUPPORT_EMAIL, APP_URL, LOGO_ATTACHMENT };
