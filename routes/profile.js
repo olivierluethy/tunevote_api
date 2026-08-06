@@ -4,6 +4,7 @@ const crypto = require("crypto");
 const bcrypt = require("bcrypt");
 const pool = require("../db");
 const transporter = require("../services/mailer");
+const { renderEmail, APP_URL } = require("../services/emailLayout");
 const { getUserFromToken } = require("../services/auth");
 const { getScalar, getSingleValue, hashPassword } = require("../utils/helpers");
 const { resolveId } = require("../services/publicId");
@@ -1373,11 +1374,20 @@ router.post("/profile/email-new-password", async (req, res) => {
 
   try {
     const [rows] = await pool.query(
-      "SELECT email, username FROM users WHERE id = ?",
+      "SELECT email, username, password_hash FROM users WHERE id = ?",
       [user.id],
     );
     if (!rows.length) return res.status(404).json({ error: "User not found" });
-    const { email, username } = rows[0];
+    const { email, username, password_hash } = rows[0];
+
+    // This feature only makes sense for local email/password accounts. OAuth-only
+    // users (Google/Facebook) have no password — never generate/email one.
+    if (!password_hash) {
+      return res.status(400).json({
+        error:
+          "This account uses social login (Google/Facebook), so there's no password to change.",
+      });
+    }
 
     const newPassword = generatePassword();
     const hash = await hashPassword(newPassword);
@@ -1386,31 +1396,37 @@ router.post("/profile/email-new-password", async (req, res) => {
       [hash, user.id],
     );
 
-    const html = `
-      <div style="font-family: sans-serif; max-width: 480px; margin: 0 auto; color: #1f2937;">
-        <h2 style="color: #7c3aed;">Dein neues TuneVote-Passwort</h2>
-        <p>Hallo ${username},</p>
-        <p>dein Passwort wurde zurückgesetzt. Dein neues Passwort lautet:</p>
-        <p style="font-size: 20px; font-weight: 700; letter-spacing: 1px;
-                  background: #f3f4f6; padding: 12px 16px; border-radius: 10px;
-                  display: inline-block;">${newPassword}</p>
-        <p>Bitte speichere es sicher (z. B. in deinem Passwort-Manager) und ändere
-           es nach dem Login, wenn du möchtest.</p>
-        <p style="color: #6b7280; font-size: 13px;">Wenn du das nicht angefordert
-           hast, ändere dein Passwort umgehend.</p>
-        <p style="color: #7c3aed; font-weight: 600;">– TuneVote</p>
-      </div>`;
+    const html = renderEmail({
+      title: "Your new TuneVote password",
+      heading: "Your new password",
+      bodyHtml: `
+        <p style="margin:0 0 16px;">Hi${username ? ` ${username}` : ""},</p>
+        <p style="margin:0 0 16px;">Your password has been reset. Your new password is:</p>
+        <p style="margin:0 auto;text-align:center;font-size:22px;font-weight:700;letter-spacing:1px;color:#ffffff;background:#1c1233;border:1px solid rgba(255,255,255,0.1);padding:14px 18px;border-radius:12px;">${newPassword}</p>`,
+      button: { label: "Log in to TuneVote", url: `${APP_URL}/login` },
+      footerNote:
+        "Please store it somewhere safe (for example in your password manager) and change it after logging in if you like. If you didn't request this, change your password immediately.",
+    });
 
     await transporter.sendMail({
       to: email,
-      subject: "🔐 Dein neues TuneVote-Passwort",
-      text: `Hallo ${username},\n\nDein Passwort wurde zurückgesetzt. Dein neues Passwort lautet:\n\n${newPassword}\n\nBitte speichere es sicher und ändere es nach dem Login, wenn du möchtest.\n\n– TuneVote`,
+      subject: "Your new TuneVote password",
+      text: `Hi${username ? ` ${username}` : ""},
+
+Your password has been reset. Your new password is:
+
+${newPassword}
+
+Please store it somewhere safe and change it after logging in if you like.
+If you didn't request this, change your password immediately.
+
+— TuneVote`,
       html,
     });
 
     res.json({
       success: true,
-      message: "Ein neues Passwort wurde an deine E-Mail-Adresse gesendet.",
+      message: "A new password has been sent to your email address.",
     });
   } catch (err) {
     console.error("Fehler beim Senden des neuen Passworts:", err);
