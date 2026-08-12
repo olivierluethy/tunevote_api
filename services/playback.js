@@ -746,9 +746,14 @@ const advanceToNext = async (sessionId, expectedCurrentItemId = null) => {
 const broadcastLiveParticipants = async (sessionId) => {
   try {
     const [participants] = await pool.query(
-      `SELECT 
+      `SELECT
+         sp.id,
+         sp.role,
+         sp.user_id,
          COALESCE(u.username, g.nickname, 'Gast') AS name,
-         (sp.role = 'host') AS isHost
+         (sp.role = 'host') AS isHost,
+         u.imageType,
+         u.imageData
        FROM session_participants sp
        LEFT JOIN users u ON sp.user_id = u.id
        LEFT JOIN guest_users g ON sp.guest_id = g.id
@@ -757,9 +762,20 @@ const broadcastLiveParticipants = async (sessionId) => {
       [sessionId],
     );
 
+    // Shape mirrors GET live-participants (routes/invites.js) so the client can
+    // treat both sources identically — including co-host role (#24).
     const formatted = participants.map((p) => ({
+      participantId: p.id,
+      userId: p.user_id,
       name: p.name,
+      role: p.role,
       isHost: !!p.isHost,
+      isCoHost: p.role === "co-host",
+      promotable: !!p.user_id && p.role !== "host",
+      profileImage:
+        p.imageType && p.imageData
+          ? `data:${p.imageType};base64,${p.imageData.toString("base64")}`
+          : null,
     }));
 
     // An alle Clients in der Session senden

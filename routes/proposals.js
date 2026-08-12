@@ -11,6 +11,7 @@ const {
 const transporter = require("../services/mailer");
 const { openai, safeParseOpenAI, CHAT_MODEL } = require("../services/openai");
 const { broadcastTodayTopArtists } = require("../services/broadcast");
+const { isHostOrCoHost } = require("../services/permissions");
 const {
   sessionTimers,
   startPhaseTimer,
@@ -750,7 +751,16 @@ router.post("/sessions/:id/proposals", async (req, res) => {
     );
     if (!sessionRow) return res.status(404).json({ error: "Session not found" });
 
-    const isHost = user && sessionRow.user_id === user.id;
+    // Host OR co-host may add songs directly while the session isn't live (#24).
+    let callerRole = null;
+    if (user) {
+      const [rr] = await pool.query(
+        "SELECT role FROM session_participants WHERE session_id = ? AND user_id = ?",
+        [sessionId, user.id],
+      );
+      callerRole = rr[0]?.role || null;
+    }
+    const isHost = isHostOrCoHost(sessionRow.user_id, user?.id, callerRole);
     const isSessionLive = sessionRow.status === "live";
 
     let votingRoundId = null;
