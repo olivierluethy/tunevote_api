@@ -50,4 +50,28 @@ function polarMoment(sorted, userId) {
   };
 }
 
-module.exports = { shapeGenreRanking, polarMoment };
+// "Most votes given" leaderboard (#42). Takes a board sorted by score DESC
+// ([{userId, name, score}]) and returns the top `limit` entries (each ranked and
+// flagged isMe), plus the caller's own {rank, name, score} even when they fall
+// outside the top slice (or null when not on the board / not logged in).
+function shapeLeaderboard(board, myUserId, limit = 10) {
+  const list = board || [];
+  const entries = list.slice(0, limit).map((r, i) => ({
+    rank: i + 1,
+    userId: r.userId,
+    name: r.name,
+    score: r.score,
+    isMe: myUserId != null && String(r.userId) === String(myUserId),
+  }));
+
+  let me = null;
+  if (myUserId != null) {
+    const idx = list.findIndex((r) => String(r.userId) === String(myUserId));
+    if (idx !== -1) {
+      me = { rank: idx + 1, name: list[idx].name, score: list[idx].score };
+    }
+  }
+  return { entries, me };
+}
+
+module.exports = { shapeGenreRanking, polarMoment, shapeLeaderboard };
