@@ -11,6 +11,7 @@ const {
 const transporter = require("../services/mailer");
 const { openai, safeParseOpenAI } = require("../services/openai");
 const { broadcastTodayTopArtists } = require("../services/broadcast");
+const { isHostOrCoHost } = require("../services/permissions");
 const {
   sessionTimers,
   startPhaseTimer,
@@ -191,11 +192,15 @@ router.post("/sessions/:sessionId/invite", async (req, res) => {
         .status(400)
         .json({ error: "Nur private Sessions können Einladungen versenden" });
     }
-    if (session.user_id !== user.id) {
+    const [inviterRoleRows] = await conn.query(
+      "SELECT role FROM session_participants WHERE session_id = ? AND user_id = ?",
+      [sessionId, user.id],
+    );
+    if (!isHostOrCoHost(session.user_id, user.id, inviterRoleRows[0]?.role)) {
       await conn.rollback();
       return res
         .status(403)
-        .json({ error: "Nur der Host darf Einladungen verschicken" });
+        .json({ error: "Nur Host oder Co-Host darf Einladungen verschicken" });
     }
     if (email === session.host_email?.toLowerCase()) {
       await conn.rollback();
@@ -645,9 +650,10 @@ router.get("/sessions/:sessionId/participants", async (req, res) => {
 
     // Alle LIVE Teilnehmer holen
     const [participants] = await pool.query(
-      `SELECT 
+      `SELECT
          sp.id,
          sp.role,
+         sp.user_id,
          COALESCE(u.username, g.nickname, 'Gast') AS name,
          (sp.role = 'host') AS isHost,
         u.imageType,
@@ -668,8 +674,14 @@ router.get("/sessions/:sessionId/participants", async (req, res) => {
       }
 
       return {
+        participantId: p.id,
+        userId: p.user_id,
         name: p.name,
+        role: p.role,
         isHost: !!p.isHost,
+        isCoHost: p.role === "co-host",
+        // Only registered users (not guests, not the host) can be promoted.
+        promotable: !!p.user_id && p.role !== "host",
         profileImage,
       };
     });

@@ -22,7 +22,7 @@ const {
 } = require("../services/playback");
 const { normalize, parseIsoDuration } = require("../utils/helpers");
 const { isGenre } = require("../services/genres");
-const { isHostOrCoHost } = require("../services/permissions");
+const { isHost, isHostOrCoHost } = require("../services/permissions");
 
 const YOUTUBE_KEY = process.env.YOUTUBE_KEY;
 
@@ -405,10 +405,14 @@ router.patch("/sessions/:id", async (req, res) => {
       return res.status(404).json({ error: "Session nicht gefunden" });
     }
 
-    if (rows[0].user_id !== user.id) {
+    const [renamerPart] = await pool.query(
+      "SELECT role FROM session_participants WHERE session_id = ? AND user_id = ?",
+      [id, user.id],
+    );
+    if (!isHostOrCoHost(rows[0].user_id, user.id, renamerPart[0]?.role)) {
       return res
         .status(403)
-        .json({ error: "Nur der Host darf den Namen ändern" });
+        .json({ error: "Nur Host oder Co-Host darf den Namen ändern" });
     }
 
     // Update durchführen
@@ -471,6 +475,68 @@ router.patch("/sessions/:id/ai-genre", async (req, res) => {
     res.json({ success: true, genre });
   } catch (err) {
     console.error("Fehler beim Setzen des AI-Genres:", err);
+    res.status(500).json({ error: "Interner Serverfehler" });
+  }
+});
+
+// === PATCH: Rolle eines Teilnehmers ändern (nur Host) — Co-Host promote/demote (#24) ===
+router.patch("/sessions/:id/participants/:participantId/role", async (req, res) => {
+  const { id, participantId } = req.params;
+  const { role } = req.body;
+
+  const token = req.headers.authorization?.split(" ")[1];
+  const user = token ? await getUserFromToken(token) : null;
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+
+  if (role !== "co-host" && role !== "user") {
+    return res.status(400).json({ error: "Rolle muss 'co-host' oder 'user' sein" });
+  }
+
+  try {
+    const [rows] = await pool.query(
+      "SELECT user_id FROM sessions WHERE id = ?",
+      [id],
+    );
+    if (!rows[0]) return res.status(404).json({ error: "Session nicht gefunden" });
+
+    // Nur der Host darf Rollen vergeben (Co-Hosts nicht).
+    if (!isHost(rows[0].user_id, user.id)) {
+      return res
+        .status(403)
+        .json({ error: "Nur der Host darf Rollen vergeben" });
+    }
+
+    const [partRows] = await pool.query(
+      "SELECT id, user_id, guest_id, role FROM session_participants WHERE id = ? AND session_id = ?",
+      [participantId, id],
+    );
+    const participant = partRows[0];
+    if (!participant) {
+      return res.status(404).json({ error: "Teilnehmer nicht gefunden" });
+    }
+    // Nur eingeloggte Teilnehmer können Co-Host werden; niemals der Host selbst.
+    if (!participant.user_id) {
+      return res.status(400).json({ error: "Gäste können nicht Co-Host werden" });
+    }
+    if (participant.role === "host") {
+      return res.status(400).json({ error: "Der Host kann nicht geändert werden" });
+    }
+
+    await pool.query(
+      "UPDATE session_participants SET role = ? WHERE id = ?",
+      [role, participantId],
+    );
+
+    getIO().to(String(id)).emit("participant_role_changed", {
+      sessionId: parseInt(id, 10),
+      participantId: parseInt(participantId, 10),
+      userId: participant.user_id,
+      role,
+    });
+
+    res.json({ success: true, participantId: parseInt(participantId, 10), role });
+  } catch (err) {
+    console.error("Fehler beim Ändern der Rolle:", err);
     res.status(500).json({ error: "Interner Serverfehler" });
   }
 });
