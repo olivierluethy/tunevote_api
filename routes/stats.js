@@ -1,8 +1,37 @@
 const express = require("express");
 const pool = require("../db");
-const { shapeGenreRanking } = require("../services/statsShaping");
+const { getUserFromToken } = require("../services/auth");
+const { shapeGenreRanking, polarMoment } = require("../services/statsShaping");
 
 const router = express.Router();
+
+// GET /stats/polar-moment (auth) — where the caller stands on the votes-given
+// leaderboard vs. the person one rank above them (#50).
+router.get("/stats/polar-moment", async (req, res) => {
+  const token = req.headers.authorization?.split(" ")[1];
+  const user = token ? await getUserFromToken(token) : null;
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+
+  try {
+    const [rows] = await pool.query(
+      `SELECT v.user_id AS userId, u.username AS name, COUNT(*) AS score
+         FROM votes v
+         JOIN users u ON u.id = v.user_id
+        WHERE v.user_id IS NOT NULL
+        GROUP BY v.user_id, u.username
+        ORDER BY score DESC, u.username ASC`,
+    );
+    const board = rows.map((r) => ({
+      userId: r.userId,
+      name: r.name,
+      score: Number(r.score),
+    }));
+    res.json(polarMoment(board, user.id));
+  } catch (err) {
+    console.error("polar-moment failed:", err);
+    res.status(500).json({ error: "Interner Serverfehler" });
+  }
+});
 
 // GET /stats/genre-ranking?window=week|month|all  (#43)
 // Ranks genres by how many songs of each genre were played in the window,
