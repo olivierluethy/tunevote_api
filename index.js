@@ -66,6 +66,9 @@ initIO(httpServer);
 // Crash-safe playback reconciler (DB-authoritative; rebuilds work on boot).
 require("./services/scheduler").startReconciler();
 
+// Weekly summary email (#25) — no-op unless WEEKLY_SUMMARY_ENABLED=true.
+require("./services/weeklySummary").startWeeklySummaryScheduler();
+
 // === Route modules ===
 app.use(require("./routes/youtube"));
 app.use(require("./routes/oauth"));

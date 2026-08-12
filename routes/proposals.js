@@ -872,6 +872,19 @@ router.post("/sessions/:id/proposals", async (req, res) => {
       // Alles korrekt → suggested + round verknüpfen
       votingRoundId = round.id;
       status = "suggested";
+
+      // #26 — at most 5 suggestions per round (of which max 3 are AI, enforced
+      // elsewhere). Matches the "/5" counter shown in the UI.
+      const [[{ suggestedCount }]] = await pool.query(
+        `SELECT COUNT(*) AS suggestedCount FROM queue_items
+          WHERE voting_round_id = ? AND status = 'suggested'`,
+        [round.id],
+      );
+      if (suggestedCount >= 5) {
+        return res.status(409).json({
+          error: "Maximal 5 Vorschläge pro Runde erreicht",
+        });
+      }
     } else {
       // Session nicht live → nur Host darf direkt queued einfügen
       if (!isHost) {
@@ -1219,6 +1232,19 @@ router.post("/sessions/:id/proposals/:propId/vote", async (req, res) => {
 
   const voterId = user?.id || guest?.id;
   const voterColumn = user ? "user_id" : "guest_id";
+
+  // #13 — only participants who are still live in this session may vote. A
+  // stale client (tab left open after leaving) must not keep casting votes.
+  const [[voterPart]] = await pool.query(
+    `SELECT is_live FROM session_participants
+      WHERE session_id = ? AND ${voterColumn} = ?`,
+    [id, voterId],
+  );
+  if (!voterPart || !voterPart.is_live) {
+    return res
+      .status(403)
+      .json({ error: "Nur aktive (live) Teilnehmer dürfen abstimmen" });
+  }
 
   // Toggle Vote (Upvote / Widerruf)
   const [[existing]] = await pool.query(

@@ -6,8 +6,24 @@ const {
   polarMoment,
   shapeLeaderboard,
 } = require("../services/statsShaping");
+const { buildUserSummary } = require("../services/weeklySummary");
 
 const router = express.Router();
+
+// GET /session/summary (auth) — the caller's own last-7-days summary (#25).
+// Same data the weekly summary email is built from, available on demand.
+router.get("/session/summary", async (req, res) => {
+  const token = req.headers.authorization?.split(" ")[1];
+  const user = token ? await getUserFromToken(token) : null;
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+
+  try {
+    res.json(await buildUserSummary(user.id));
+  } catch (err) {
+    console.error("session/summary failed:", err);
+    res.status(500).json({ error: "Interner Serverfehler" });
+  }
+});
 
 // The "most votes given" board: one row per user, ranked by votes cast, DESC.
 // Shared by the leaderboard (#42) and the polar-moment stat (#50).
