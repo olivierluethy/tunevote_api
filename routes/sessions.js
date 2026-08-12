@@ -323,7 +323,7 @@ router.get("/join", async (req, res) => {
     if (autoStarted) {
       setTimeout(async () => {
         try {
-          await axios.post(`https://api.tunevote.com/sessions/${sessionId}/start`);
+          await axios.post(`https://api.tunevote.com/sessions/${sessionId}/start?auto=1`);
           console.log(`[AUTO] Session ${sessionId} gestartet (Titel: ${requestedTitle || DEFAULT_TITLE})`);
         } catch (err) {
           console.error("[AUTO] Start fehlgeschlagen:", err.response?.data || err.message);
@@ -698,6 +698,23 @@ router.post("/sessions/:id/start", async (req, res) => {
   if (!sess) return res.status(404).json({ error: "Session not found" });
   if (sess.status === "live") {
     return res.status(400).json({ error: "Session already live" });
+  }
+
+  // #17 — refuse to go live with an empty queue. A brand-new public session is
+  // deliberately auto-started empty (guests + AI then fill it), so the internal
+  // auto-start passes ?auto=1 to bypass this guard; manual/host starts do not.
+  const auto = req.query.auto === "1" || req.body?.auto === true;
+  if (!auto) {
+    const [[{ playable }]] = await pool.query(
+      `SELECT COUNT(*) AS playable FROM queue_items
+        WHERE session_id = ? AND status IN ('queued', 'suggested')`,
+      [id],
+    );
+    if (!playable) {
+      return res
+        .status(400)
+        .json({ error: "Die Queue ist leer – füge zuerst einen Song hinzu." });
+    }
   }
 
   // Alle bisherigen "suggested" Vorschläge in die Queue übernehmen
