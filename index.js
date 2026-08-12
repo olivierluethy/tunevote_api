@@ -78,6 +78,7 @@ app.use(require("./routes/proposals"));
 app.use(require("./routes/invites"));
 app.use(require("./routes/stats"));
 app.use(require("./routes/polls"));
+app.use(require("./routes/trends"));
 
 // === Socket.IO ===
 require("./socket").registerSocketHandlers();
