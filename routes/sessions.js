@@ -21,6 +21,8 @@ const {
   createNewPublicSession,
 } = require("../services/playback");
 const { normalize, parseIsoDuration } = require("../utils/helpers");
+const { isGenre } = require("../services/genres");
+const { isHostOrCoHost } = require("../services/permissions");
 
 const YOUTUBE_KEY = process.env.YOUTUBE_KEY;
 
@@ -425,6 +427,50 @@ router.patch("/sessions/:id", async (req, res) => {
     res.json({ success: true, title: cleanTitle });
   } catch (err) {
     console.error("Fehler beim Umbenennen der Session:", err);
+    res.status(500).json({ error: "Interner Serverfehler" });
+  }
+});
+
+// === PATCH: AI-Genre der Session setzen (Host oder Co-Host) ===
+// Steuert die KI-Empfehlungen (#39). null/"" löscht die Vorgabe -> Zufalls-Angle.
+router.patch("/sessions/:id/ai-genre", async (req, res) => {
+  const { id } = req.params;
+  let { genre } = req.body;
+
+  const token = req.headers.authorization?.split(" ")[1];
+  const user = token ? await getUserFromToken(token) : null;
+  if (!user) return res.status(401).json({ error: "Unauthorized" });
+
+  if (genre === "" || genre === "Any") genre = null;
+  if (genre !== null && !isGenre(genre)) {
+    return res.status(400).json({ error: "Unbekanntes Genre" });
+  }
+
+  try {
+    const [rows] = await pool.query(
+      "SELECT user_id FROM sessions WHERE id = ?",
+      [id],
+    );
+    if (!rows[0]) return res.status(404).json({ error: "Session nicht gefunden" });
+
+    const [partRows] = await pool.query(
+      "SELECT role FROM session_participants WHERE session_id = ? AND user_id = ?",
+      [id, user.id],
+    );
+    const role = partRows[0]?.role || null;
+    if (!isHostOrCoHost(rows[0].user_id, user.id, role)) {
+      return res
+        .status(403)
+        .json({ error: "Nur Host oder Co-Host darf das Genre setzen" });
+    }
+
+    await pool.query("UPDATE sessions SET ai_genre = ? WHERE id = ?", [
+      genre,
+      id,
+    ]);
+    res.json({ success: true, genre });
+  } catch (err) {
+    console.error("Fehler beim Setzen des AI-Genres:", err);
     res.status(500).json({ error: "Interner Serverfehler" });
   }
 });

@@ -76,10 +76,20 @@ const EXPLORATION_ANGLES = [
   "include classic, iconic tracks people may have forgotten",
 ];
 
-async function generateAiSuggestions(sessionId, votingRoundId, needed) {
+async function generateAiSuggestions(
+  sessionId,
+  votingRoundId,
+  needed,
+  opts = {},
+) {
   if (!openai || !needed || needed <= 0 || !votingRoundId) return [];
   const id = sessionId;
   const currentRoundId = votingRoundId;
+  // Extra titles to exclude on top of the session's own history — used by the
+  // "regenerate bad AI suggestions" flow (#27) to avoid re-proposing rejects.
+  const excludeTitles = Array.isArray(opts.excludeTitles)
+    ? opts.excludeTitles
+    : [];
 
   // ---- Comprehensive exclusion list (everything the session ever touched) ----
   const [seenRows] = await pool.query(
@@ -92,7 +102,7 @@ async function generateAiSuggestions(sessionId, votingRoundId, needed) {
       LIMIT 200`,
     [id],
   );
-  const allTitles = seenRows.map((r) => r.title);
+  const allTitles = [...seenRows.map((r) => r.title), ...excludeTitles];
 
   // ---- Taste seed (what the humans here actually chose) ----
   const [tasteRows] = await pool.query(
@@ -108,8 +118,18 @@ async function generateAiSuggestions(sessionId, votingRoundId, needed) {
   );
   const tasteSeed = [...new Set(tasteRows.map((r) => r.title))];
 
-  const angle =
-    EXPLORATION_ANGLES[Math.floor(Math.random() * EXPLORATION_ANGLES.length)];
+  // When the host has chosen a genre for the session (#39), steer every batch
+  // toward it; otherwise rotate through the random exploration angles.
+  const [genreRows] = await pool.query(
+    `SELECT ai_genre FROM sessions WHERE id = ?`,
+    [id],
+  );
+  const hostGenre = genreRows?.[0]?.ai_genre || null;
+  const angle = hostGenre
+    ? `focus specifically on the "${hostGenre}" genre — every song should clearly fit it`
+    : EXPLORATION_ANGLES[
+        Math.floor(Math.random() * EXPLORATION_ANGLES.length)
+      ];
 
   const tasteLine = tasteSeed.length
     ? `The people in this room added these songs, which reflect their taste:\n${JSON.stringify(
