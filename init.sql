@@ -84,6 +84,7 @@ CREATE TABLE youtube_video_cache (
   thumbnail TEXT,
   cached_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   public_id CHAR(36) DEFAULT NULL,
+  genre VARCHAR(40) NULL,
   UNIQUE KEY uq_youtube_video_cache_public_id (public_id),
   FOREIGN KEY (artist_id) REFERENCES artists(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
@@ -98,6 +99,7 @@ CREATE TABLE sessions (
   is_live TINYINT(1) DEFAULT '0',
   is_private TINYINT(1) DEFAULT 0,
   public_id CHAR(36) DEFAULT NULL,
+  ai_genre VARCHAR(40) NULL,
   KEY user_id (user_id),
   UNIQUE KEY uq_sessions_public_id (public_id),
   CONSTRAINT sessions_ibfk_1 FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
@@ -160,7 +162,7 @@ CREATE TABLE session_participants (
   session_id INT NOT NULL,
   user_id INT DEFAULT NULL,
   guest_id INT DEFAULT NULL,
-  role ENUM('host', 'user','guest') NOT NULL,
+  role ENUM('host', 'co-host', 'user','guest') NOT NULL,
   joined_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
   left_at TIMESTAMP NULL,
   is_live TINYINT(1) DEFAULT '0',
@@ -426,3 +428,38 @@ CREATE TABLE shout_likes (
     FOREIGN KEY (shout_id) REFERENCES shouts(id) ON DELETE CASCADE,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- =============================================
+-- 7. Live anonymous home-page polls (idea #44)
+-- =============================================
+CREATE TABLE polls (
+  id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  question VARCHAR(255) NOT NULL,
+  is_active TINYINT(1) NOT NULL DEFAULT 0,
+  created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  KEY idx_polls_active (is_active)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE poll_options (
+  id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  poll_id INT NOT NULL,
+  label VARCHAR(120) NOT NULL,
+  sort INT NOT NULL DEFAULT 0,
+  KEY idx_poll_options_poll (poll_id),
+  CONSTRAINT poll_options_ibfk_1
+    FOREIGN KEY (poll_id) REFERENCES polls(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE poll_votes (
+  id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  poll_id INT NOT NULL,
+  option_id INT NOT NULL,
+  voter_key VARCHAR(64) NOT NULL,
+  created_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_poll_voter (poll_id, voter_key),
+  KEY idx_poll_votes_option (option_id),
+  CONSTRAINT poll_votes_ibfk_1
+    FOREIGN KEY (poll_id) REFERENCES polls(id) ON DELETE CASCADE,
+  CONSTRAINT poll_votes_ibfk_2
+    FOREIGN KEY (option_id) REFERENCES poll_options(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
