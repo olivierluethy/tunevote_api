@@ -76,6 +76,7 @@ app.use(require("./routes/artists"));
 app.use(require("./routes/sessions"));
 app.use(require("./routes/proposals"));
 app.use(require("./routes/invites"));
+app.use(require("./routes/stats"));
 
 // === Socket.IO ===
 require("./socket").registerSocketHandlers();

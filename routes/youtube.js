@@ -2,8 +2,26 @@ const express = require("express");
 const ytdl = require("@distube/ytdl-core");
 const pool = require("../db");
 const { normalize } = require("../utils/helpers");
+const { classifyGenre } = require("../services/genres");
 
 const router = express.Router();
+
+// Assign a genre to a freshly-cached video WITHOUT blocking the request.
+// classifyGenre never throws (falls back to "Other"); a failed UPDATE is logged
+// and ignored so genre tagging can never break search/caching. Powers the host
+// genre selector (#39) and genre ranking (#43).
+function tagGenreInBackground(youtubeId, title) {
+  if (!youtubeId || !title) return;
+  classifyGenre(title)
+    .then((genre) =>
+      pool.query(
+        `UPDATE youtube_video_cache SET genre = ?
+          WHERE youtube_id = ? AND (genre IS NULL OR genre = '')`,
+        [genre, youtubeId],
+      ),
+    )
+    .catch((err) => console.warn("genre tagging failed:", err.message));
+}
 
 router.get("/youtube-cache", async (req, res) => {
   try {
@@ -29,6 +47,7 @@ router.post("/youtube-cache", async (req, res) => {
     `,
       [title_norm, title, youtube_id, thumbnail],
     );
+    tagGenreInBackground(youtube_id, title);
     res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: "Cache save failed" });
@@ -92,6 +111,7 @@ router.get("/youtube-info/:id", async (req, res) => {
         info.videoDetails.lengthSeconds || 0,
       ],
     );
+    tagGenreInBackground(id, title);
 
     // 4. Antwort im YouTube-API-Format
     res.json({
