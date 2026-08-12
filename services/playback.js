@@ -613,12 +613,21 @@ const advanceToNext = async (sessionId, expectedCurrentItemId = null) => {
         `SELECT COUNT(*) AS cnt FROM queue_items WHERE session_id = ? AND status = 'playing'`,
         [sessionId],
       );
+      // #38 — never close while a playable song is still queued. `next` being
+      // null should already imply this, but this explicit guard makes the
+      // "only close after ALL songs have played" rule impossible to violate
+      // (e.g. a queued item the next-song query missed, or a race).
+      const [queuedRemaining] = await connection.query(
+        `SELECT COUNT(*) AS cnt FROM queue_items WHERE session_id = ? AND status = 'queued'`,
+        [sessionId],
+      );
 
       const noActiveUsers = activeParticipants[0].cnt === 0;
       const noOpenVoting = openRounds[0].cnt === 0;
       const nothingPlaying = currentlyPlaying[0].cnt === 0;
+      const noQueuedSongs = queuedRemaining[0].cnt === 0;
 
-      if (noActiveUsers && noOpenVoting && nothingPlaying) {
+      if (noActiveUsers && noOpenVoting && nothingPlaying && noQueuedSongs) {
         await connection.query(
           `UPDATE sessions SET is_live = 0, status = 'ended', ended_at = NOW() WHERE id = ?`,
           [sessionId],
@@ -636,6 +645,7 @@ const advanceToNext = async (sessionId, expectedCurrentItemId = null) => {
         if (!noActiveUsers) reasons.push("active users");
         if (!noOpenVoting) reasons.push("open voting");
         if (!nothingPlaying) reasons.push("song currently playing");
+        if (!noQueuedSongs) reasons.push("queued songs remain");
         console.log(
           `[Session ${sessionId}] No song to play next, but session stays alive → ${reasons.join(", ")}`,
         );
