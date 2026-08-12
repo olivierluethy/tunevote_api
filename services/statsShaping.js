@@ -20,4 +20,34 @@ function shapeGenreRanking(rows) {
     .sort((a, b) => b.plays - a.plays || a.genre.localeCompare(b.genre));
 }
 
-module.exports = { shapeGenreRanking };
+// "Polar Moment" (#50): given a leaderboard sorted by score DESC
+// ([{userId, name, score}]), describe where `userId` stands relative to the
+// competitor directly above them. Returns null when the user isn't on the board.
+function polarMoment(sorted, userId) {
+  const list = sorted || [];
+  const i = list.findIndex((r) => String(r.userId) === String(userId));
+  if (i === -1) return null;
+
+  const me = list[i];
+  const above = i > 0 ? list[i - 1] : null;
+  const gap = above ? above.score - me.score : 0;
+
+  let suggestion;
+  if (!above) {
+    suggestion = "You're #1 — nobody's ahead of you. Defend your lead!";
+  } else if (gap <= 0) {
+    suggestion = `You're tied with ${above.name} — one more vote pulls you ahead.`;
+  } else {
+    suggestion = `Cast ${gap + 1} more vote${gap + 1 === 1 ? "" : "s"} to pass ${above.name}.`;
+  }
+
+  return {
+    rank: i + 1,
+    myScore: me.score,
+    above: above ? { name: above.name, score: above.score } : null,
+    gap,
+    suggestion,
+  };
+}
+
+module.exports = { shapeGenreRanking, polarMoment };
