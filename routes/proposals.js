@@ -20,10 +20,81 @@ const {
   createNewPublicSession,
 } = require("../services/playback");
 const { normalize, parseIsoDuration } = require("../utils/helpers");
+const { shouldRegenerate } = require("../services/aiRegenerate");
 
 const YOUTUBE_KEY = process.env.YOUTUBE_KEY;
 
 const router = express.Router();
+
+// --- #27: live-user majority "regenerate the AI suggestions" tally ---------
+// In-memory per-round state (single-process server). rejectionsByRound holds the
+// distinct voter keys who pressed "not feeling these"; regeneratedRounds guards
+// so a round regenerates at most once.
+const rejectionsByRound = new Map(); // roundId -> Set<voterKey>
+const regeneratedRounds = new Set(); // roundIds already regenerated
+
+router.post("/proposals/:roundId/regenerate-vote", async (req, res) => {
+  const roundId = parseInt(req.params.roundId, 10);
+  const token = req.headers.authorization?.split(" ")[1];
+  const guestToken = req.headers["x-guest-token"];
+  const user = token ? await getUserFromToken(token) : null;
+  const guest = !user && guestToken ? await getGuestFromToken(guestToken) : null;
+  if (!user && !guest) return res.status(401).json({ error: "Unauthorized" });
+
+  try {
+    const [[round]] = await pool.query(
+      "SELECT id, session_id, state FROM voting_rounds WHERE id = ?",
+      [roundId],
+    );
+    if (!round) return res.status(404).json({ error: "Round not found" });
+    if (round.state !== "suggesting") {
+      return res
+        .status(400)
+        .json({ error: "Regenerate nur während der Vorschlagsphase möglich" });
+    }
+    const sessionId = round.session_id;
+
+    // Record this voter's rejection (idempotent per voter).
+    const voterKey = user ? `u${user.id}` : `g${guest.id}`;
+    let set = rejectionsByRound.get(roundId);
+    if (!set) {
+      set = new Set();
+      rejectionsByRound.set(roundId, set);
+    }
+    set.add(voterKey);
+    const rejections = set.size;
+
+    const [[{ liveUsers }]] = await pool.query(
+      "SELECT COUNT(*) AS liveUsers FROM session_participants WHERE session_id = ? AND is_live = 1",
+      [sessionId],
+    );
+
+    let regenerated = false;
+    if (
+      shouldRegenerate(rejections, liveUsers) &&
+      !regeneratedRounds.has(roundId)
+    ) {
+      regeneratedRounds.add(roundId);
+      // Archive the round's AI suggestions. They stay in queue_items, so the
+      // regeneration's "already seen" exclusion skips these rejected titles.
+      await pool.query(
+        `UPDATE queue_items SET status = 'archived'
+          WHERE session_id = ? AND voting_round_id = ?
+            AND item_source = 'ai' AND status = 'suggested'`,
+        [sessionId, roundId],
+      );
+      rejectionsByRound.delete(roundId);
+      regenerated = true;
+      getIO().to(String(sessionId)).emit("proposals_updated", {});
+      getIO().to(String(sessionId)).emit("regenerate_suggestions", { roundId });
+    }
+
+    res.json({ rejections, liveUsers, regenerated });
+  } catch (err) {
+    console.error("regenerate-vote failed:", err);
+    res.status(500).json({ error: "Interner Serverfehler" });
+  }
+});
 
 router.get("/sessions/:id/current-voting-phase", async (req, res) => {
   const sessionId = parseInt(req.params.id);
@@ -232,10 +303,17 @@ router.get("/sessions/:id/recommendations", async (req, res) => {
         "include Latin, Afrobeats and other global-pop styles",
         "include classic, iconic tracks people may have forgotten",
       ];
-      const angle =
-        EXPLORATION_ANGLES[
-          Math.floor(Math.random() * EXPLORATION_ANGLES.length)
-        ];
+      // Host-chosen genre (#39) steers every batch; otherwise rotate angles.
+      const [genreRows] = await pool.query(
+        `SELECT ai_genre FROM sessions WHERE id = ?`,
+        [id],
+      );
+      const hostGenre = genreRows?.[0]?.ai_genre || null;
+      const angle = hostGenre
+        ? `focus specifically on the "${hostGenre}" genre — every song should clearly fit it`
+        : EXPLORATION_ANGLES[
+            Math.floor(Math.random() * EXPLORATION_ANGLES.length)
+          ];
 
       const tasteLine = tasteSeed.length
         ? `The people in this room added these songs, which reflect their taste:\n${JSON.stringify(
