@@ -5,6 +5,10 @@ const {
   broadcastLiveParticipants,
   broadcastParticipantCount,
 } = require("./services/playback");
+const { allowReaction } = require("./services/reactionRateLimit");
+
+// Emoji reactions on the playing song (#18) — ephemeral, never stored.
+const REACTION_EMOJIS = ["😍", "🔥", "👏", "🎉", "😴"];
 
 // Registers all Socket.IO connection/room/disconnect handlers. Called once
 // from index.js after the io server is initialised.
@@ -75,6 +79,19 @@ io.on("connection", (socket) => {
   })();
 
   socket.on("heartbeat", touchLastSeen);
+
+  // Ephemeral emoji reactions (#18): validate against the allow-list, rate-limit
+  // per socket, then fan out to everyone ELSE in the room (the sender animates
+  // its own tap locally). Nothing is persisted.
+  let reactionBucket = { count: 0, windowStart: 0 };
+  socket.on("song_reaction", (payload) => {
+    const emoji = payload && payload.emoji;
+    if (!REACTION_EMOJIS.includes(emoji)) return;
+    const { allowed, state } = allowReaction(reactionBucket, Date.now());
+    reactionBucket = state;
+    if (!allowed) return;
+    socket.to(sessionId).emit("song_reaction_broadcast", { emoji });
+  });
 
   socket.on("disconnect", async () => {
     console.log("📴 [WS-DISCONNECT] Triggered for socket:", socket.id);
