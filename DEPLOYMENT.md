@@ -40,7 +40,8 @@ cPanel** account. They deploy independently.
 | Process | PM2 app **`tunevote_api`**, running under **root** |
 | Code dir | `/var/www/tunevote_api` |
 | Database | MySQL 8 in Docker, container **`mysql`**, database **`tunevote`** |
-| Also on box | phpMyAdmin (nginx → `:8080`). **No frontend here anymore.** |
+| Also on box | phpMyAdmin — **private, not publicly exposed**: gated behind the compose `admin` profile and bound to `127.0.0.1:8080`, reachable only via SSH tunnel. **No frontend here anymore.** |
+| DB & admin security | MySQL binds to `127.0.0.1:3306` only; there is **no** public `phpmyadmin.tunevote.com`. See [`docs/2026-08-26-database-security-architecture.md`](docs/2026-08-26-database-security-architecture.md). |
 | Backups | `~/tunevote-backups/` |
 
 ### Frontend — GoDaddy cPanel (`app.tunevote.com`)
@@ -137,8 +138,11 @@ variable **names**. To bring a fresh checkout up locally:
 **Backend** (`tunevote_api`):
 
 ```bash
-cp .env.example .env          # fill in local values (DB_HOST=localhost, etc.)
-docker compose up -d          # MySQL 8 + phpMyAdmin (phpMyAdmin on :8080)
+cp .env.example .env          # fill in local values (DB_HOST=localhost, MYSQL_* etc.)
+docker compose up -d          # MySQL 8 only (bound to 127.0.0.1:3306, never public)
+# phpMyAdmin is NOT started by default — it lives behind the "admin" profile and
+# binds to loopback. Bring it up only when you need it, then reach it via tunnel:
+#   docker compose --profile admin up -d phpmyadmin   # then ssh -L 8080:127.0.0.1:8080 …
 # load the canonical schema once, then apply migrations:
 #   import init.sql into the `tunevote` database, then:
 npm ci
