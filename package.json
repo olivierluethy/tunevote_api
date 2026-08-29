@@ -20,7 +20,7 @@
   "license": "ISC",
   "dependencies": {
     "@distube/ytdl-core": "^4.16.12",
-    "axios": "^1.12.2",
+    "axios": "^1.18.0",
     "bcrypt": "^6.0.0",
     "cors": "^2.8.5",
     "dotenv": "^17.2.3",
