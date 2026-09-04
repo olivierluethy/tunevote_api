@@ -1,7 +1,10 @@
 const pool = require("../db");
 const { advanceToNext, broadcastParticipantCount } = require("./playback");
 const { generateAiSuggestions } = require("./recommendations");
-const { reconcileExpired: reconcileExpiredChangeRequests } = require("./changeRequests");
+const {
+  reconcileExpired: reconcileExpiredChangeRequests,
+  autoProposePauses,
+} = require("./changeRequests");
 
 // Sessions with an AI auto-fill generation in flight. Prevents the reconciler
 // from starting a second (expensive) OpenAI/YouTube generation for the same
@@ -51,6 +54,13 @@ async function reconcileOnce({
     await reconcileExpiredChangeRequests();
   } catch (e) {
     console.error("[reconciler] change-request expiry failed:", e.message);
+  }
+
+  // Auto-pause rule: propose a pause after N songs where the rule is enabled.
+  try {
+    await autoProposePauses();
+  } catch (e) {
+    console.error("[reconciler] auto-pause failed:", e.message);
   }
 
   // 1) Advance songs whose deadline has passed. Pass the current playing item id

@@ -51,14 +51,22 @@ function fail(res, err) {
 // POST /sessions/:id/change-requests  { type, payload }
 router.post("/sessions/:id/change-requests", async (req, res) => {
   const sessionId = parseInt(req.params.id, 10);
-  const { type, payload, options, method } = req.body || {};
+  const { type, payload, options, method, min_support } = req.body || {};
   try {
     const identity = await identify(req);
     if (!identity.user && !identity.guest) {
       return res.status(401).json({ error: "Unauthorized" });
     }
     await assertLiveParticipant(sessionId, identity);
-    const dto = await create(sessionId, type, payload, identity, options, method);
+    const dto = await create(
+      sessionId,
+      type,
+      payload,
+      identity,
+      options,
+      method,
+      min_support,
+    );
     res.status(201).json(dto);
   } catch (err) {
     fail(res, err);
