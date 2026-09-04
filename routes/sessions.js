@@ -628,9 +628,14 @@ router.post("/sessions/:id/queue/add", async (req, res) => {
       [videoId, title, normalize(title), thumbnail, duration],
     );
 
+    // #66 Slice 3: a host-added song joins the session's current section, if any.
+    const [[curSec]] = await pool.query(
+      "SELECT current_section_id FROM sessions WHERE id = ?",
+      [id],
+    );
     await pool.query(
-      "INSERT INTO queue_items (session_id, video_id, added_by, status, item_type) VALUES (?, ?, ?, 'queued', 'music')",
-      [id, videoId, user.id],
+      "INSERT INTO queue_items (session_id, video_id, added_by, status, item_type, section_id) VALUES (?, ?, ?, 'queued', 'music', ?)",
+      [id, videoId, user.id, curSec?.current_section_id || null],
     );
 
     getIO().to(id).emit("queue_updated", {});

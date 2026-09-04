@@ -68,6 +68,7 @@ async function insertRunAfterCurrent(conn, sessionId, recipe, loopId, runNumber,
   const src = sourceOf(loop);
   const uid = loop.created_by_user_id || null;
   const gid = loop.created_by_guest_id || null;
+  const sid = loop.section_id || null; // loop-as-block: items join the loop's section
   const ids = [];
   let slot = 0;
   for (const s of steps) {
@@ -78,18 +79,18 @@ async function insertRunAfterCurrent(conn, sessionId, recipe, loopId, runNumber,
       const [ins] = await conn.query(
         `INSERT INTO queue_items
            (session_id, item_type, description, pause_duration_seconds,
-            added_by, guest_id, status, item_source, sort_order, loop_id, loop_run)
-         VALUES (?, 'pause', ?, ?, ?, ?, 'queued', ?, ?, ?, ?)`,
-        [sessionId, "Pause (Loop)", dur, uid, gid, src, so, loopId, runNumber],
+            added_by, guest_id, status, item_source, sort_order, loop_id, loop_run, section_id)
+         VALUES (?, 'pause', ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)`,
+        [sessionId, "Pause (Loop)", dur, uid, gid, src, so, loopId, runNumber, sid],
       );
       ids.push(ins.insertId);
     } else {
       const [ins] = await conn.query(
         `INSERT INTO queue_items
            (session_id, video_id, description, added_by, guest_id,
-            status, item_type, item_source, sort_order, loop_id, loop_run)
-         VALUES (?, ?, ?, ?, ?, 'queued', 'music', ?, ?, ?, ?)`,
-        [sessionId, s.video_id, s.description || null, uid, gid, src, so, loopId, runNumber],
+            status, item_type, item_source, sort_order, loop_id, loop_run, section_id)
+         VALUES (?, ?, ?, ?, ?, 'queued', 'music', ?, ?, ?, ?, ?)`,
+        [sessionId, s.video_id, s.description || null, uid, gid, src, so, loopId, runNumber, sid],
       );
       ids.push(ins.insertId);
     }
@@ -116,17 +117,18 @@ async function loopStatus(conn, loopId) {
 
 // Create a loop object and materialize its first run. Called from the create_loop
 // change request's apply (inside its transaction). Returns { loopId, insertedIds }.
-async function createLoop(conn, sessionId, recipe, totalRuns, onComplete, proposer) {
+async function createLoop(conn, sessionId, recipe, totalRuns, onComplete, proposer, sectionId) {
   const [ins] = await conn.query(
     `INSERT INTO loops
        (session_id, recipe, total_runs, completed_runs, status, on_complete,
-        created_by_user_id, created_by_guest_id)
-     VALUES (?, ?, ?, 0, 'active', ?, ?, ?)`,
+        section_id, created_by_user_id, created_by_guest_id)
+     VALUES (?, ?, ?, 0, 'active', ?, ?, ?, ?)`,
     [
       sessionId,
       toJson(recipe),
       totalRuns ?? null,
       onComplete || "none",
+      sectionId ?? null,
       proposer?.user_id || null,
       proposer?.guest_id || null,
     ],

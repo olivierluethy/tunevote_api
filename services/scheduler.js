@@ -5,6 +5,7 @@ const {
   reconcileExpired: reconcileExpiredChangeRequests,
   autoProposePauses,
   processLoopCompletions,
+  processSectionCompletions,
   proposeAiSuggestions,
 } = require("./changeRequests");
 
@@ -70,6 +71,13 @@ async function reconcileOnce({
     await processLoopCompletions();
   } catch (e) {
     console.error("[reconciler] loop on-complete failed:", e.message);
+  }
+
+  // Section "what happens after": fire a completed section's on_complete rule.
+  try {
+    await processSectionCompletions();
+  } catch (e) {
+    console.error("[reconciler] section on-complete failed:", e.message);
   }
 
   // AI suggestions: opt-in, key-gated. No-op unless a session enabled the rule.
