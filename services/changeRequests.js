@@ -683,6 +683,8 @@ const handlers = {
           if (!Number.isInteger(value) || value < 2 || value > 50) {
             throw new HttpError(400, "Wert muss 2–50 Songs sein");
           }
+        } else if (key === "poll_decide_on_expiry") {
+          value = value ? 1 : 0; // boolean flag
         } else if (!(value > 0 && value <= 1)) {
           throw new HttpError(400, "Quorum muss zwischen 0 und 1 liegen");
         }
@@ -723,6 +725,7 @@ const ALLOWED_RULE_KEYS = new Set([
   "quorum.poll",
   "duration_seconds",
   "auto_pause_after_songs",
+  "poll_decide_on_expiry",
 ]);
 
 async function loadRules(sessionId, conn = pool) {
@@ -1224,6 +1227,7 @@ async function resolve(crId) {
     // their own type/payload on approve; polls apply the WINNING option's.
     let approved = false;
     let winnerOption = null;
+    let strictLeader = false; // a clear leader exists (may still lack quorum)
 
     if (options && options.length && cr.vote_method === "ranking") {
       // Borda count: each ballot gives an option (N-1 - position) points.
@@ -1257,7 +1261,8 @@ async function resolve(crId) {
         }
       }
       // Enough voters ranked (turnout quorum) and there's a strict Borda winner.
-      approved = !!winnerOption && lead > 0 && turnout >= needed && !tie;
+      strictLeader = !!winnerOption && lead > 0 && !tie;
+      approved = strictLeader && turnout >= needed;
     } else if (options && options.length) {
       const [orows] = await connection.query(
         `SELECT option_id, COUNT(*) AS cnt FROM change_request_votes
@@ -1278,7 +1283,8 @@ async function resolve(crId) {
           tie = true;
         }
       }
-      approved = !!winnerOption && leadCount > 0 && leadCount >= needed && !tie;
+      strictLeader = !!winnerOption && leadCount > 0 && !tie;
+      approved = strictLeader && leadCount >= needed;
     } else {
       const [[votes]] = await connection.query(
         `SELECT COUNT(*) AS cnt FROM change_request_votes WHERE change_request_id = ?`,
@@ -1287,6 +1293,13 @@ async function resolve(crId) {
       // A suggestion can't be applied until it has crossed its support threshold.
       const activated = !cr.min_support || cr.activated_at;
       approved = !!activated && needed > 0 && votes.cnt >= needed;
+    }
+
+    // Rule "poll_decide_on_expiry" (#67): at the deadline a poll's clear leader
+    // wins even below quorum, so a decision is always reached rather than lapsing.
+    if (!approved && expired && options && options.length && strictLeader) {
+      const rules = await loadRules(sessionId, connection);
+      if (rules.poll_decide_on_expiry) approved = true;
     }
 
     if (!approved && !expired) {
