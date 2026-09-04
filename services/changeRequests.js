@@ -629,6 +629,33 @@ const handlers = {
     },
     describe: () => "Änderung rückgängig machen",
   },
+
+  // ------------------------------------------------------- multi-option poll
+  // A poll never applies directly; the winning OPTION's handler does. Only a
+  // describe() is needed (the option payloads are validated at create time).
+  poll: {
+    quorumPercent: 0.5,
+    durationSeconds: 60,
+    describe: (p = {}) => p.question || "Abstimmung",
+  },
+
+  // "No change" — the losing branch of a yes/no, or an explicit abstain option.
+  none: {
+    quorumPercent: 0.5,
+    durationSeconds: 60,
+    async validate() {
+      return {};
+    },
+    async apply() {
+      return {
+        eventType: "poll.no_change",
+        eventPayload: {},
+        reversible: false,
+        inverse: null,
+      };
+    },
+    describe: () => "Keine Änderung",
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -659,6 +686,24 @@ async function buildDto(crRow, conn = pool) {
   const payload = fromJson(crRow.payload);
   const handler = handlers[crRow.type];
 
+  // Multi-option polls: attach each option with its live vote tally.
+  const rawOptions = fromJson(crRow.options);
+  let options = null;
+  if (rawOptions && rawOptions.length) {
+    const [orows] = await conn.query(
+      `SELECT option_id, COUNT(*) AS cnt FROM change_request_votes
+        WHERE change_request_id = ? GROUP BY option_id`,
+      [crRow.id],
+    );
+    const counts = {};
+    for (const r of orows) counts[r.option_id] = r.cnt;
+    options = rawOptions.map((o) => ({
+      id: o.id,
+      label: o.label,
+      votes: counts[o.id] || 0,
+    }));
+  }
+
   // Live "Jetzt → Danach" preview (#67 §5) — only for still-open requests, where
   // the upcoming queue is meaningful and voters need to see the effect.
   let preview = null;
@@ -679,6 +724,9 @@ async function buildDto(crRow, conn = pool) {
     payload,
     description: handler ? handler.describe(payload || {}) : crRow.type,
     preview,
+    is_poll: !!options,
+    options,
+    winner_option_id: crRow.winner_option_id || null,
     quorum_percent: Number(crRow.quorum_percent),
     votes: votes.cnt,
     live,
@@ -730,9 +778,16 @@ function clearTimer(crId) {
 // Create a new change request. proposer = { user, guest }. The proposer's own
 // upvote is recorded immediately (proposing is endorsing), then we try to resolve
 // right away so a request that already meets quorum applies without waiting.
-async function create(sessionId, type, rawPayload, proposer) {
+async function create(sessionId, type, rawPayload, proposer, options) {
+  // A request with options is a multi-option poll (see createPoll).
+  if (Array.isArray(options) && options.length) {
+    return createPoll(sessionId, rawPayload, options, proposer);
+  }
+
   const handler = handlers[type];
-  if (!handler) throw new HttpError(400, `Unbekannter Change-Type: ${type}`);
+  if (!handler || type === "poll" || type === "none") {
+    throw new HttpError(400, `Unbekannter Change-Type: ${type}`);
+  }
 
   const [[session]] = await pool.query(
     `SELECT id, status FROM sessions WHERE id = ?`,
@@ -778,17 +833,89 @@ async function create(sessionId, type, rawPayload, proposer) {
   return await buildDto(await loadCr(crId));
 }
 
-// Record an approve vote (idempotent), then try to resolve early.
-async function vote(crId, voter) {
+// Create a multi-option poll: voters pick one option, the winner (most votes,
+// meeting quorum) is applied via that option's handler. Each option's payload is
+// validated up front. rawPayload.question is the banner text.
+async function createPoll(sessionId, rawPayload, options, proposer) {
+  const [[session]] = await pool.query(
+    `SELECT id, status FROM sessions WHERE id = ?`,
+    [sessionId],
+  );
+  if (!session) throw new HttpError(404, "Session nicht gefunden");
+  if (session.status !== "live") throw new HttpError(403, "Session ist nicht live");
+  if (options.length < 2 || options.length > 6) {
+    throw new HttpError(400, "Eine Abstimmung braucht 2 bis 6 Optionen");
+  }
+
+  const seen = new Set();
+  const norm = [];
+  for (const o of options) {
+    const id = String(o?.id || "").slice(0, 64);
+    if (!id || seen.has(id)) throw new HttpError(400, "Ungültige oder doppelte Option-ID");
+    seen.add(id);
+    const type = o.type || "none";
+    const handler = handlers[type];
+    if (!handler) throw new HttpError(400, `Unbekannter Option-Typ: ${type}`);
+    let payload = {};
+    if (type !== "none" && handler.validate) {
+      payload = await handler.validate(pool, session, o.payload || {});
+    }
+    norm.push({ id, label: String(o.label || id).slice(0, 80), type, payload });
+  }
+
+  const question = String(rawPayload?.question || "Abstimmung").slice(0, 140);
+  const quorumPercent = handlers.poll.quorumPercent;
+  const durationSeconds = handlers.poll.durationSeconds;
+
+  const [ins] = await pool.query(
+    `INSERT INTO change_requests
+       (session_id, type, payload, options, proposed_by_user_id, proposed_by_guest_id,
+        status, quorum_percent, expires_at)
+     VALUES (?, 'poll', ?, ?, ?, ?, 'open', ?, DATE_ADD(NOW(), INTERVAL ? SECOND))`,
+    [
+      sessionId,
+      toJson({ question }),
+      toJson(norm),
+      proposer.user?.id || null,
+      proposer.guest?.id || null,
+      quorumPercent,
+      durationSeconds,
+    ],
+  );
+  const crId = ins.insertId;
+  armTimer(crId, durationSeconds * 1000);
+  await emitCreated(await loadCr(crId));
+  await resolve(crId);
+  return await buildDto(await loadCr(crId));
+}
+
+// Record a vote, then try to resolve early. For a poll, `optionId` selects an
+// option and may be changed later (upsert); for a single-action request it is a
+// plain approve upvote (idempotent).
+async function vote(crId, voter, optionId = null) {
   const cr = await loadCr(crId);
   if (!cr) throw new HttpError(404, "Change Request nicht gefunden");
   if (cr.status !== "open") throw new HttpError(409, "Abstimmung ist bereits beendet");
 
-  await pool.query(
-    `INSERT IGNORE INTO change_request_votes (change_request_id, user_id, guest_id)
-     VALUES (?, ?, ?)`,
-    [crId, voter.user?.id || null, voter.guest?.id || null],
-  );
+  const options = fromJson(cr.options);
+  if (options && options.length) {
+    if (!optionId || !options.some((o) => o.id === optionId)) {
+      throw new HttpError(400, "Bitte eine gültige Option wählen");
+    }
+    // Upsert so a voter can switch their choice while the poll is open.
+    await pool.query(
+      `INSERT INTO change_request_votes (change_request_id, user_id, guest_id, option_id)
+       VALUES (?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE option_id = VALUES(option_id)`,
+      [crId, voter.user?.id || null, voter.guest?.id || null, optionId],
+    );
+  } else {
+    await pool.query(
+      `INSERT IGNORE INTO change_request_votes (change_request_id, user_id, guest_id)
+       VALUES (?, ?, ?)`,
+      [crId, voter.user?.id || null, voter.guest?.id || null],
+    );
+  }
 
   await emitUpdated(crId);
   await resolve(crId); // applies immediately if quorum is now met
@@ -821,14 +948,51 @@ async function resolve(crId) {
     }
     sessionId = cr.session_id;
 
-    const [[votes]] = await connection.query(
-      `SELECT COUNT(*) AS cnt FROM change_request_votes WHERE change_request_id = ?`,
-      [crId],
-    );
+    const options = fromJson(cr.options);
     const live = await liveCount(sessionId, connection);
     const needed = neededVotes(live, cr.quorum_percent);
-    const approved = needed > 0 && votes.cnt >= needed;
     const expired = !!Number(cr.is_expired);
+
+    // Decide the outcome and which action to apply. Single-action requests apply
+    // their own type/payload on approve; polls apply the WINNING option's.
+    let approved = false;
+    let winnerOption = null;
+    let applyType = cr.type;
+    let applyPayload = fromJson(cr.payload) || {};
+
+    if (options && options.length) {
+      const [orows] = await connection.query(
+        `SELECT option_id, COUNT(*) AS cnt FROM change_request_votes
+          WHERE change_request_id = ? GROUP BY option_id`,
+        [crId],
+      );
+      const counts = {};
+      for (const r of orows) counts[r.option_id] = r.cnt;
+      let leadCount = -1;
+      let tie = false;
+      for (const opt of options) {
+        const c = counts[opt.id] || 0;
+        if (c > leadCount) {
+          winnerOption = opt;
+          leadCount = c;
+          tie = false;
+        } else if (c === leadCount && c > 0) {
+          tie = true;
+        }
+      }
+      // A clear winner needs the most votes, no tie for the lead, and quorum.
+      approved = !!winnerOption && leadCount > 0 && leadCount >= needed && !tie;
+      if (approved) {
+        applyType = winnerOption.type;
+        applyPayload = winnerOption.payload || {};
+      }
+    } else {
+      const [[votes]] = await connection.query(
+        `SELECT COUNT(*) AS cnt FROM change_request_votes WHERE change_request_id = ?`,
+        [crId],
+      );
+      approved = needed > 0 && votes.cnt >= needed;
+    }
 
     if (!approved && !expired) {
       await connection.commit(); // still open, keep waiting
@@ -841,14 +1005,9 @@ async function resolve(crId) {
     );
 
     if (approved && session && session.status === "live") {
-      const handler = handlers[cr.type];
+      const handler = handlers[applyType];
       try {
-        const out = await handler.apply(
-          connection,
-          session,
-          fromJson(cr.payload) || {},
-          cr,
-        );
+        const out = await handler.apply(connection, session, applyPayload, cr);
         const [ev] = await connection.query(
           `INSERT INTO session_events
              (session_id, type, change_request_id, payload, reversible, inverse, actor)
@@ -870,9 +1029,10 @@ async function resolve(crId) {
         await connection.query(
           `UPDATE change_requests
               SET status = 'applied', resolved_at = NOW(),
-                  resolution = 'quorum_met', applied_event_id = ?
+                  resolution = 'quorum_met', applied_event_id = ?,
+                  winner_option_id = ?
             WHERE id = ?`,
-          [ev.insertId, crId],
+          [ev.insertId, winnerOption?.id || null, crId],
         );
         resolvedStatus = "applied";
         afterEffects = out.after ? [out.after] : [];
@@ -890,8 +1050,13 @@ async function resolve(crId) {
         console.error(`[change-request ${crId}] apply failed:`, applyErr.message);
       }
     } else {
-      // Expired without quorum, or the session is no longer live.
-      const resolution = expired ? "expired_no_quorum" : "session_not_live";
+      // No clear/quorum winner by the deadline, or the session is no longer live.
+      const resolution =
+        options && options.length
+          ? "poll_no_winner"
+          : expired
+            ? "expired_no_quorum"
+            : "session_not_live";
       await connection.query(
         `UPDATE change_requests
             SET status = 'expired', resolved_at = NOW(), resolution = ?

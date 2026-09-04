@@ -49,14 +49,14 @@ function fail(res, err) {
 // POST /sessions/:id/change-requests  { type, payload }
 router.post("/sessions/:id/change-requests", async (req, res) => {
   const sessionId = parseInt(req.params.id, 10);
-  const { type, payload } = req.body || {};
+  const { type, payload, options } = req.body || {};
   try {
     const identity = await identify(req);
     if (!identity.user && !identity.guest) {
       return res.status(401).json({ error: "Unauthorized" });
     }
     await assertLiveParticipant(sessionId, identity);
-    const dto = await create(sessionId, type, payload, identity);
+    const dto = await create(sessionId, type, payload, identity, options);
     res.status(201).json(dto);
   } catch (err) {
     fail(res, err);
@@ -102,7 +102,8 @@ router.post("/change-requests/:crId/vote", async (req, res) => {
     );
     if (!cr) return res.status(404).json({ error: "Change Request nicht gefunden" });
     await assertLiveParticipant(cr.session_id, identity);
-    const dto = await vote(crId, identity);
+    const { option_id } = req.body || {};
+    const dto = await vote(crId, identity, option_id);
     res.json(dto);
   } catch (err) {
     fail(res, err);
