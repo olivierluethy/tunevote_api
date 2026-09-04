@@ -27,11 +27,18 @@ const fromJson = (v) => {
 const sourceOf = (loop) =>
   loop.created_by_user_id ? "user" : loop.created_by_guest_id ? "guest" : "ai";
 
+// A recipe step is a pause or a music item. Legacy recipes (no `kind`, just a
+// video_id) are treated as music.
+const stepIsPause = (s) => s?.kind === "pause";
+const stepIsValid = (s) => (stepIsPause(s) ? Number(s.duration_seconds) > 0 : !!s?.video_id);
+const stepLabel = (s) =>
+  stepIsPause(s) ? `⏸ ${s.duration_seconds || 30}s` : s?.description || "Song";
+
 // Insert one run of `recipe` right after the currently playing song, spread evenly
 // between it and the next queued item so ordering stays stable. Returns the new ids.
 async function insertRunAfterCurrent(conn, sessionId, recipe, loopId, runNumber, loop) {
-  const songs = (recipe || []).filter((s) => s && s.video_id);
-  if (!songs.length) return [];
+  const steps = (recipe || []).filter(stepIsValid);
+  if (!steps.length) return [];
 
   const [[playing]] = await conn.query(
     `SELECT COALESCE(sort_order, id) AS ord FROM queue_items
@@ -47,7 +54,7 @@ async function insertRunAfterCurrent(conn, sessionId, recipe, loopId, runNumber,
         WHERE session_id = ? AND status = 'queued' AND COALESCE(sort_order, id) > ?`,
       [sessionId, anchor],
     );
-    boundary = nb.nb != null ? Number(nb.nb) : anchor + songs.length + 1;
+    boundary = nb.nb != null ? Number(nb.nb) : anchor + steps.length + 1;
   } else {
     const [[m]] = await conn.query(
       `SELECT MAX(COALESCE(sort_order, id)) AS mx FROM queue_items
@@ -55,32 +62,37 @@ async function insertRunAfterCurrent(conn, sessionId, recipe, loopId, runNumber,
       [sessionId],
     );
     anchor = Number(m.mx) || 0;
-    boundary = anchor + songs.length + 1;
+    boundary = anchor + steps.length + 1;
   }
-  const step = (boundary - anchor) / (songs.length + 1);
+  const step = (boundary - anchor) / (steps.length + 1);
   const src = sourceOf(loop);
+  const uid = loop.created_by_user_id || null;
+  const gid = loop.created_by_guest_id || null;
   const ids = [];
   let slot = 0;
-  for (const s of songs) {
+  for (const s of steps) {
     slot++;
-    const [ins] = await conn.query(
-      `INSERT INTO queue_items
-         (session_id, video_id, description, added_by, guest_id,
-          status, item_type, item_source, sort_order, loop_id, loop_run)
-       VALUES (?, ?, ?, ?, ?, 'queued', 'music', ?, ?, ?, ?)`,
-      [
-        sessionId,
-        s.video_id,
-        s.description || null,
-        loop.created_by_user_id || null,
-        loop.created_by_guest_id || null,
-        src,
-        anchor + step * slot,
-        loopId,
-        runNumber,
-      ],
-    );
-    ids.push(ins.insertId);
+    const so = anchor + step * slot;
+    if (stepIsPause(s)) {
+      const dur = Math.max(5, Math.min(600, Number(s.duration_seconds) || 30));
+      const [ins] = await conn.query(
+        `INSERT INTO queue_items
+           (session_id, item_type, description, pause_duration_seconds,
+            added_by, guest_id, status, item_source, sort_order, loop_id, loop_run)
+         VALUES (?, 'pause', ?, ?, ?, ?, 'queued', ?, ?, ?, ?)`,
+        [sessionId, "Pause (Loop)", dur, uid, gid, src, so, loopId, runNumber],
+      );
+      ids.push(ins.insertId);
+    } else {
+      const [ins] = await conn.query(
+        `INSERT INTO queue_items
+           (session_id, video_id, description, added_by, guest_id,
+            status, item_type, item_source, sort_order, loop_id, loop_run)
+         VALUES (?, ?, ?, ?, ?, 'queued', 'music', ?, ?, ?, ?)`,
+        [sessionId, s.video_id, s.description || null, uid, gid, src, so, loopId, runNumber],
+      );
+      ids.push(ins.insertId);
+    }
   }
   return ids;
 }
@@ -90,7 +102,6 @@ async function loopStatus(conn, loopId) {
   const [[loop]] = await conn.query(`SELECT * FROM loops WHERE id = ?`, [loopId]);
   if (!loop) return null;
   const recipe = fromJson(loop.recipe) || [];
-  const titles = recipe.map((s) => s.description || "Song");
   return {
     id: loop.id,
     session_id: loop.session_id,
@@ -98,22 +109,24 @@ async function loopStatus(conn, loopId) {
     total_runs: loop.total_runs, // null = endless
     completed_runs: loop.completed_runs,
     current_run: loop.status === "active" ? loop.completed_runs + 1 : loop.completed_runs,
-    songs: titles,
+    songs: recipe.map(stepLabel),
+    on_complete: loop.on_complete || "none",
   };
 }
 
 // Create a loop object and materialize its first run. Called from the create_loop
 // change request's apply (inside its transaction). Returns { loopId, insertedIds }.
-async function createLoop(conn, sessionId, recipe, totalRuns, proposer) {
+async function createLoop(conn, sessionId, recipe, totalRuns, onComplete, proposer) {
   const [ins] = await conn.query(
     `INSERT INTO loops
-       (session_id, recipe, total_runs, completed_runs, status,
+       (session_id, recipe, total_runs, completed_runs, status, on_complete,
         created_by_user_id, created_by_guest_id)
-     VALUES (?, ?, ?, 0, 'active', ?, ?)`,
+     VALUES (?, ?, ?, 0, 'active', ?, ?, ?)`,
     [
       sessionId,
       toJson(recipe),
       totalRuns ?? null,
+      onComplete || "none",
       proposer?.user_id || null,
       proposer?.guest_id || null,
     ],

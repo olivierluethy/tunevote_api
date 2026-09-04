@@ -453,50 +453,98 @@ const handlers = {
     quorumPercent: 0.5,
     durationSeconds: 45,
     async validate(conn, session, payload = {}) {
-      let ids = Array.isArray(payload.queue_item_ids)
-        ? payload.queue_item_ids.map(Number).filter(Number.isFinite)
-        : [];
-      if (!ids.length) {
+      // Normalize an ordered step list: music (queue_item_id) or pause, in any
+      // order/repetition. Falls back to queue_item_ids, then the current song.
+      let raw = [];
+      if (Array.isArray(payload.steps) && payload.steps.length) {
+        raw = payload.steps;
+      } else if (Array.isArray(payload.queue_item_ids) && payload.queue_item_ids.length) {
+        raw = payload.queue_item_ids.map((id) => ({ queue_item_id: id }));
+      } else {
         const playing = await currentPlaying(conn, session.id);
-        if (playing) ids = [playing.id];
+        if (playing) raw = [{ queue_item_id: playing.id }];
       }
-      if (!ids.length) throw new HttpError(409, "Kein Song zum Loopen");
-      const [rows] = await conn.query(
-        `SELECT id FROM queue_items
-          WHERE session_id = ? AND item_type = 'music' AND video_id IS NOT NULL
-            AND id IN (${ids.map(() => "?").join(",")})`,
-        [session.id, ...ids],
-      );
-      const found = new Set(rows.map((r) => r.id));
-      const ordered = ids.filter((id) => found.has(id));
-      if (!ordered.length) throw new HttpError(404, "Songs nicht gefunden");
+      if (!raw.length) throw new HttpError(409, "Kein Song zum Loopen");
+      if (raw.length > 20) throw new HttpError(400, "Loop-Sequenz zu lang (max. 20 Schritte)");
+
+      const musicIds = raw
+        .filter((s) => s.kind !== "pause" && s.pause_seconds == null)
+        .map((s) => Number(s.queue_item_id))
+        .filter(Number.isFinite);
+      let found = new Set();
+      if (musicIds.length) {
+        const [rows] = await conn.query(
+          `SELECT id FROM queue_items
+            WHERE session_id = ? AND item_type = 'music' AND video_id IS NOT NULL
+              AND id IN (${musicIds.map(() => "?").join(",")})`,
+          [session.id, ...musicIds],
+        );
+        found = new Set(rows.map((r) => r.id));
+      }
+
+      const steps = [];
+      for (const s of raw) {
+        if (s.kind === "pause" || s.pause_seconds != null) {
+          const dur = Number(s.pause_seconds ?? s.duration_seconds);
+          if (!Number.isFinite(dur) || dur < 5 || dur > 600) {
+            throw new HttpError(400, "Pausendauer muss 5–600 Sekunden sein");
+          }
+          steps.push({ kind: "pause", duration_seconds: Math.floor(dur) });
+        } else if (found.has(Number(s.queue_item_id))) {
+          steps.push({ kind: "music", queue_item_id: Number(s.queue_item_id) });
+        }
+      }
+      if (!steps.some((s) => s.kind === "music")) {
+        throw new HttpError(404, "Kein gültiger Song im Loop");
+      }
       const endless = payload.endless === true || payload.repeat === "endless";
       const repeat = endless ? null : Math.max(2, Math.min(10, Number(payload.repeat) || 3));
-      return { queue_item_ids: ordered, repeat, endless };
+      const on_complete = payload.on_complete === "propose_pause" ? "propose_pause" : "none";
+      return { steps, repeat, endless, on_complete };
     },
     async apply(conn, session, payload, cr) {
-      const ids = payload.queue_item_ids;
-      const [srcRows] = await conn.query(
-        `SELECT id, video_id, description FROM queue_items
-          WHERE session_id = ? AND id IN (${ids.map(() => "?").join(",")})`,
-        [session.id, ...ids],
-      );
-      const byId = new Map(srcRows.map((r) => [r.id, r]));
-      const recipe = ids
-        .map((id) => byId.get(id))
-        .filter((r) => r && r.video_id)
-        .map((r) => ({ video_id: r.video_id, description: r.description }));
+      const steps = payload.steps;
+      const musicIds = steps.filter((s) => s.kind === "music").map((s) => s.queue_item_id);
+      const byId = new Map();
+      if (musicIds.length) {
+        const [srcRows] = await conn.query(
+          `SELECT id, video_id, description FROM queue_items
+            WHERE session_id = ? AND id IN (${musicIds.map(() => "?").join(",")})`,
+          [session.id, ...musicIds],
+        );
+        for (const r of srcRows) byId.set(r.id, r);
+      }
+      const recipe = steps
+        .map((s) => {
+          if (s.kind === "pause") {
+            return { kind: "pause", duration_seconds: s.duration_seconds };
+          }
+          const r = byId.get(s.queue_item_id);
+          return r && r.video_id
+            ? { kind: "music", video_id: r.video_id, description: r.description }
+            : null;
+        })
+        .filter(Boolean);
 
       // Create a live loop object; it materializes run 1 now, and playback.js
       // enqueues each following run when the previous one ends.
       const totalRuns = payload.endless ? null : payload.repeat;
-      const { loopId } = await loops.createLoop(conn, session.id, recipe, totalRuns, {
-        user_id: cr.proposed_by_user_id,
-        guest_id: cr.proposed_by_guest_id,
-      });
+      const { loopId } = await loops.createLoop(
+        conn,
+        session.id,
+        recipe,
+        totalRuns,
+        payload.on_complete,
+        { user_id: cr.proposed_by_user_id, guest_id: cr.proposed_by_guest_id },
+      );
       return {
         eventType: "loop.created",
-        eventPayload: { loop_id: loopId, total_runs: totalRuns, source_ids: ids },
+        eventPayload: {
+          loop_id: loopId,
+          total_runs: totalRuns,
+          steps: recipe.length,
+          on_complete: payload.on_complete,
+        },
         reversible: true,
         inverse: { op: "archive_loop", loop_id: loopId },
         emits: [
@@ -505,20 +553,29 @@ const handlers = {
         ],
       };
     },
-    describe: (p = {}) =>
-      p.endless ? "Endlos-Loop erstellen" : `Loop ×${p.repeat ?? 3} erstellen`,
+    describe: (p = {}) => {
+      const steps = p.steps || [];
+      const pauses = steps.filter((s) => s.kind === "pause").length;
+      const base = p.endless ? "Endlos-Loop" : `Loop ×${p.repeat ?? 3}`;
+      return pauses
+        ? `${base} (${steps.length} Schritte, ${pauses} Pause${pauses > 1 ? "n" : ""})`
+        : base;
+    },
     preview: (win, p = {}) => {
       const before = win.map(labelOf);
-      const ids = p.queue_item_ids || [];
-      const names = ids.map(
-        (id) => labelOf(win.find((w) => w.id === id)) || "Song",
+      const names = (p.steps || []).map((s) =>
+        s.kind === "pause"
+          ? `⏸ ${s.duration_seconds}s`
+          : labelOf(win.find((w) => w.id === s.queue_item_id)) || "Song",
       );
       const repeat = p.endless ? "∞" : (p.repeat ?? 3);
       const head = win[0]?.status === "playing" ? [before[0]] : [];
       const rest = win[0]?.status === "playing" ? before.slice(1) : before;
+      const tail =
+        p.on_complete === "propose_pause" ? ["→ danach Pause vorschlagen"] : [];
       return {
         before,
-        after: [...head, `🔁 ${names.join(" → ")} ×${repeat}`, ...rest],
+        after: [...head, `🔁 ${names.join(" → ")} ×${repeat}`, ...tail, ...rest],
       };
     },
   },
@@ -1509,6 +1566,46 @@ async function autoProposePauses() {
   }
 }
 
+// Loop "what happens after" (#66): when a loop with on_complete='propose_pause'
+// ends, propose a pause suggestion once. Called each reconciler tick.
+async function processLoopCompletions() {
+  const [rows] = await pool.query(
+    `SELECT l.id AS loop_id, l.session_id
+       FROM loops l
+       JOIN sessions s ON s.id = l.session_id
+      WHERE l.status = 'ended' AND l.on_complete = 'propose_pause'
+        AND l.on_complete_done = 0 AND s.status = 'live'`,
+  );
+  for (const r of rows) {
+    // Mark handled first (atomically) so a create failure can't loop forever.
+    const [upd] = await pool.query(
+      `UPDATE loops SET on_complete_done = 1 WHERE id = ? AND on_complete_done = 0`,
+      [r.loop_id],
+    );
+    if (!upd.affectedRows) continue;
+    const [[live]] = await pool.query(
+      `SELECT COUNT(*) AS c FROM session_participants
+        WHERE session_id = ? AND is_live = 1`,
+      [r.session_id],
+    );
+    if (live.c < 1) continue;
+    const minSupport = Math.min(3, Math.max(1, live.c));
+    try {
+      await create(
+        r.session_id,
+        "insert_pause",
+        { duration_seconds: 60 },
+        { user: null, guest: null },
+        null,
+        null,
+        minSupport,
+      );
+    } catch (e) {
+      console.warn(`[loop on_complete] session ${r.session_id}:`, e.message);
+    }
+  }
+}
+
 // Read-only session metrics (#67 §10) derived from the event log + change
 // requests + queue. Powers the end-of-session summary.
 async function computeMetrics(sessionId) {
@@ -1579,6 +1676,7 @@ module.exports = {
   resolve,
   reconcileExpired,
   autoProposePauses,
+  processLoopCompletions,
   buildDto,
   loadCr,
   loadRules,
