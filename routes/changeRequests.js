@@ -16,6 +16,7 @@ const {
   HttpError,
   computeMetrics,
   loadRules,
+  sectionsForSession,
 } = require("../services/changeRequests");
 const { activeLoops } = require("../services/loops");
 
@@ -135,6 +136,16 @@ router.get("/sessions/:id/rules", async (req, res) => {
   const sessionId = parseInt(req.params.id, 10);
   try {
     res.json(await loadRules(sessionId));
+  } catch (err) {
+    fail(res, err);
+  }
+});
+
+// GET /sessions/:id/sections  → named sections with their items (#66)
+router.get("/sessions/:id/sections", async (req, res) => {
+  const sessionId = parseInt(req.params.id, 10);
+  try {
+    res.json(await sectionsForSession(sessionId));
   } catch (err) {
     fail(res, err);
   }
