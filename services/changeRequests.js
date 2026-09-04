@@ -164,6 +164,14 @@ async function applyInverse(conn, session, inverse) {
           );
         }
         break;
+      case "restore_section_name":
+        if (op.name != null) {
+          await conn.query(
+            `UPDATE sections SET name = ? WHERE id = ? AND session_id = ?`,
+            [op.name, op.section_id, session.id],
+          );
+        }
+        break;
       default:
         console.warn(`[change-request] unknown inverse op: ${op.op}`);
     }
@@ -928,6 +936,113 @@ const handlers = {
       };
     },
     describe: () => "Zu Abschnitt springen",
+  },
+
+  // --- sections slice 2: reorder + rename ----------------------------------
+  move_section: {
+    quorumPercent: 0.5,
+    durationSeconds: 45,
+    async validate(conn, session, payload = {}) {
+      const sectionId = Number(payload.section_id);
+      if (!Number.isFinite(sectionId)) throw new HttpError(400, "section_id fehlt");
+      const [[sec]] = await conn.query(
+        `SELECT id FROM sections WHERE id = ? AND session_id = ? AND status = 'active'`,
+        [sectionId, session.id],
+      );
+      if (!sec) throw new HttpError(404, "Abschnitt nicht gefunden");
+      let afterId = payload.after_section_id ?? null;
+      if (afterId != null) {
+        afterId = Number(afterId);
+        if (afterId === sectionId) throw new HttpError(400, "Ungültige Zielposition");
+        const [[a]] = await conn.query(
+          `SELECT id FROM sections WHERE id = ? AND session_id = ? AND status = 'active'`,
+          [afterId, session.id],
+        );
+        if (!a) throw new HttpError(404, "Zielabschnitt nicht gefunden");
+      }
+      return { section_id: sectionId, after_section_id: afterId };
+    },
+    async apply(conn, session, payload) {
+      const [items] = await conn.query(
+        `SELECT id, COALESCE(sort_order, id) AS ord FROM queue_items
+          WHERE session_id = ? AND section_id = ? AND status = 'queued'
+          ORDER BY COALESCE(sort_order, id) ASC`,
+        [session.id, payload.section_id],
+      );
+      if (!items.length) throw new HttpError(409, "Keine spielbaren Songs im Abschnitt");
+      const before = items.map((r) => ({ id: r.id, sort_order: Number(r.ord) }));
+
+      let anchor;
+      if (payload.after_section_id == null) {
+        const playing = await currentPlaying(conn, session.id);
+        anchor = playing ? Number(playing.ord) : 0;
+      } else {
+        const [[m]] = await conn.query(
+          `SELECT MAX(COALESCE(sort_order, id)) AS mx FROM queue_items
+            WHERE session_id = ? AND section_id = ? AND status = 'queued'`,
+          [session.id, payload.after_section_id],
+        );
+        anchor = m.mx != null ? Number(m.mx) : 0;
+      }
+      const [[nb]] = await conn.query(
+        `SELECT MIN(COALESCE(sort_order, id)) AS nb FROM queue_items
+          WHERE session_id = ? AND status = 'queued' AND COALESCE(sort_order, id) > ?
+            AND (section_id IS NULL OR section_id <> ?)`,
+        [session.id, anchor, payload.section_id],
+      );
+      const boundary = nb.nb != null ? Number(nb.nb) : anchor + items.length + 1;
+      const step = (boundary - anchor) / (items.length + 1);
+      for (let i = 0; i < items.length; i++) {
+        await conn.query(
+          `UPDATE queue_items SET sort_order = ? WHERE id = ? AND session_id = ?`,
+          [anchor + step * (i + 1), items[i].id, session.id],
+        );
+      }
+      return {
+        eventType: "section.moved",
+        eventPayload: { section_id: payload.section_id },
+        reversible: true,
+        inverse: { op: "restore_sort_orders", items: before },
+        emits: [{ event: "sections_updated" }, { event: "queue_updated" }],
+      };
+    },
+    describe: () => "Abschnitt verschieben",
+  },
+
+  rename_section: {
+    quorumPercent: 0.5,
+    durationSeconds: 45,
+    async validate(conn, session, payload = {}) {
+      const sectionId = Number(payload.section_id);
+      if (!Number.isFinite(sectionId)) throw new HttpError(400, "section_id fehlt");
+      const name = String(payload.name || "").trim().slice(0, 80);
+      if (!name) throw new HttpError(400, "Neuer Name fehlt");
+      const [[sec]] = await conn.query(
+        `SELECT id FROM sections WHERE id = ? AND session_id = ? AND status = 'active'`,
+        [sectionId, session.id],
+      );
+      if (!sec) throw new HttpError(404, "Abschnitt nicht gefunden");
+      return { section_id: sectionId, name };
+    },
+    async apply(conn, session, payload) {
+      const [[sec]] = await conn.query(
+        `SELECT name FROM sections WHERE id = ? AND session_id = ?`,
+        [payload.section_id, session.id],
+      );
+      const oldName = sec?.name ?? null;
+      await conn.query(
+        `UPDATE sections SET name = ? WHERE id = ? AND session_id = ?`,
+        [payload.name, payload.section_id, session.id],
+      );
+      return {
+        eventType: "section.renamed",
+        eventPayload: { section_id: payload.section_id, name: payload.name },
+        reversible: true,
+        inverse: { op: "restore_section_name", section_id: payload.section_id, name: oldName },
+        emits: [{ event: "sections_updated" }],
+      };
+    },
+    describe: (p = {}) => `Abschnitt umbenennen: „${p.name || ""}"`,
   },
 };
 
@@ -1877,9 +1992,16 @@ async function processLoopCompletions() {
 
 // Named sections (#66) with their items, for the sections view.
 async function sectionsForSession(sessionId) {
+  // Order by where each section currently sits in the queue (its first queued
+  // item); sections with nothing queued fall to the end by creation order.
   const [sections] = await pool.query(
-    `SELECT id, name, status, created_at FROM sections
-      WHERE session_id = ? ORDER BY id ASC`,
+    `SELECT s.id, s.name, s.status, s.created_at,
+            (SELECT MIN(COALESCE(q.sort_order, q.id)) FROM queue_items q
+              WHERE q.session_id = s.session_id AND q.section_id = s.id
+                AND q.status = 'queued') AS position
+       FROM sections s
+      WHERE s.session_id = ?
+      ORDER BY (position IS NULL), position ASC, s.id ASC`,
     [sessionId],
   );
   const out = [];
