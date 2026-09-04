@@ -136,6 +136,34 @@ async function applyInverse(conn, session, inverse) {
       case "restore_rule":
         await upsertRule(conn, session.id, op.key, op.value ?? null);
         break;
+      case "unassign_section":
+        await conn.query(
+          `UPDATE queue_items SET section_id = NULL
+            WHERE section_id = ? AND session_id = ?`,
+          [op.section_id, session.id],
+        );
+        await conn.query(
+          `UPDATE sections SET status = 'archived' WHERE id = ? AND session_id = ?`,
+          [op.section_id, session.id],
+        );
+        break;
+      case "requeue_items":
+        if (op.queue_item_ids?.length) {
+          await conn.query(
+            `UPDATE queue_items SET status = 'queued'
+              WHERE session_id = ? AND id IN (${op.queue_item_ids.map(() => "?").join(",")})`,
+            [session.id, ...op.queue_item_ids],
+          );
+        }
+        break;
+      case "restore_sort_orders":
+        for (const it of op.items || []) {
+          await conn.query(
+            `UPDATE queue_items SET sort_order = ? WHERE id = ? AND session_id = ?`,
+            [it.sort_order, it.id, session.id],
+          );
+        }
+        break;
       default:
         console.warn(`[change-request] unknown inverse op: ${op.op}`);
     }
@@ -763,6 +791,143 @@ const handlers = {
     },
     describe: (p = {}) =>
       `Regel ändern: ${p.key} → ${p.value == null ? "Standard" : p.value}`,
+  },
+
+  // ---------------------------------------------------------- named sections
+  create_section: {
+    quorumPercent: 0.5,
+    durationSeconds: 45,
+    async validate(conn, session, payload = {}) {
+      const name = String(payload.name || "").trim().slice(0, 80);
+      if (!name) throw new HttpError(400, "Abschnittsname fehlt");
+      const ids = Array.isArray(payload.queue_item_ids)
+        ? payload.queue_item_ids.map(Number).filter(Number.isFinite)
+        : [];
+      if (!ids.length) throw new HttpError(400, "Keine Songs für den Abschnitt gewählt");
+      const [rows] = await conn.query(
+        `SELECT id FROM queue_items
+          WHERE session_id = ? AND status = 'queued'
+            AND id IN (${ids.map(() => "?").join(",")})`,
+        [session.id, ...ids],
+      );
+      const found = new Set(rows.map((r) => r.id));
+      const valid = ids.filter((id) => found.has(id));
+      if (!valid.length) throw new HttpError(404, "Songs nicht (mehr) in der Queue");
+      return { name, queue_item_ids: valid };
+    },
+    async apply(conn, session, payload, cr) {
+      const [ins] = await conn.query(
+        `INSERT INTO sections
+           (session_id, name, status, created_by_user_id, created_by_guest_id)
+         VALUES (?, ?, 'active', ?, ?)`,
+        [session.id, payload.name, cr.proposed_by_user_id || null, cr.proposed_by_guest_id || null],
+      );
+      const sectionId = ins.insertId;
+      await conn.query(
+        `UPDATE queue_items SET section_id = ?
+          WHERE session_id = ? AND id IN (${payload.queue_item_ids.map(() => "?").join(",")})`,
+        [sectionId, session.id, ...payload.queue_item_ids],
+      );
+      return {
+        eventType: "section.created",
+        eventPayload: {
+          section_id: sectionId,
+          name: payload.name,
+          count: payload.queue_item_ids.length,
+        },
+        reversible: true,
+        inverse: { op: "unassign_section", section_id: sectionId },
+        emits: [{ event: "sections_updated" }, { event: "queue_updated" }],
+      };
+    },
+    describe: (p = {}) => `Abschnitt „${p.name || "Abschnitt"}" erstellen`,
+  },
+
+  skip_section: {
+    quorumPercent: 0.5,
+    durationSeconds: 45,
+    async validate(conn, session, payload = {}) {
+      const sectionId = Number(payload.section_id);
+      if (!Number.isFinite(sectionId)) throw new HttpError(400, "section_id fehlt");
+      const [[sec]] = await conn.query(
+        `SELECT id FROM sections WHERE id = ? AND session_id = ? AND status = 'active'`,
+        [sectionId, session.id],
+      );
+      if (!sec) throw new HttpError(404, "Abschnitt nicht gefunden");
+      return { section_id: sectionId };
+    },
+    async apply(conn, session, payload) {
+      const [items] = await conn.query(
+        `SELECT id FROM queue_items
+          WHERE session_id = ? AND section_id = ? AND status = 'queued'`,
+        [session.id, payload.section_id],
+      );
+      const ids = items.map((r) => r.id);
+      if (!ids.length) throw new HttpError(409, "Keine spielbaren Songs im Abschnitt");
+      await conn.query(
+        `UPDATE queue_items SET status = 'archived'
+          WHERE session_id = ? AND id IN (${ids.map(() => "?").join(",")})`,
+        [session.id, ...ids],
+      );
+      return {
+        eventType: "section.skipped",
+        eventPayload: { section_id: payload.section_id, count: ids.length },
+        reversible: true,
+        inverse: { op: "requeue_items", queue_item_ids: ids },
+        emits: [{ event: "sections_updated" }, { event: "queue_updated" }],
+      };
+    },
+    describe: () => "Abschnitt überspringen",
+  },
+
+  jump_to_section: {
+    quorumPercent: 0.5,
+    durationSeconds: 45,
+    async validate(conn, session, payload = {}) {
+      const sectionId = Number(payload.section_id);
+      if (!Number.isFinite(sectionId)) throw new HttpError(400, "section_id fehlt");
+      const [[sec]] = await conn.query(
+        `SELECT id FROM sections WHERE id = ? AND session_id = ? AND status = 'active'`,
+        [sectionId, session.id],
+      );
+      if (!sec) throw new HttpError(404, "Abschnitt nicht gefunden");
+      return { section_id: sectionId };
+    },
+    async apply(conn, session, payload) {
+      const [items] = await conn.query(
+        `SELECT id, COALESCE(sort_order, id) AS ord FROM queue_items
+          WHERE session_id = ? AND section_id = ? AND status = 'queued'
+          ORDER BY COALESCE(sort_order, id) ASC`,
+        [session.id, payload.section_id],
+      );
+      if (!items.length) throw new HttpError(409, "Keine spielbaren Songs im Abschnitt");
+      const before = items.map((r) => ({ id: r.id, sort_order: Number(r.ord) }));
+      // Move the whole block right after the currently playing item.
+      const playing = await currentPlaying(conn, session.id);
+      const anchor = playing ? Number(playing.ord) : 0;
+      const [[nb]] = await conn.query(
+        `SELECT MIN(COALESCE(sort_order, id)) AS nb FROM queue_items
+          WHERE session_id = ? AND status = 'queued' AND COALESCE(sort_order, id) > ?
+            AND (section_id IS NULL OR section_id <> ?)`,
+        [session.id, anchor, payload.section_id],
+      );
+      const boundary = nb.nb != null ? Number(nb.nb) : anchor + items.length + 1;
+      const step = (boundary - anchor) / (items.length + 1);
+      for (let i = 0; i < items.length; i++) {
+        await conn.query(
+          `UPDATE queue_items SET sort_order = ? WHERE id = ? AND session_id = ?`,
+          [anchor + step * (i + 1), items[i].id, session.id],
+        );
+      }
+      return {
+        eventType: "section.jumped",
+        eventPayload: { section_id: payload.section_id },
+        reversible: true,
+        inverse: { op: "restore_sort_orders", items: before },
+        emits: [{ event: "sections_updated" }, { event: "queue_updated" }],
+      };
+    },
+    describe: () => "Zu Abschnitt springen",
   },
 };
 
@@ -1710,6 +1875,40 @@ async function processLoopCompletions() {
   }
 }
 
+// Named sections (#66) with their items, for the sections view.
+async function sectionsForSession(sessionId) {
+  const [sections] = await pool.query(
+    `SELECT id, name, status, created_at FROM sections
+      WHERE session_id = ? ORDER BY id ASC`,
+    [sessionId],
+  );
+  const out = [];
+  for (const s of sections) {
+    const [items] = await pool.query(
+      `SELECT qi.id, qi.item_type, qi.status,
+              COALESCE(yvc.title, qi.description, 'Song') AS title
+         FROM queue_items qi
+         LEFT JOIN youtube_video_cache yvc ON yvc.youtube_id = qi.video_id
+        WHERE qi.session_id = ? AND qi.section_id = ?
+        ORDER BY COALESCE(qi.sort_order, qi.id) ASC`,
+      [sessionId, s.id],
+    );
+    out.push({
+      id: s.id,
+      name: s.name,
+      status: s.status,
+      items: items.map((i) => ({
+        id: i.id,
+        title: i.title,
+        item_type: i.item_type,
+        status: i.status,
+      })),
+      queued_count: items.filter((i) => i.status === "queued").length,
+    });
+  }
+  return out;
+}
+
 // Read-only session metrics (#67 §10) derived from the event log + change
 // requests + queue. Powers the end-of-session summary.
 async function computeMetrics(sessionId) {
@@ -1786,4 +1985,5 @@ module.exports = {
   loadCr,
   loadRules,
   computeMetrics,
+  sectionsForSession,
 };
