@@ -115,7 +115,7 @@ router.get("/sessions/:id/events", async (req, res) => {
   try {
     const [rows] = await pool.query(
       `SELECT id, session_id, type, change_request_id, payload, reversible,
-              inverse, actor, created_at
+              inverse, actor, created_at, undone_at
          FROM session_events
         WHERE session_id = ?
         ORDER BY id DESC

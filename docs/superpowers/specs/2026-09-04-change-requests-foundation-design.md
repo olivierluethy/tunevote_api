@@ -99,6 +99,30 @@ dürfen abstimmen (analog #13-Check im Song-Voting).
 - Quick-Action-Auslöser mit den vier Types.
 - Socket-Handler für die drei neuen Events in `SessionPage`/`PlaybackContext`.
 
+## Folge-Slices (umgesetzt im selben Zug)
+
+Auf dem Fundament aufbauend, ohne dessen Kern zu ändern:
+
+- **Demokratisches Undo** — neuer Change-Type `undo_event` (payload `{event_id}`):
+  führt die im Event gespeicherte `inverse`-Operation aus und markiert das Event
+  `undone_at` (Migration `20260904000002`). Nur reversible, noch nicht rückgängig
+  gemachte Events sind wählbar. `applyInverse` deckt `archive_item`,
+  `requeue_item`, `archive_items`, `restore_sort_order` ab.
+- **Loops** — `create_loop` (payload `{queue_item_ids, repeat 2..10}`, Default =
+  aktueller Song): fügt `repeat`×Kopien direkt nach dem laufenden Song ein
+  (sort_order gleichmäßig verteilt). `inverse` = alle eingefügten Kopien
+  archivieren → per Undo entfernbar.
+- **Reorder** — `move_item` (payload `{queue_item_id, after_item_id|null}`,
+  null = ganz nach vorne): setzt `sort_order` neu; `inverse` =
+  `restore_sort_order` auf den alten Wert.
+- **Live-Preview** (#67 §5) — jeder offene Change-Request-DTO trägt ein
+  `preview: { before, after }` (die nächsten Queue-Labels als „Jetzt → Danach"),
+  berechnet aus einem `queueWindow`-Snapshot pro Handler.
+- **Mobile-First-UX** (#68, erster Schritt) — `BottomSheet` (Slide-up, große
+  Touch-Targets, Swipe-to-close), Steuerzentrale `QuickChangeActions`
+  (Schnellaktionen + pro-Song Als-Nächstes/Loop/Entfernen), `ChangeHistory`-Sheet
+  mit Undo, Preview-Darstellung im Banner.
+
 ## Integrations-Risiken
 
 - Einziger Eingriff in die Playback-Engine: `ORDER BY`-Wechsel (Fallback auf id =
