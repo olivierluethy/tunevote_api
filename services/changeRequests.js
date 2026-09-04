@@ -19,6 +19,7 @@
 const pool = require("../db");
 const { getIO } = require("../lib/io");
 const { advanceToNext, endSession } = require("./playback");
+const loops = require("./loops");
 
 // crId -> Timeout. Low-latency expiry; the reconciler is the durable safety net.
 const crTimers = {};
@@ -124,6 +125,12 @@ async function applyInverse(conn, session, inverse) {
           `UPDATE queue_items SET sort_order = ? WHERE id = ? AND session_id = ?`,
           [op.sort_order, op.queue_item_id, session.id],
         );
+        break;
+      case "archive_loop":
+        await loops.archiveLoop(conn, session.id, op.loop_id);
+        break;
+      case "restore_loop_runs":
+        await loops.restoreRuns(conn, session.id, op.loop_id, op.total_runs ?? null);
         break;
       default:
         console.warn(`[change-request] unknown inverse op: ${op.op}`);
@@ -460,84 +467,50 @@ const handlers = {
       const found = new Set(rows.map((r) => r.id));
       const ordered = ids.filter((id) => found.has(id));
       if (!ordered.length) throw new HttpError(404, "Songs nicht gefunden");
-      const repeat = Math.max(2, Math.min(10, Number(payload.repeat) || 3));
-      return { queue_item_ids: ordered, repeat };
+      const endless = payload.endless === true || payload.repeat === "endless";
+      const repeat = endless ? null : Math.max(2, Math.min(10, Number(payload.repeat) || 3));
+      return { queue_item_ids: ordered, repeat, endless };
     },
     async apply(conn, session, payload, cr) {
       const ids = payload.queue_item_ids;
-      const repeat = payload.repeat;
       const [srcRows] = await conn.query(
         `SELECT id, video_id, description FROM queue_items
           WHERE session_id = ? AND id IN (${ids.map(() => "?").join(",")})`,
         [session.id, ...ids],
       );
       const byId = new Map(srcRows.map((r) => [r.id, r]));
-      const sources = ids.map((id) => byId.get(id)).filter(Boolean);
+      const recipe = ids
+        .map((id) => byId.get(id))
+        .filter((r) => r && r.video_id)
+        .map((r) => ({ video_id: r.video_id, description: r.description }));
 
-      // Place the copies right after the currently playing song, spread evenly
-      // between it and the next queued item so ordering stays stable.
-      const playing = await currentPlaying(conn, session.id);
-      const count = sources.length * repeat;
-      let anchor;
-      let boundary;
-      if (playing) {
-        anchor = Number(playing.ord);
-        const [[nb]] = await conn.query(
-          `SELECT MIN(COALESCE(sort_order, id)) AS nb FROM queue_items
-            WHERE session_id = ? AND status = 'queued' AND COALESCE(sort_order, id) > ?`,
-          [session.id, anchor],
-        );
-        boundary = nb.nb != null ? Number(nb.nb) : anchor + count + 1;
-      } else {
-        const [[m]] = await conn.query(
-          `SELECT MAX(COALESCE(sort_order, id)) AS mx FROM queue_items
-            WHERE session_id = ? AND status IN ('queued','playing')`,
-          [session.id],
-        );
-        anchor = Number(m.mx) || 0;
-        boundary = anchor + count + 1;
-      }
-      const step = (boundary - anchor) / (count + 1);
-      const src = cr.proposed_by_user_id ? "user" : cr.proposed_by_guest_id ? "guest" : "ai";
-      const insertedIds = [];
-      let slot = 0;
-      for (let r = 0; r < repeat; r++) {
-        for (const s of sources) {
-          slot++;
-          const [ins] = await conn.query(
-            `INSERT INTO queue_items
-               (session_id, video_id, description, added_by, guest_id,
-                status, item_type, item_source, sort_order)
-             VALUES (?, ?, ?, ?, ?, 'queued', 'music', ?, ?)`,
-            [
-              session.id,
-              s.video_id,
-              s.description || null,
-              cr.proposed_by_user_id || null,
-              cr.proposed_by_guest_id || null,
-              src,
-              anchor + step * slot,
-            ],
-          );
-          insertedIds.push(ins.insertId);
-        }
-      }
+      // Create a live loop object; it materializes run 1 now, and playback.js
+      // enqueues each following run when the previous one ends.
+      const totalRuns = payload.endless ? null : payload.repeat;
+      const { loopId } = await loops.createLoop(conn, session.id, recipe, totalRuns, {
+        user_id: cr.proposed_by_user_id,
+        guest_id: cr.proposed_by_guest_id,
+      });
       return {
         eventType: "loop.created",
-        eventPayload: { queue_item_ids: insertedIds, source_ids: ids, repeat },
+        eventPayload: { loop_id: loopId, total_runs: totalRuns, source_ids: ids },
         reversible: true,
-        inverse: { op: "archive_items", queue_item_ids: insertedIds },
-        emits: [{ event: "queue_updated" }],
+        inverse: { op: "archive_loop", loop_id: loopId },
+        emits: [
+          { event: "queue_updated" },
+          { event: "loop_updated", payload: await loops.loopStatus(conn, loopId) },
+        ],
       };
     },
-    describe: (p = {}) => `Loop ×${p.repeat ?? 3} erstellen`,
+    describe: (p = {}) =>
+      p.endless ? "Endlos-Loop erstellen" : `Loop ×${p.repeat ?? 3} erstellen`,
     preview: (win, p = {}) => {
       const before = win.map(labelOf);
       const ids = p.queue_item_ids || [];
       const names = ids.map(
         (id) => labelOf(win.find((w) => w.id === id)) || "Song",
       );
-      const repeat = p.repeat ?? 3;
+      const repeat = p.endless ? "∞" : (p.repeat ?? 3);
       const head = win[0]?.status === "playing" ? [before[0]] : [];
       const rest = win[0]?.status === "playing" ? before.slice(1) : before;
       return {
@@ -545,6 +518,78 @@ const handlers = {
         after: [...head, `🔁 ${names.join(" → ")} ×${repeat}`, ...rest],
       };
     },
+  },
+
+  // --------------------------------------------------------------- end loop
+  end_loop: {
+    quorumPercent: 0.5,
+    durationSeconds: 45,
+    async validate(conn, session, payload = {}) {
+      const loopId = Number(payload.loop_id);
+      if (!Number.isFinite(loopId)) throw new HttpError(400, "loop_id fehlt");
+      const [[loop]] = await conn.query(
+        `SELECT id, status FROM loops WHERE id = ? AND session_id = ?`,
+        [loopId, session.id],
+      );
+      if (!loop) throw new HttpError(404, "Loop nicht gefunden");
+      if (loop.status !== "active") throw new HttpError(409, "Loop ist nicht aktiv");
+      return { loop_id: loopId };
+    },
+    async apply(conn, session, payload) {
+      const status = await loops.endLoop(conn, session.id, payload.loop_id);
+      return {
+        eventType: "loop.ended",
+        eventPayload: { loop_id: payload.loop_id },
+        reversible: false,
+        inverse: null,
+        emits: [
+          { event: "loop_updated", payload: status },
+          { event: "queue_updated" },
+        ],
+      };
+    },
+    describe: () => "Loop beenden",
+  },
+
+  // ---------------------------------------------------------- set loop runs
+  set_loop_runs: {
+    quorumPercent: 0.5,
+    durationSeconds: 45,
+    async validate(conn, session, payload = {}) {
+      const loopId = Number(payload.loop_id);
+      if (!Number.isFinite(loopId)) throw new HttpError(400, "loop_id fehlt");
+      const endless = payload.endless === true || payload.total_runs == null;
+      let totalRuns = null;
+      if (!endless) {
+        totalRuns = Number(payload.total_runs);
+        if (!Number.isInteger(totalRuns) || totalRuns < 1 || totalRuns > 50) {
+          throw new HttpError(400, "Anzahl muss zwischen 1 und 50 liegen");
+        }
+      }
+      const [[loop]] = await conn.query(
+        `SELECT id, status FROM loops WHERE id = ? AND session_id = ?`,
+        [loopId, session.id],
+      );
+      if (!loop) throw new HttpError(404, "Loop nicht gefunden");
+      if (loop.status !== "active") throw new HttpError(409, "Loop ist nicht aktiv");
+      return { loop_id: loopId, total_runs: totalRuns };
+    },
+    async apply(conn, session, payload) {
+      const res = await loops.setRuns(conn, session.id, payload.loop_id, payload.total_runs);
+      return {
+        eventType: "loop.runs_changed",
+        eventPayload: { loop_id: payload.loop_id, total_runs: payload.total_runs },
+        reversible: true,
+        inverse: {
+          op: "restore_loop_runs",
+          loop_id: payload.loop_id,
+          total_runs: res?.previous_total_runs ?? null,
+        },
+        emits: [{ event: "loop_updated", payload: res?.status }],
+      };
+    },
+    describe: (p = {}) =>
+      p.total_runs == null ? "Loop auf endlos setzen" : `Loop auf ×${p.total_runs} setzen`,
   },
 
   // -------------------------------------------------------------- undo event
