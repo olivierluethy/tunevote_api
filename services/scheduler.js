@@ -5,6 +5,7 @@ const {
   reconcileExpired: reconcileExpiredChangeRequests,
   autoProposePauses,
   processLoopCompletions,
+  proposeAiSuggestions,
 } = require("./changeRequests");
 
 // Sessions with an AI auto-fill generation in flight. Prevents the reconciler
@@ -69,6 +70,13 @@ async function reconcileOnce({
     await processLoopCompletions();
   } catch (e) {
     console.error("[reconciler] loop on-complete failed:", e.message);
+  }
+
+  // AI suggestions: opt-in, key-gated. No-op unless a session enabled the rule.
+  try {
+    await proposeAiSuggestions();
+  } catch (e) {
+    console.error("[reconciler] ai-suggest failed:", e.message);
   }
 
   // 1) Advance songs whose deadline has passed. Pass the current playing item id

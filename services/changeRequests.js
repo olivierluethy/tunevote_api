@@ -20,6 +20,7 @@ const pool = require("../db");
 const { getIO } = require("../lib/io");
 const { advanceToNext, endSession } = require("./playback");
 const loops = require("./loops");
+const { openai, CHAT_MODEL } = require("./openai"); // openai is null without a key
 
 // crId -> Timeout. Low-latency expiry; the reconciler is the durable safety net.
 const crTimers = {};
@@ -740,7 +741,7 @@ const handlers = {
           if (!Number.isInteger(value) || value < 2 || value > 50) {
             throw new HttpError(400, "Wert muss 2–50 Songs sein");
           }
-        } else if (key === "poll_decide_on_expiry") {
+        } else if (key === "poll_decide_on_expiry" || key === "ai_suggestions") {
           value = value ? 1 : 0; // boolean flag
         } else if (!(value > 0 && value <= 1)) {
           throw new HttpError(400, "Quorum muss zwischen 0 und 1 liegen");
@@ -783,6 +784,7 @@ const ALLOWED_RULE_KEYS = new Set([
   "duration_seconds",
   "auto_pause_after_songs",
   "poll_decide_on_expiry",
+  "ai_suggestions",
 ]);
 
 async function loadRules(sessionId, conn = pool) {
@@ -1566,6 +1568,108 @@ async function autoProposePauses() {
   }
 }
 
+// AI suggestions (#67): OPT-IN (session rule ai_suggestions), key-gated, and
+// off by default — so it can never affect a normal session. When enabled, the
+// assistant occasionally SUGGESTS a pause (never decides): it creates a pause
+// suggestion the community must still back. Deliberately conservative: pause-only,
+// single-flight per session, long cooldown. UNTESTED without an OPENAI_API_KEY.
+const aiInFlight = new Set();
+const aiCooldown = new Map(); // sessionId -> epoch ms
+const AI_COOLDOWN_MS = 300_000;
+
+async function proposeAiSuggestions() {
+  if (!openai) return; // no key → disabled
+  const [rows] = await pool.query(
+    `SELECT s.id AS session_id, sr.rules
+       FROM sessions s
+       JOIN session_rules sr ON sr.session_id = s.id
+      WHERE s.status = 'live'`,
+  );
+  const now = Date.now();
+  for (const r of rows) {
+    const rules = fromJson(r.rules) || {};
+    if (!rules.ai_suggestions) continue;
+    if (aiInFlight.has(r.session_id)) continue;
+    if (now < (aiCooldown.get(r.session_id) || 0)) continue;
+
+    // Don't stack pauses; only act with people present and some songs played.
+    const [[openPause]] = await pool.query(
+      `SELECT 1 AS x FROM change_requests
+        WHERE session_id = ? AND type = 'insert_pause' AND status = 'open' LIMIT 1`,
+      [r.session_id],
+    );
+    if (openPause) continue;
+    const [[pending]] = await pool.query(
+      `SELECT 1 AS x FROM queue_items
+        WHERE session_id = ? AND item_type = 'pause'
+          AND status IN ('queued','playing') LIMIT 1`,
+      [r.session_id],
+    );
+    if (pending) continue;
+    const [[live]] = await pool.query(
+      `SELECT COUNT(*) AS c FROM session_participants
+        WHERE session_id = ? AND is_live = 1`,
+      [r.session_id],
+    );
+    if (live.c < 1) continue;
+    const [recent] = await pool.query(
+      `SELECT COALESCE(yvc.title, q.description, 'Song') AS title
+         FROM queue_items q
+         LEFT JOIN youtube_video_cache yvc ON yvc.youtube_id = q.video_id
+        WHERE q.session_id = ? AND q.item_type = 'music' AND q.status = 'played'
+        ORDER BY q.playedAt DESC LIMIT 5`,
+      [r.session_id],
+    );
+    if (recent.length < 3) continue;
+
+    aiInFlight.add(r.session_id);
+    aiCooldown.set(r.session_id, now + AI_COOLDOWN_MS);
+    const titles = recent.map((x) => x.title).reverse();
+    const sessionId = r.session_id;
+    const liveCnt = live.c;
+
+    // Fire off the LLM call OUTSIDE the tick so a slow response never blocks it.
+    (async () => {
+      try {
+        const prompt =
+          `Du bist ein Musik-Session-Assistent. Zuletzt gespielt: ${titles.join(", ")}. ` +
+          `Wäre JETZT eine kurze Pause sinnvoll? Antworte NUR als JSON ohne Fließtext: ` +
+          `{"suggest":"pause"|"none","duration_seconds":<20-120>}`;
+        const completion = await openai.chat.completions.create({
+          model: CHAT_MODEL,
+          messages: [{ role: "user", content: prompt }],
+          temperature: 0.4,
+          max_tokens: 40,
+        });
+        const txt = completion.choices?.[0]?.message?.content || "";
+        let parsed = null;
+        try {
+          parsed = JSON.parse(txt.replace(/^```(?:json)?\s*|\s*```$/g, "").trim());
+        } catch {
+          parsed = null;
+        }
+        if (parsed?.suggest === "pause") {
+          const dur = Math.max(20, Math.min(120, Number(parsed.duration_seconds) || 60));
+          const minSupport = Math.min(3, Math.max(1, liveCnt));
+          await create(
+            sessionId,
+            "insert_pause",
+            { duration_seconds: dur },
+            { user: null, guest: null },
+            null,
+            null,
+            minSupport,
+          );
+        }
+      } catch (e) {
+        console.warn(`[ai-suggest] session ${sessionId}:`, e.message);
+      } finally {
+        aiInFlight.delete(sessionId);
+      }
+    })();
+  }
+}
+
 // Loop "what happens after" (#66): when a loop with on_complete='propose_pause'
 // ends, propose a pause suggestion once. Called each reconciler tick.
 async function processLoopCompletions() {
@@ -1677,6 +1781,7 @@ module.exports = {
   reconcileExpired,
   autoProposePauses,
   processLoopCompletions,
+  proposeAiSuggestions,
   buildDto,
   loadCr,
   loadRules,
