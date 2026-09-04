@@ -574,7 +574,7 @@ router.get("/sessions/:id/queue", async (req, res) => {
     LEFT JOIN guest_users g ON qi.guest_id = g.id
     WHERE qi.session_id = ?
       AND (qi.status IS NULL OR qi.status NOT IN ('suggested', 'archived'))
-    ORDER BY qi.id ASC
+    ORDER BY COALESCE(qi.sort_order, qi.id) ASC, qi.id ASC
     `,
     [id],
   );
@@ -741,7 +741,7 @@ router.post("/sessions/:id/start", async (req, res) => {
        FROM queue_items qi
        LEFT JOIN youtube_video_cache yvc ON yvc.youtube_id = qi.video_id
       WHERE qi.session_id = ? AND qi.status = 'queued'
-      ORDER BY qi.id ASC LIMIT 1`,
+      ORDER BY COALESCE(qi.sort_order, qi.id) ASC, qi.id ASC LIMIT 1`,
     [id],
   );
 

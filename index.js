@@ -78,6 +78,7 @@ app.use(require("./routes/profile"));
 app.use(require("./routes/artists"));
 app.use(require("./routes/sessions"));
 app.use(require("./routes/proposals"));
+app.use(require("./routes/changeRequests"));
 app.use(require("./routes/invites"));
 app.use(require("./routes/stats"));
 app.use(require("./routes/polls"));

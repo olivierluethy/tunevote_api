@@ -481,7 +481,7 @@ const advanceToNext = async (sessionId, expectedCurrentItemId = null) => {
        FROM queue_items qi
        LEFT JOIN youtube_video_cache yvc ON yvc.youtube_id = qi.video_id
        WHERE qi.session_id = ? AND qi.status = 'queued'
-       ORDER BY qi.id ASC
+       ORDER BY COALESCE(qi.sort_order, qi.id) ASC, qi.id ASC
        LIMIT 1`,
       [sessionId],
     );
@@ -752,6 +752,58 @@ const advanceToNext = async (sessionId, expectedCurrentItemId = null) => {
   if (armTimer) armTimer();
 };
 
+// Ends a session out-of-band from the normal playback flow (used by the
+// `end_session` change request). Mirrors advanceToNext's end-guard writes but in
+// its own transaction so it can be invoked directly. Idempotent: only a session
+// that is still 'live' is ended, so a race between two callers ends it once.
+const endSession = async (sessionId, reason = "manual") => {
+  const connection = await pool.getConnection();
+  let ended = false;
+  try {
+    await connection.beginTransaction();
+    await connection.query(`SELECT id FROM sessions WHERE id = ? FOR UPDATE`, [
+      sessionId,
+    ]);
+    const [r] = await connection.query(
+      `UPDATE sessions SET is_live = 0, status = 'ended', ended_at = NOW()
+        WHERE id = ? AND status = 'live'`,
+      [sessionId],
+    );
+    if (r.affectedRows) {
+      await connection.query(
+        `UPDATE session_participants SET is_live = 0 WHERE session_id = ?`,
+        [sessionId],
+      );
+      ended = true;
+    }
+    await connection.commit();
+  } catch (err) {
+    try {
+      await connection.rollback();
+    } catch (rollbackErr) {
+      console.error(
+        `[Session ${sessionId}] endSession rollback failed:`,
+        rollbackErr.message,
+      );
+    }
+    console.error(`[Session ${sessionId}] endSession error:`, err);
+    return false;
+  } finally {
+    connection.release();
+  }
+
+  if (!ended) return false; // already ended / not live — nothing to broadcast
+
+  // Stop the pending next-song timer so no advance fires after the session ends.
+  if (sessionTimers[sessionId]) {
+    clearTimeout(sessionTimers[sessionId]);
+    delete sessionTimers[sessionId];
+  }
+  getIO().to(String(sessionId)).emit("session_ended", { reason });
+  console.log(`[Session ${sessionId}] Session ended (${reason})`);
+  return true;
+};
+
 // Hilfsfunktion: Sendet aktuelle Live-Teilnehmer an alle in der Session
 const broadcastLiveParticipants = async (sessionId) => {
   try {
@@ -948,6 +1000,7 @@ module.exports = {
   startPhaseTimer,
   finalizeListeningForCurrentSong,
   advanceToNext,
+  endSession,
   broadcastLiveParticipants,
   broadcastParticipantCount,
   createNewPublicSession,
