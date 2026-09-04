@@ -536,12 +536,17 @@ const handlers = {
       );
       if (!loop) throw new HttpError(404, "Loop nicht gefunden");
       if (loop.status !== "active") throw new HttpError(409, "Loop ist nicht aktiv");
-      return { loop_id: loopId };
+      return { loop_id: loopId, hard: payload.hard === true };
     },
     async apply(conn, session, payload) {
-      const status = await loops.endLoop(conn, session.id, payload.loop_id);
+      // Graceful: the current run's queued copies still play. Hard: archive the
+      // remaining queued copies now so the loop stops immediately.
+      const status = payload.hard
+        ? (await loops.archiveLoop(conn, session.id, payload.loop_id),
+          await loops.loopStatus(conn, payload.loop_id))
+        : await loops.endLoop(conn, session.id, payload.loop_id);
       return {
-        eventType: "loop.ended",
+        eventType: payload.hard ? "loop.aborted" : "loop.ended",
         eventPayload: { loop_id: payload.loop_id },
         reversible: false,
         inverse: null,
@@ -551,7 +556,7 @@ const handlers = {
         ],
       };
     },
-    describe: () => "Loop beenden",
+    describe: (p = {}) => (p.hard ? "Loop sofort abbrechen" : "Loop beenden"),
   },
 
   // ---------------------------------------------------------- set loop runs
@@ -674,6 +679,10 @@ const handlers = {
           if (!Number.isInteger(value) || value < 10 || value > 600) {
             throw new HttpError(400, "Dauer muss 10–600 Sekunden sein");
           }
+        } else if (key === "auto_pause_after_songs") {
+          if (!Number.isInteger(value) || value < 2 || value > 50) {
+            throw new HttpError(400, "Wert muss 2–50 Songs sein");
+          }
         } else if (!(value > 0 && value <= 1)) {
           throw new HttpError(400, "Quorum muss zwischen 0 und 1 liegen");
         }
@@ -713,6 +722,7 @@ const ALLOWED_RULE_KEYS = new Set([
   "quorum.move_item",
   "quorum.poll",
   "duration_seconds",
+  "auto_pause_after_songs",
 ]);
 
 async function loadRules(sessionId, conn = pool) {
@@ -734,21 +744,21 @@ function durationFor(type, rules) {
 }
 
 function getRuleValue(rules, key) {
-  if (key === "duration_seconds") return rules?.duration_seconds ?? null;
   if (key.startsWith("quorum.")) return rules?.quorum?.[key.slice(7)] ?? null;
-  return null;
+  return rules?.[key] ?? null;
 }
 
 async function upsertRule(conn, sessionId, key, value) {
   const rules = await loadRules(sessionId, conn);
-  if (key === "duration_seconds") {
-    if (value == null) delete rules.duration_seconds;
-    else rules.duration_seconds = value;
-  } else if (key.startsWith("quorum.")) {
+  if (key.startsWith("quorum.")) {
     const t = key.slice(7);
     rules.quorum = rules.quorum || {};
     if (value == null) delete rules.quorum[t];
     else rules.quorum[t] = value;
+  } else if (value == null) {
+    delete rules[key];
+  } else {
+    rules[key] = value;
   }
   await conn.query(
     `INSERT INTO session_rules (session_id, rules) VALUES (?, ?)
@@ -840,6 +850,21 @@ async function buildDto(crRow, conn = pool) {
     }
   }
 
+  // Attribution (#68): resolve the proposer's display name.
+  let proposer_name = null;
+  if (crRow.proposed_by_user_id) {
+    const [[u]] = await conn.query(`SELECT username FROM users WHERE id = ?`, [
+      crRow.proposed_by_user_id,
+    ]);
+    proposer_name = u?.username || null;
+  } else if (crRow.proposed_by_guest_id) {
+    const [[g]] = await conn.query(
+      `SELECT nickname FROM guest_users WHERE id = ?`,
+      [crRow.proposed_by_guest_id],
+    );
+    proposer_name = g?.nickname || null;
+  }
+
   return {
     id: crRow.id,
     session_id: crRow.session_id,
@@ -856,8 +881,13 @@ async function buildDto(crRow, conn = pool) {
     votes: votes.cnt,
     live,
     needed: neededVotes(live, crRow.quorum_percent),
+    // Suggestion state (#67): a suggestion needs `min_support` backers before it
+    // becomes a live vote (`activated`).
+    min_support: crRow.min_support || null,
+    activated: !crRow.min_support || !!crRow.activated_at,
     proposed_by_user_id: crRow.proposed_by_user_id,
     proposed_by_guest_id: crRow.proposed_by_guest_id,
+    proposer_name,
     expires_at: crRow.expires_at,
     created_at: crRow.created_at,
     resolution: crRow.resolution,
@@ -903,7 +933,11 @@ function clearTimer(crId) {
 // Create a new change request. proposer = { user, guest }. The proposer's own
 // upvote is recorded immediately (proposing is endorsing), then we try to resolve
 // right away so a request that already meets quorum applies without waiting.
-async function create(sessionId, type, rawPayload, proposer, options, method) {
+// How long a suggestion collects support before it lapses (if it never reaches
+// its threshold it expires as "not_enough_support").
+const GATHERING_WINDOW_SEC = 180;
+
+async function create(sessionId, type, rawPayload, proposer, options, method, minSupport) {
   // A request with options is a multi-option poll (see createPoll).
   if (Array.isArray(options) && options.length) {
     return createPoll(sessionId, rawPayload, options, proposer, method);
@@ -926,11 +960,17 @@ async function create(sessionId, type, rawPayload, proposer, options, method) {
   const quorum = quorumFor(type, rules);
   const duration = durationFor(type, rules);
 
+  // A suggestion (min_support > 1) gathers backers first; a normal request is an
+  // immediate vote. The window is shorter while gathering.
+  const isSuggestion = Number(minSupport) > 1;
+  const min_support = isSuggestion ? Math.floor(minSupport) : null;
+  const windowSec = isSuggestion ? GATHERING_WINDOW_SEC : duration;
+
   const [ins] = await pool.query(
     `INSERT INTO change_requests
        (session_id, type, payload, proposed_by_user_id, proposed_by_guest_id,
-        status, quorum_percent, expires_at)
-     VALUES (?, ?, ?, ?, ?, 'open', ?, DATE_ADD(NOW(), INTERVAL ? SECOND))`,
+        status, quorum_percent, min_support, expires_at)
+     VALUES (?, ?, ?, ?, ?, 'open', ?, ?, DATE_ADD(NOW(), INTERVAL ? SECOND))`,
     [
       sessionId,
       type,
@@ -938,27 +978,57 @@ async function create(sessionId, type, rawPayload, proposer, options, method) {
       proposer.user?.id || null,
       proposer.guest?.id || null,
       quorum,
-      duration,
+      min_support,
+      windowSec,
     ],
   );
   const crId = ins.insertId;
 
-  // Proposing counts as the first upvote.
-  await pool.query(
-    `INSERT IGNORE INTO change_request_votes (change_request_id, user_id, guest_id)
-     VALUES (?, ?, ?)`,
-    [crId, proposer.user?.id || null, proposer.guest?.id || null],
-  );
+  // Proposing counts as the first upvote — but only for a real person (a
+  // system/AI-proposed suggestion has no phantom vote and must earn its support).
+  if (proposer.user || proposer.guest) {
+    await pool.query(
+      `INSERT IGNORE INTO change_request_votes (change_request_id, user_id, guest_id)
+       VALUES (?, ?, ?)`,
+      [crId, proposer.user?.id || null, proposer.guest?.id || null],
+    );
+  }
 
-  armTimer(crId, duration * 1000);
+  armTimer(crId, windowSec * 1000);
 
   const row = await loadCr(crId);
   await emitCreated(row);
 
-  // Early pass: may already meet quorum (e.g. a solo live session).
+  // Early pass: may already meet quorum (e.g. a solo live session). A suggestion
+  // that already has enough backers activates inside resolve→vote path below.
+  await maybeActivateSuggestion(crId);
   await resolve(crId);
 
   return await buildDto(await loadCr(crId));
+}
+
+// If a gathering suggestion has reached its support threshold, turn it into a
+// normal timed vote (fresh expiry, re-armed timer). No-op otherwise.
+async function maybeActivateSuggestion(crId) {
+  const cr = await loadCr(crId);
+  if (!cr || cr.status !== "open" || !cr.min_support || cr.activated_at) return;
+  if (fromJson(cr.options)) return; // suggestions apply to single-action requests
+  const [[c]] = await pool.query(
+    `SELECT COUNT(*) AS cnt FROM change_request_votes WHERE change_request_id = ?`,
+    [crId],
+  );
+  if (c.cnt < cr.min_support) return;
+  const rules = await loadRules(cr.session_id);
+  const dur = durationFor(cr.type, rules);
+  await pool.query(
+    `UPDATE change_requests
+        SET activated_at = NOW(), expires_at = DATE_ADD(NOW(), INTERVAL ? SECOND)
+      WHERE id = ? AND activated_at IS NULL`,
+    [dur, crId],
+  );
+  clearTimer(crId);
+  armTimer(crId, dur * 1000);
+  await emitUpdated(crId);
 }
 
 // Create a multi-option poll. Each option carries one or more ACTIONS (single
@@ -1080,6 +1150,7 @@ async function vote(crId, voter, optionId = null, ranking = null) {
     );
   }
 
+  await maybeActivateSuggestion(crId); // a suggestion may cross its threshold now
   await emitUpdated(crId);
   await resolve(crId); // applies immediately if quorum is now met
   return await buildDto(await loadCr(crId));
@@ -1213,7 +1284,9 @@ async function resolve(crId) {
         `SELECT COUNT(*) AS cnt FROM change_request_votes WHERE change_request_id = ?`,
         [crId],
       );
-      approved = needed > 0 && votes.cnt >= needed;
+      // A suggestion can't be applied until it has crossed its support threshold.
+      const activated = !cr.min_support || cr.activated_at;
+      approved = !!activated && needed > 0 && votes.cnt >= needed;
     }
 
     if (!approved && !expired) {
@@ -1289,9 +1362,11 @@ async function resolve(crId) {
       const resolution =
         options && options.length
           ? "poll_no_winner"
-          : expired
-            ? "expired_no_quorum"
-            : "session_not_live";
+          : cr.min_support && !cr.activated_at
+            ? "not_enough_support"
+            : expired
+              ? "expired_no_quorum"
+              : "session_not_live";
       await connection.query(
         `UPDATE change_requests
             SET status = 'expired', resolved_at = NOW(), resolution = ?
@@ -1346,6 +1421,79 @@ async function reconcileExpired() {
     );
   }
   return rows.length;
+}
+
+// Auto-pause rule (#67): sessions with `auto_pause_after_songs` set get a pause
+// SUGGESTION proposed automatically after that many songs since the last pause.
+// The community still decides — it's a suggestion needing supporters, not a
+// forced pause. Called each reconciler tick. Per-session cooldown avoids spam.
+const autoPauseCooldown = new Map(); // sessionId -> epoch ms
+const AUTO_PAUSE_COOLDOWN_MS = 120_000;
+
+async function autoProposePauses() {
+  const [rows] = await pool.query(
+    `SELECT s.id AS session_id, sr.rules
+       FROM sessions s
+       JOIN session_rules sr ON sr.session_id = s.id
+      WHERE s.status = 'live'`,
+  );
+  const now = Date.now();
+  for (const r of rows) {
+    const rules = fromJson(r.rules) || {};
+    const threshold = Number(rules.auto_pause_after_songs);
+    if (!Number.isInteger(threshold) || threshold < 2) continue;
+    if (now < (autoPauseCooldown.get(r.session_id) || 0)) continue;
+
+    // Don't stack pauses: skip while a pause vote is open or one is already queued.
+    const [[openPause]] = await pool.query(
+      `SELECT 1 AS x FROM change_requests
+        WHERE session_id = ? AND type = 'insert_pause' AND status = 'open' LIMIT 1`,
+      [r.session_id],
+    );
+    if (openPause) continue;
+    const [[pending]] = await pool.query(
+      `SELECT 1 AS x FROM queue_items
+        WHERE session_id = ? AND item_type = 'pause'
+          AND status IN ('queued','playing') LIMIT 1`,
+      [r.session_id],
+    );
+    if (pending) continue;
+
+    // Songs played since the last pause actually played.
+    const [[cnt]] = await pool.query(
+      `SELECT COUNT(*) AS c FROM queue_items
+        WHERE session_id = ? AND item_type = 'music' AND status = 'played'
+          AND playedAt > COALESCE(
+            (SELECT MAX(playedAt) FROM queue_items
+              WHERE session_id = ? AND item_type = 'pause' AND status = 'played'),
+            '1970-01-01 00:00:00')`,
+      [r.session_id, r.session_id],
+    );
+    if (cnt.c < threshold) continue;
+
+    const [[live]] = await pool.query(
+      `SELECT COUNT(*) AS c FROM session_participants
+        WHERE session_id = ? AND is_live = 1`,
+      [r.session_id],
+    );
+    if (live.c < 1) continue;
+
+    autoPauseCooldown.set(r.session_id, now + AUTO_PAUSE_COOLDOWN_MS);
+    const minSupport = Math.min(3, Math.max(1, live.c));
+    try {
+      await create(
+        r.session_id,
+        "insert_pause",
+        { duration_seconds: 60 },
+        { user: null, guest: null },
+        null,
+        null,
+        minSupport,
+      );
+    } catch (e) {
+      console.warn(`[auto-pause] session ${r.session_id}:`, e.message);
+    }
+  }
 }
 
 // Read-only session metrics (#67 §10) derived from the event log + change
@@ -1417,6 +1565,7 @@ module.exports = {
   vote,
   resolve,
   reconcileExpired,
+  autoProposePauses,
   buildDto,
   loadCr,
   loadRules,
