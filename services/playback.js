@@ -1,6 +1,7 @@
 const pool = require("../db");
 const { getIO } = require("../lib/io");
 const { broadcastTodayTopArtists } = require("./broadcast");
+const loops = require("./loops");
 
 // ---------------------------------------------------------------------------
 // SESSION / PLAYBACK ENGINE
@@ -472,6 +473,11 @@ const advanceToNext = async (sessionId, expectedCurrentItemId = null) => {
       doBroadcast = true;
       console.log(`[Session ${sessionId}] Marked played: #${currentId}`);
     }
+
+    // Loop engine: if the item just played finished a loop's current run, bump the
+    // loop and materialize its next run so it's ready as the next queued song.
+    const loopEmits = await loops.onItemPlayed(connection, sessionId, currentId);
+    for (const e of loopEmits) emits.push(e);
 
     // 2) Check if there are still queued items
     const [queuedRows] = await connection.query(

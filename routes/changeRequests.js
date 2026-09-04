@@ -15,6 +15,7 @@ const {
   buildDto,
   HttpError,
 } = require("../services/changeRequests");
+const { activeLoops } = require("../services/loops");
 
 const router = express.Router();
 
@@ -103,6 +104,16 @@ router.post("/change-requests/:crId/vote", async (req, res) => {
     await assertLiveParticipant(cr.session_id, identity);
     const dto = await vote(crId, identity);
     res.json(dto);
+  } catch (err) {
+    fail(res, err);
+  }
+});
+
+// GET /sessions/:id/loops  → active loops with live run-x/y status
+router.get("/sessions/:id/loops", async (req, res) => {
+  const sessionId = parseInt(req.params.id, 10);
+  try {
+    res.json(await activeLoops(sessionId));
   } catch (err) {
     fail(res, err);
   }
