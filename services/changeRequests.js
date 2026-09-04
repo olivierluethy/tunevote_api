@@ -146,6 +146,24 @@ async function applyInverse(conn, session, inverse) {
           `UPDATE sections SET status = 'archived' WHERE id = ? AND session_id = ?`,
           [op.section_id, session.id],
         );
+        await conn.query(
+          `UPDATE sessions SET current_section_id = NULL
+            WHERE id = ? AND current_section_id = ?`,
+          [session.id, op.section_id],
+        );
+        break;
+      case "set_current_section":
+        await conn.query(
+          `UPDATE sessions SET current_section_id = ? WHERE id = ?`,
+          [op.section_id ?? null, session.id],
+        );
+        break;
+      case "restore_section_rule":
+        await conn.query(
+          `UPDATE sections SET on_complete = ?, on_complete_target = ?, on_complete_done = 0, completed_at = NULL
+            WHERE id = ? AND session_id = ?`,
+          [op.on_complete || "none", op.on_complete_target ?? null, op.section_id, session.id],
+        );
         break;
       case "requeue_items":
         if (op.queue_item_ids?.length) {
@@ -566,6 +584,11 @@ const handlers = {
       // Create a live loop object; it materializes run 1 now, and playback.js
       // enqueues each following run when the previous one ends.
       const totalRuns = payload.endless ? null : payload.repeat;
+      // Loop-as-block: inherit the session's current section, if any.
+      const [[sess]] = await conn.query(
+        `SELECT current_section_id FROM sessions WHERE id = ?`,
+        [session.id],
+      );
       const { loopId } = await loops.createLoop(
         conn,
         session.id,
@@ -573,6 +596,7 @@ const handlers = {
         totalRuns,
         payload.on_complete,
         { user_id: cr.proposed_by_user_id, guest_id: cr.proposed_by_guest_id },
+        sess?.current_section_id || null,
       );
       return {
         eventType: "loop.created",
@@ -836,6 +860,11 @@ const handlers = {
           WHERE session_id = ? AND id IN (${payload.queue_item_ids.map(() => "?").join(",")})`,
         [sectionId, session.id, ...payload.queue_item_ids],
       );
+      // The new section becomes the current one (host-added songs join it).
+      await conn.query(`UPDATE sessions SET current_section_id = ? WHERE id = ?`, [
+        sectionId,
+        session.id,
+      ]);
       return {
         eventType: "section.created",
         eventPayload: {
@@ -1043,6 +1072,110 @@ const handlers = {
       };
     },
     describe: (p = {}) => `Abschnitt umbenennen: „${p.name || ""}"`,
+  },
+
+  // --- sections slice 3: current section + branching ------------------------
+  set_current_section: {
+    quorumPercent: 0.5,
+    durationSeconds: 45,
+    async validate(conn, session, payload = {}) {
+      let sectionId = payload.section_id ?? null;
+      if (sectionId != null) {
+        sectionId = Number(sectionId);
+        const [[sec]] = await conn.query(
+          `SELECT id FROM sections WHERE id = ? AND session_id = ? AND status = 'active'`,
+          [sectionId, session.id],
+        );
+        if (!sec) throw new HttpError(404, "Abschnitt nicht gefunden");
+      }
+      return { section_id: sectionId };
+    },
+    async apply(conn, session, payload) {
+      const [[s]] = await conn.query(
+        `SELECT current_section_id FROM sessions WHERE id = ?`,
+        [session.id],
+      );
+      const old = s?.current_section_id ?? null;
+      await conn.query(`UPDATE sessions SET current_section_id = ? WHERE id = ?`, [
+        payload.section_id ?? null,
+        session.id,
+      ]);
+      return {
+        eventType: "section.current_set",
+        eventPayload: { section_id: payload.section_id },
+        reversible: true,
+        inverse: { op: "set_current_section", section_id: old },
+        emits: [{ event: "sections_updated" }],
+      };
+    },
+    describe: () => "Aktuellen Abschnitt setzen",
+  },
+
+  set_section_on_complete: {
+    quorumPercent: 0.5,
+    durationSeconds: 45,
+    async validate(conn, session, payload = {}) {
+      const sectionId = Number(payload.section_id);
+      if (!Number.isFinite(sectionId)) throw new HttpError(400, "section_id fehlt");
+      const onComplete = ["none", "propose_pause", "jump_to"].includes(payload.on_complete)
+        ? payload.on_complete
+        : "none";
+      const [[sec]] = await conn.query(
+        `SELECT id FROM sections WHERE id = ? AND session_id = ? AND status = 'active'`,
+        [sectionId, session.id],
+      );
+      if (!sec) throw new HttpError(404, "Abschnitt nicht gefunden");
+      let target = null;
+      if (onComplete === "jump_to") {
+        target = Number(payload.target_section_id);
+        if (!Number.isFinite(target) || target === sectionId) {
+          throw new HttpError(400, "Zielabschnitt fehlt oder ungültig");
+        }
+        const [[t]] = await conn.query(
+          `SELECT id FROM sections WHERE id = ? AND session_id = ? AND status = 'active'`,
+          [target, session.id],
+        );
+        if (!t) throw new HttpError(404, "Zielabschnitt nicht gefunden");
+      }
+      return { section_id: sectionId, on_complete: onComplete, target_section_id: target };
+    },
+    async apply(conn, session, payload) {
+      const [[sec]] = await conn.query(
+        `SELECT on_complete, on_complete_target FROM sections WHERE id = ? AND session_id = ?`,
+        [payload.section_id, session.id],
+      );
+      const old = {
+        on_complete: sec?.on_complete || "none",
+        on_complete_target: sec?.on_complete_target ?? null,
+      };
+      await conn.query(
+        `UPDATE sections SET on_complete = ?, on_complete_target = ?, on_complete_done = 0, completed_at = NULL
+          WHERE id = ? AND session_id = ?`,
+        [payload.on_complete, payload.target_section_id ?? null, payload.section_id, session.id],
+      );
+      return {
+        eventType: "section.rule_set",
+        eventPayload: {
+          section_id: payload.section_id,
+          on_complete: payload.on_complete,
+          target_section_id: payload.target_section_id,
+        },
+        reversible: true,
+        inverse: {
+          op: "restore_section_rule",
+          section_id: payload.section_id,
+          on_complete: old.on_complete,
+          on_complete_target: old.on_complete_target,
+        },
+        emits: [{ event: "sections_updated" }],
+      };
+    },
+    describe: (p = {}) =>
+      p.on_complete === "jump_to"
+        ? "Regel: danach zu Abschnitt springen"
+        : p.on_complete === "propose_pause"
+          ? "Regel: danach Pause vorschlagen"
+          : "Regel: danach nichts",
   },
 };
 
@@ -1990,12 +2123,93 @@ async function processLoopCompletions() {
   }
 }
 
+// Section "what happens after" (#66, Slice 3): when a section with an on_complete
+// rule has finished (sectionsEngine stamped completed_at), fire the rule once.
+async function processSectionCompletions() {
+  const [rows] = await pool.query(
+    `SELECT sec.id AS section_id, sec.session_id, sec.on_complete, sec.on_complete_target
+       FROM sections sec
+       JOIN sessions s ON s.id = sec.session_id
+      WHERE sec.completed_at IS NOT NULL AND sec.on_complete <> 'none'
+        AND sec.on_complete_done = 0 AND s.status = 'live'`,
+  );
+  for (const r of rows) {
+    const [upd] = await pool.query(
+      `UPDATE sections SET on_complete_done = 1 WHERE id = ? AND on_complete_done = 0`,
+      [r.section_id],
+    );
+    if (!upd.affectedRows) continue;
+    try {
+      if (r.on_complete === "propose_pause") {
+        const [[live]] = await pool.query(
+          `SELECT COUNT(*) AS c FROM session_participants
+            WHERE session_id = ? AND is_live = 1`,
+          [r.session_id],
+        );
+        if (live.c < 1) continue;
+        await create(
+          r.session_id,
+          "insert_pause",
+          { duration_seconds: 60 },
+          { user: null, guest: null },
+          null,
+          null,
+          Math.min(3, Math.max(1, live.c)),
+        );
+      } else if (r.on_complete === "jump_to" && r.on_complete_target) {
+        await jumpSectionToFront(r.session_id, r.on_complete_target);
+        room(r.session_id).emit("sections_updated");
+        room(r.session_id).emit("queue_updated");
+      }
+    } catch (e) {
+      console.warn(`[section on_complete] session ${r.session_id}:`, e.message);
+    }
+  }
+}
+
+// Move a section's queued items right after the currently playing item (the
+// deterministic effect of an on_complete='jump_to' rule).
+async function jumpSectionToFront(sessionId, sectionId) {
+  const [items] = await pool.query(
+    `SELECT id, COALESCE(sort_order, id) AS ord FROM queue_items
+      WHERE session_id = ? AND section_id = ? AND status = 'queued'
+      ORDER BY COALESCE(sort_order, id) ASC`,
+    [sessionId, sectionId],
+  );
+  if (!items.length) return;
+  const [[playing]] = await pool.query(
+    `SELECT COALESCE(sort_order, id) AS ord FROM queue_items
+      WHERE session_id = ? AND status = 'playing' LIMIT 1`,
+    [sessionId],
+  );
+  const anchor = playing ? Number(playing.ord) : 0;
+  const [[nb]] = await pool.query(
+    `SELECT MIN(COALESCE(sort_order, id)) AS nb FROM queue_items
+      WHERE session_id = ? AND status = 'queued' AND COALESCE(sort_order, id) > ?
+        AND (section_id IS NULL OR section_id <> ?)`,
+    [sessionId, anchor, sectionId],
+  );
+  const boundary = nb.nb != null ? Number(nb.nb) : anchor + items.length + 1;
+  const stepSize = (boundary - anchor) / (items.length + 1);
+  for (let i = 0; i < items.length; i++) {
+    await pool.query(
+      `UPDATE queue_items SET sort_order = ? WHERE id = ? AND session_id = ?`,
+      [anchor + stepSize * (i + 1), items[i].id, sessionId],
+    );
+  }
+}
+
 // Named sections (#66) with their items, for the sections view.
 async function sectionsForSession(sessionId) {
   // Order by where each section currently sits in the queue (its first queued
   // item); sections with nothing queued fall to the end by creation order.
+  const [[sess]] = await pool.query(
+    `SELECT current_section_id FROM sessions WHERE id = ?`,
+    [sessionId],
+  );
+  const currentId = sess?.current_section_id ?? null;
   const [sections] = await pool.query(
-    `SELECT s.id, s.name, s.status, s.created_at,
+    `SELECT s.id, s.name, s.status, s.created_at, s.on_complete, s.on_complete_target,
             (SELECT MIN(COALESCE(q.sort_order, q.id)) FROM queue_items q
               WHERE q.session_id = s.session_id AND q.section_id = s.id
                 AND q.status = 'queued') AS position
@@ -2019,6 +2233,9 @@ async function sectionsForSession(sessionId) {
       id: s.id,
       name: s.name,
       status: s.status,
+      is_current: s.id === currentId,
+      on_complete: s.on_complete || "none",
+      on_complete_target: s.on_complete_target ?? null,
       items: items.map((i) => ({
         id: i.id,
         title: i.title,
@@ -2102,6 +2319,7 @@ module.exports = {
   reconcileExpired,
   autoProposePauses,
   processLoopCompletions,
+  processSectionCompletions,
   proposeAiSuggestions,
   buildDto,
   loadCr,

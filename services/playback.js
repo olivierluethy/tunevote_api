@@ -2,6 +2,7 @@ const pool = require("../db");
 const { getIO } = require("../lib/io");
 const { broadcastTodayTopArtists } = require("./broadcast");
 const loops = require("./loops");
+const sectionsEngine = require("./sectionsEngine");
 
 // ---------------------------------------------------------------------------
 // SESSION / PLAYBACK ENGINE
@@ -478,6 +479,10 @@ const advanceToNext = async (sessionId, expectedCurrentItemId = null) => {
     // loop and materialize its next run so it's ready as the next queued song.
     const loopEmits = await loops.onItemPlayed(connection, sessionId, currentId);
     for (const e of loopEmits) emits.push(e);
+
+    // Section "what happens after": mark a section completed when its last item
+    // plays; the reconciler fires its on_complete rule.
+    await sectionsEngine.onItemPlayed(connection, sessionId, currentId);
 
     // 2) Check if there are still queued items
     const [queuedRows] = await connection.query(
