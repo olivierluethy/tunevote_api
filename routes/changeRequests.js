@@ -14,6 +14,8 @@ const {
   vote,
   buildDto,
   HttpError,
+  computeMetrics,
+  loadRules,
 } = require("../services/changeRequests");
 const { activeLoops } = require("../services/loops");
 
@@ -49,14 +51,14 @@ function fail(res, err) {
 // POST /sessions/:id/change-requests  { type, payload }
 router.post("/sessions/:id/change-requests", async (req, res) => {
   const sessionId = parseInt(req.params.id, 10);
-  const { type, payload, options } = req.body || {};
+  const { type, payload, options, method } = req.body || {};
   try {
     const identity = await identify(req);
     if (!identity.user && !identity.guest) {
       return res.status(401).json({ error: "Unauthorized" });
     }
     await assertLiveParticipant(sessionId, identity);
-    const dto = await create(sessionId, type, payload, identity, options);
+    const dto = await create(sessionId, type, payload, identity, options, method);
     res.status(201).json(dto);
   } catch (err) {
     fail(res, err);
@@ -102,9 +104,29 @@ router.post("/change-requests/:crId/vote", async (req, res) => {
     );
     if (!cr) return res.status(404).json({ error: "Change Request nicht gefunden" });
     await assertLiveParticipant(cr.session_id, identity);
-    const { option_id } = req.body || {};
-    const dto = await vote(crId, identity, option_id);
+    const { option_id, ranking } = req.body || {};
+    const dto = await vote(crId, identity, option_id, ranking);
     res.json(dto);
+  } catch (err) {
+    fail(res, err);
+  }
+});
+
+// GET /sessions/:id/metrics  → read-only session summary (#67 §10)
+router.get("/sessions/:id/metrics", async (req, res) => {
+  const sessionId = parseInt(req.params.id, 10);
+  try {
+    res.json(await computeMetrics(sessionId));
+  } catch (err) {
+    fail(res, err);
+  }
+});
+
+// GET /sessions/:id/rules  → current session rule overrides
+router.get("/sessions/:id/rules", async (req, res) => {
+  const sessionId = parseInt(req.params.id, 10);
+  try {
+    res.json(await loadRules(sessionId));
   } catch (err) {
     fail(res, err);
   }
