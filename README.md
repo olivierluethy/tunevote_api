@@ -1,4 +1,22 @@
-# TuneVote — API
+<div align="center">
+  <img src="assets/logo.png" alt="TuneVote" width="150" height="150" />
+  <h1>TuneVote — API</h1>
+  <p>
+    <b>The real-time engine behind collaborative music voting.</b><br/>
+    A server-authoritative backend that runs the voting rounds, keeps every listener's playback in sync, and fills quiet rooms with AI-picked songs.
+  </p>
+  <p>
+    <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-blue.svg"></a>
+    <img alt="Node.js" src="https://img.shields.io/badge/Node.js-18+-339933?logo=nodedotjs&logoColor=white">
+    <img alt="Express 5" src="https://img.shields.io/badge/Express-5-000000?logo=express&logoColor=white">
+    <img alt="MySQL 8" src="https://img.shields.io/badge/MySQL-8-4479A1?logo=mysql&logoColor=white">
+    <img alt="Socket.IO" src="https://img.shields.io/badge/Socket.IO-realtime-010101?logo=socketdotio&logoColor=white">
+    <img alt="OpenAI" src="https://img.shields.io/badge/OpenAI-gpt--4o--mini-412991?logo=openai&logoColor=white">
+  </p>
+  <p><i>The server for the <a href="https://github.com/olivierluethy/tunevote_frontend">TuneVote web client</a>.</i></p>
+</div>
+
+---
 
 The **backend** for TuneVote, a real-time collaborative music-listening app. People join a shared listening room ("session"), suggest YouTube songs, and vote in rounds to decide what plays next — with everyone's audio kept in sync across devices.
 
@@ -158,3 +176,11 @@ See [`docs/`](docs/) for detailed engineering notes — start at [`docs/README.m
 ## Related
 
 - Web client: [`tunevote_frontend`](https://github.com/olivierluethy/tunevote_frontend)
+
+## License
+
+Released under the [MIT License](LICENSE) © Olivier Lüthy. You're free to use, modify and distribute this software, including commercially, as long as the copyright notice and license are included.
+
+## Author
+
+Built by **Olivier Lüthy** — [GitHub](https://github.com/olivierluethy). Part of the [TuneVote](https://github.com/olivierluethy?tab=repositories&q=tunevote) project.
