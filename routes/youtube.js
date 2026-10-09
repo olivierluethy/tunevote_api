@@ -134,4 +134,102 @@ router.get("/youtube-info/:id", async (req, res) => {
 });
 
 
+// ===========================================================================
+// GET /stream/:videoId — ad-free audio proxy (issue #75)
+// ===========================================================================
+//
+// Streams ONLY the audio track of a YouTube video through the API so the
+// frontend can play it in a plain <audio> element instead of the YouTube
+// IFrame player. Because the bytes come straight from the audio format, there
+// is no pre-/mid-roll advertising in the stream — playback in a TuneVote
+// session stays continuous.
+//
+// Range-aware: honors the browser's `Range` header and replies 206 with a
+// `Content-Range`, which is what makes <audio> seeking work. That is required
+// for synchronized playback (the client seeks to the session's current
+// position when it (re)joins a live song).
+//
+// NOTE (maintenance): this relies on @distube/ytdl-core resolving YouTube's
+// audio formats. YouTube occasionally changes its player internals and can
+// break ytdl until the library is updated — keep the dependency current.
+const YT_VIDEO_ID_RE = /^[a-zA-Z0-9_-]{11}$/;
+
+router.get("/stream/:videoId", async (req, res) => {
+  const { videoId } = req.params;
+  if (!YT_VIDEO_ID_RE.test(videoId)) {
+    return res.status(400).json({ error: "Invalid video id" });
+  }
+
+  try {
+    const info = await ytdl.getInfo(
+      `https://www.youtube.com/watch?v=${videoId}`,
+    );
+    // Prefer itag 140 (m4a / AAC) — the one audio format every browser can play,
+    // Safari included (which cannot decode WebM/Opus). Fall back to the best
+    // available audio-only format if 140 isn't offered for this video.
+    let format;
+    try {
+      format = ytdl.chooseFormat(info.formats, {
+        quality: "140",
+        filter: "audioonly",
+      });
+    } catch {
+      /* itag 140 not available → fall through */
+    }
+    if (!format) {
+      format = ytdl.chooseFormat(info.formats, {
+        quality: "highestaudio",
+        filter: "audioonly",
+      });
+    }
+    if (!format) {
+      return res.status(404).json({ error: "No audio stream available" });
+    }
+
+    const mime = (format.mimeType || "audio/webm").split(";")[0];
+    const totalLength = format.contentLength
+      ? parseInt(format.contentLength, 10)
+      : null;
+
+    res.setHeader("Content-Type", mime);
+    res.setHeader("Accept-Ranges", "bytes");
+    res.setHeader("Cache-Control", "no-store");
+
+    const pipeStream = (ytdlOptions) => {
+      const stream = ytdl.downloadFromInfo(info, ytdlOptions);
+      stream.on("error", (err) => {
+        console.warn(`[stream] ytdl error for ${videoId}:`, err.message);
+        if (!res.headersSent) res.status(502).end();
+        else res.destroy(err);
+      });
+      // Stop pulling bytes if the listener navigates away / song changes.
+      res.on("close", () => stream.destroy());
+      stream.pipe(res);
+    };
+
+    const rangeHeader = req.headers.range;
+    if (rangeHeader && totalLength) {
+      const match = /bytes=(\d*)-(\d*)/.exec(rangeHeader);
+      let start = match && match[1] ? parseInt(match[1], 10) : 0;
+      let end = match && match[2] ? parseInt(match[2], 10) : totalLength - 1;
+      if (!Number.isFinite(start) || start < 0) start = 0;
+      if (!Number.isFinite(end) || end >= totalLength) end = totalLength - 1;
+      if (start > end) {
+        start = 0;
+        end = totalLength - 1;
+      }
+      res.status(206);
+      res.setHeader("Content-Range", `bytes ${start}-${end}/${totalLength}`);
+      res.setHeader("Content-Length", end - start + 1);
+      pipeStream({ format, range: { start, end } });
+    } else {
+      if (totalLength) res.setHeader("Content-Length", totalLength);
+      pipeStream({ format });
+    }
+  } catch (err) {
+    console.error(`[stream] failed for ${videoId}:`, err.message);
+    if (!res.headersSent) res.status(502).json({ error: "Stream unavailable" });
+  }
+});
+
 module.exports = router;
